@@ -1,1 +1,1 @@
-cout "X";
+cout "XYZ";
