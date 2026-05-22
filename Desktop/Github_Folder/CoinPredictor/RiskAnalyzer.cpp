@@ -368,9 +368,6 @@ bool analyzeSymbol(const std::string &symbol, const std::vector<std::string> &da
         const std::string url = binanceTradeZipUrl(symbol, date);
 
         if (!downloadFile(url, path)) {
-            if (date == dates.front()) {
-                return false;
-            }
             continue;
         }
 
@@ -378,6 +375,9 @@ bool analyzeSymbol(const std::string &symbol, const std::vector<std::string> &da
         const long long sellsBefore = result.sellTrades;
         if (addTradesFromZip(path, result.buyTrades, result.sellTrades)) {
             result.datesUsed.push_back(date);
+            if (result.datesUsed.size() == kDaysToAnalyze) {
+             break;
+            }
         } else {
             result.buyTrades = buysBefore;
             result.sellTrades = sellsBefore;
@@ -448,7 +448,7 @@ void writeBinanceRatioCsv(const std::vector<SymbolRatio> &ratios, const std::str
 }
 
 std::vector<SymbolRatio> analyzeBinanceDataVision(const std::vector<std::string> &requestedSymbols) {
-    const std::vector<std::string> dates = lastCompletedUtcDates(kDaysToAnalyze);
+    const std::vector<std::string> dates = lastCompletedUtcDates(kDaysToAnalyze+1);
     std::vector<std::string> symbols = requestedSymbols.empty()
         ? fetchAllBinanceTradeSymbols()
         : requestedSymbols;
