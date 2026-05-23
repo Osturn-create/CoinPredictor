@@ -1,8 +1,8 @@
 // DataScraper builds a training set from Binance Data Vision 1m kline files.
 //
 // It reads symbols from local CSV files, discovers the first available month of
-// 1m candles for each symbol, downloads that month, labels candles where the
-// next 5 minutes reach +5%, and trains a small logistic-regression model.
+// 1m candles for each symbol, trains on the first 6 available months, then
+// writes predictions for the 7th available month.
 //
 // Build standalone:
 //   g++ -std=c++11 -DDATASCRAPER_STANDALONE DataScraper.cpp -o data_scraper
@@ -18,13 +18,14 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <map>
 #include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
+
+#include "MonthSevenTester.h"
 
 #ifdef _WIN32
 #define popen _popen
@@ -40,6 +41,9 @@ const std::string kFallbackSymbolCsv = "binance_buy_sell_ratio.csv";
 const std::string kTrainingCsv = "kline_growth_training.csv";
 const std::string kModelCsv = "kline_growth_model.csv";
 const std::string kMetricsCsv = "kline_growth_metrics.csv";
+const std::string kPredictionsCsv = "kline_growth_month7_predictions.csv";
+const int kTrainingMonths = 6;
+const int kRequiredMonths = 7;
 const int kPredictionWindowMinutes = 5;
 const double kGrowthThreshold = 0.05;
 const int kEpochs = 8;
@@ -89,11 +93,14 @@ struct TrainingResult {
     Scaler scaler;
     double trainAuc;
     double testAuc;
+    double testAccuracy;
     double testPrecision;
     double testRecall;
     int trainRows;
     int testRows;
     int positiveRows;
+    int predictedPositiveRows;
+    int truePositiveRows;
 };
 
 std::string shellQuote(const std::string &text) {
@@ -351,22 +358,34 @@ std::vector<std::string> listKlineDates(const std::string &symbol) {
     return std::vector<std::string>(dates.begin(), dates.end());
 }
 
-std::vector<std::string> firstAvailableMonthDates(const std::vector<std::string> &dates) {
+std::vector<std::string> monthDatesFor(const std::vector<std::string> &dates, const std::string &month) {
     std::vector<std::string> monthDates;
-    if (dates.empty()) {
-        return monthDates;
-    }
-
-    const std::string firstMonth = dates[0].substr(0, 7);
     for (size_t i = 0; i < dates.size(); ++i) {
-        if (dates[i].substr(0, 7) == firstMonth) {
+        if (dates[i].substr(0, 7) == month) {
             monthDates.push_back(dates[i]);
-        } else if (!monthDates.empty()) {
+        } else if (!monthDates.empty() && dates[i].substr(0, 7) != month) {
             break;
         }
     }
 
     return monthDates;
+}
+
+std::vector<std::string> firstAvailableMonths(const std::vector<std::string> &dates, int count) {
+    std::vector<std::string> months;
+    std::set<std::string> seen;
+
+    for (size_t i = 0; i < dates.size(); ++i) {
+        const std::string month = dates[i].substr(0, 7);
+        if (seen.insert(month).second) {
+            months.push_back(month);
+            if (static_cast<int>(months.size()) == count) {
+                break;
+            }
+        }
+    }
+
+    return months;
 }
 
 std::string tempZipPath(const std::string &symbol, const std::string &date) {
@@ -376,6 +395,11 @@ std::string tempZipPath(const std::string &symbol, const std::string &date) {
 std::string binanceKlineZipUrl(const std::string &symbol, const std::string &date) {
     return kDataVisionBase + "/data/spot/daily/klines/" + symbol + "/1m/"
         + symbol + "-1m-" + date + ".zip";
+}
+
+std::string binanceMonthlyKlineZipUrl(const std::string &symbol, const std::string &month) {
+    return kDataVisionBase + "/data/spot/monthly/klines/" + symbol + "/1m/"
+        + symbol + "-1m-" + month + ".zip";
 }
 
 bool readCandlesFromZip(const std::string &zipPath, std::vector<Candle> &candles) {
@@ -428,16 +452,39 @@ bool readCandlesFromZip(const std::string &zipPath, std::vector<Candle> &candles
     return found;
 }
 
-std::vector<Candle> downloadFirstMonthCandles(const std::string &symbol, std::string &month) {
-    const std::vector<std::string> dates = listKlineDates(symbol);
-    const std::vector<std::string> monthDates = firstAvailableMonthDates(dates);
+std::vector<Candle> downloadCandlesForDates(const std::string &symbol, const std::vector<std::string> &monthDates);
+
+std::vector<Candle> downloadCandlesForMonth(
+    const std::string &symbol,
+    const std::string &month,
+    const std::vector<std::string> &dailyDates) {
+    std::vector<Candle> candles;
+    const std::string monthlyPath = "/tmp/binance-klines-" + symbol + "-" + month + ".zip";
+
+    if (downloadFile(binanceMonthlyKlineZipUrl(symbol, month), monthlyPath)) {
+        readCandlesFromZip(monthlyPath, candles);
+        std::remove(monthlyPath.c_str());
+    }
+
+    if (candles.empty()) {
+        const std::vector<std::string> monthDates = monthDatesFor(dailyDates, month);
+        candles = downloadCandlesForDates(symbol, monthDates);
+    }
+
+    std::sort(candles.begin(), candles.end(), [](const Candle &left, const Candle &right) {
+        return left.openTime < right.openTime;
+    });
+
+    return candles;
+}
+
+std::vector<Candle> downloadCandlesForDates(const std::string &symbol, const std::vector<std::string> &monthDates) {
     std::vector<Candle> candles;
 
     if (monthDates.empty()) {
         return candles;
     }
 
-    month = monthDates[0].substr(0, 7);
     for (size_t i = 0; i < monthDates.size(); ++i) {
         const std::string path = tempZipPath(symbol, monthDates[i]);
         if (!downloadFile(binanceKlineZipUrl(symbol, monthDates[i]), path)) {
@@ -609,39 +656,71 @@ double auc(const std::vector<std::pair<double, int> > &scores) {
         / (static_cast<double>(positives) * static_cast<double>(negatives));
 }
 
-TrainingResult trainModel(std::vector<Sample> samples) {
-    if (samples.empty()) {
-        throw std::runtime_error("No training samples were created");
+void writePredictionsCsv(
+    const std::vector<Sample> &samples,
+    const Scaler &scaler,
+    const std::vector<double> &weights) {
+    std::ofstream out(kPredictionsCsv.c_str());
+    if (!out) {
+        throw std::runtime_error("Unable to open 7th-month predictions CSV for writing");
     }
 
-    std::sort(samples.begin(), samples.end(), [](const Sample &left, const Sample &right) {
+    out << "symbol,month,open_time,label,probability,predicted\n";
+    out << std::setprecision(12);
+    for (size_t i = 0; i < samples.size(); ++i) {
+        const double probability = predictProbability(samples[i], scaler, weights);
+        out << csvEscape(samples[i].symbol) << ','
+            << csvEscape(samples[i].month) << ','
+            << samples[i].timeOrder << ','
+            << samples[i].label << ','
+            << probability << ','
+            << (probability >= 0.5 ? 1 : 0) << '\n';
+    }
+}
+
+TrainingResult trainModel(std::vector<Sample> trainSamples, std::vector<Sample> testSamples) {
+    if (trainSamples.empty()) {
+        throw std::runtime_error("No training samples were created");
+    }
+    if (testSamples.empty()) {
+        throw std::runtime_error("No 7th-month test samples were created");
+    }
+
+    std::sort(trainSamples.begin(), trainSamples.end(), [](const Sample &left, const Sample &right) {
+        if (left.timeOrder == right.timeOrder) {
+            return left.symbol < right.symbol;
+        }
+        return left.timeOrder < right.timeOrder;
+    });
+    std::sort(testSamples.begin(), testSamples.end(), [](const Sample &left, const Sample &right) {
         if (left.timeOrder == right.timeOrder) {
             return left.symbol < right.symbol;
         }
         return left.timeOrder < right.timeOrder;
     });
 
-    const size_t split = std::max<size_t>(1, samples.size() * 8 / 10);
-    const size_t featureCount = samples[0].features.size();
+    const size_t featureCount = trainSamples[0].features.size();
     TrainingResult result;
-    result.scaler = fitScaler(samples, 0, split);
+    result.scaler = fitScaler(trainSamples, 0, trainSamples.size());
     result.weights.assign(featureCount + 1, 0.0);
-    result.trainRows = static_cast<int>(split);
-    result.testRows = static_cast<int>(samples.size() - split);
+    result.trainRows = static_cast<int>(trainSamples.size());
+    result.testRows = static_cast<int>(testSamples.size());
     result.positiveRows = 0;
+    result.predictedPositiveRows = 0;
+    result.truePositiveRows = 0;
 
     int trainPositives = 0;
     int trainNegatives = 0;
-    for (size_t i = 0; i < split; ++i) {
-        if (samples[i].label == 1) {
+    for (size_t i = 0; i < trainSamples.size(); ++i) {
+        if (trainSamples[i].label == 1) {
             ++trainPositives;
             ++result.positiveRows;
         } else {
             ++trainNegatives;
         }
     }
-    for (size_t i = split; i < samples.size(); ++i) {
-        if (samples[i].label == 1) {
+    for (size_t i = 0; i < testSamples.size(); ++i) {
+        if (testSamples[i].label == 1) {
             ++result.positiveRows;
         }
     }
@@ -651,14 +730,14 @@ TrainingResult trainModel(std::vector<Sample> samples) {
         : 1.0;
 
     for (int epoch = 0; epoch < kEpochs; ++epoch) {
-        for (size_t i = 0; i < split; ++i) {
-            const double probability = predictProbability(samples[i], result.scaler, result.weights);
-            const double classWeight = samples[i].label == 1 ? positiveWeight : 1.0;
-            const double error = (probability - static_cast<double>(samples[i].label)) * classWeight;
+        for (size_t i = 0; i < trainSamples.size(); ++i) {
+            const double probability = predictProbability(trainSamples[i], result.scaler, result.weights);
+            const double classWeight = trainSamples[i].label == 1 ? positiveWeight : 1.0;
+            const double error = (probability - static_cast<double>(trainSamples[i].label)) * classWeight;
 
             result.weights[0] -= kLearningRate * error;
             for (size_t j = 0; j < featureCount; ++j) {
-                const double scaled = (samples[i].features[j] - result.scaler.mean[j]) / result.scaler.stddev[j];
+                const double scaled = (trainSamples[i].features[j] - result.scaler.mean[j]) / result.scaler.stddev[j];
                 result.weights[j + 1] -= kLearningRate * error * scaled;
             }
         }
@@ -667,29 +746,40 @@ TrainingResult trainModel(std::vector<Sample> samples) {
     std::vector<std::pair<double, int> > trainScores;
     std::vector<std::pair<double, int> > testScores;
     int truePositive = 0;
+    int trueNegative = 0;
     int falsePositive = 0;
     int falseNegative = 0;
 
-    for (size_t i = 0; i < samples.size(); ++i) {
-        const double probability = predictProbability(samples[i], result.scaler, result.weights);
-        std::pair<double, int> scored(probability, samples[i].label);
-        if (i < split) {
-            trainScores.push_back(scored);
+    for (size_t i = 0; i < trainSamples.size(); ++i) {
+        const double probability = predictProbability(trainSamples[i], result.scaler, result.weights);
+        trainScores.push_back(std::pair<double, int>(probability, trainSamples[i].label));
+    }
+
+    for (size_t i = 0; i < testSamples.size(); ++i) {
+        const double probability = predictProbability(testSamples[i], result.scaler, result.weights);
+        testScores.push_back(std::pair<double, int>(probability, testSamples[i].label));
+        const bool predicted = probability >= 0.5;
+        if (predicted) {
+            ++result.predictedPositiveRows;
+        }
+        if (predicted && testSamples[i].label == 1) {
+            ++truePositive;
+        } else if (predicted && testSamples[i].label == 0) {
+            ++falsePositive;
+        } else if (!predicted && testSamples[i].label == 1) {
+            ++falseNegative;
         } else {
-            testScores.push_back(scored);
-            const bool predicted = probability >= 0.5;
-            if (predicted && samples[i].label == 1) {
-                ++truePositive;
-            } else if (predicted && samples[i].label == 0) {
-                ++falsePositive;
-            } else if (!predicted && samples[i].label == 1) {
-                ++falseNegative;
-            }
+            ++trueNegative;
         }
     }
 
+    result.truePositiveRows = truePositive;
     result.trainAuc = auc(trainScores);
     result.testAuc = auc(testScores);
+    result.testAccuracy = (truePositive + trueNegative + falsePositive + falseNegative) > 0
+        ? static_cast<double>(truePositive + trueNegative)
+            / static_cast<double>(truePositive + trueNegative + falsePositive + falseNegative)
+        : 0.0;
     result.testPrecision = (truePositive + falsePositive) > 0
         ? static_cast<double>(truePositive) / static_cast<double>(truePositive + falsePositive)
         : 0.0;
@@ -697,7 +787,8 @@ TrainingResult trainModel(std::vector<Sample> samples) {
         ? static_cast<double>(truePositive) / static_cast<double>(truePositive + falseNegative)
         : 0.0;
 
-    writeTrainingCsv(samples);
+    writeTrainingCsv(trainSamples);
+    writePredictionsCsv(testSamples, result.scaler, result.weights);
     return result;
 }
 
@@ -735,13 +826,17 @@ void writeModel(const TrainingResult &result) {
         throw std::runtime_error("Unable to open metrics CSV for writing");
     }
 
-    metrics << "train_rows,test_rows,positive_rows,train_auc,test_auc,test_precision_at_0_5,test_recall_at_0_5\n";
+    metrics << "train_rows,month7_test_rows,positive_rows,predicted_positive_rows,true_positive_rows,"
+        << "train_auc,month7_auc,month7_accuracy,month7_success_rate,month7_recall\n";
     metrics << result.trainRows << ','
             << result.testRows << ','
             << result.positiveRows << ','
+            << result.predictedPositiveRows << ','
+            << result.truePositiveRows << ','
             << std::fixed << std::setprecision(6)
             << result.trainAuc << ','
             << result.testAuc << ','
+            << result.testAccuracy << ','
             << result.testPrecision << ','
             << result.testRecall << '\n';
 }
@@ -751,35 +846,62 @@ void writeModel(const TrainingResult &result) {
 void scrapeHistoricalCoinData(const std::vector<std::string> &symbolOverrides) {
     try {
         const std::vector<std::string> symbols = readRequestedSymbols(symbolOverrides);
-        std::vector<Sample> allSamples;
+        std::vector<Sample> trainingSamples;
+        std::vector<Sample> monthSevenSamples;
 
         for (size_t i = 0; i < symbols.size(); ++i) {
-            std::string month;
-            std::vector<Candle> candles;
             try {
-                candles = downloadFirstMonthCandles(symbols[i], month);
+                const std::vector<std::string> dates = listKlineDates(symbols[i]);
+                const std::vector<std::string> months = firstAvailableMonths(dates, kRequiredMonths);
+                if (static_cast<int>(months.size()) < kRequiredMonths) {
+                    std::cout << "Skipping " << symbols[i] << ": fewer than 7 months of 1m klines.\n";
+                    continue;
+                }
+
+                size_t symbolTrainSamples = 0;
+                for (int monthIndex = 0; monthIndex < kTrainingMonths; ++monthIndex) {
+                    const std::vector<Candle> trainCandles = downloadCandlesForMonth(
+                        symbols[i],
+                        months[monthIndex],
+                        dates);
+                    const std::vector<Sample> trainSamples = makeSamples(symbols[i], months[monthIndex], trainCandles);
+                    trainingSamples.insert(trainingSamples.end(), trainSamples.begin(), trainSamples.end());
+                    symbolTrainSamples += trainSamples.size();
+                }
+
+                const std::vector<Candle> monthSevenCandles = downloadCandlesForMonth(
+                    symbols[i],
+                    months[kTrainingMonths],
+                    dates);
+                const std::vector<Sample> testSamples = makeSamples(
+                    symbols[i],
+                    months[kTrainingMonths],
+                    monthSevenCandles);
+                monthSevenSamples.insert(monthSevenSamples.end(), testSamples.begin(), testSamples.end());
+
+                std::cout << "Processed " << (i + 1) << "/" << symbols.size()
+                          << ": " << symbols[i]
+                          << " train_months=" << months[0] << ".." << months[kTrainingMonths - 1]
+                          << " train_samples=" << symbolTrainSamples
+                          << " test_month=" << months[kTrainingMonths]
+                          << " test_samples=" << testSamples.size() << '\n';
             } catch (const std::exception &error) {
                 std::cerr << "\nSkipping " << symbols[i] << ": " << error.what() << '\n';
                 continue;
             }
-
-            const std::vector<Sample> samples = makeSamples(symbols[i], month, candles);
-            allSamples.insert(allSamples.end(), samples.begin(), samples.end());
-
-            std::cout << "Processed " << (i + 1) << "/" << symbols.size()
-                      << ": " << symbols[i] << " " << month
-                      << " candles=" << candles.size()
-                      << " samples=" << samples.size() << '\n';
         }
 
-        const TrainingResult result = trainModel(allSamples);
+        const TrainingResult result = trainModel(trainingSamples, monthSevenSamples);
         writeModel(result);
+        const MonthSevenEvaluation evaluation = evaluateMonthSevenPredictions(kPredictionsCsv);
 
-        std::cout << "Wrote " << kTrainingCsv << ", " << kModelCsv << ", and " << kMetricsCsv << ".\n"
+        std::cout << "Wrote " << kTrainingCsv << ", " << kPredictionsCsv << ", "
+                  << kModelCsv << ", and " << kMetricsCsv << ".\n"
                   << "Train AUC: " << std::fixed << std::setprecision(4) << result.trainAuc
-                  << " | Test AUC: " << result.testAuc
-                  << " | Test precision@0.5: " << result.testPrecision
-                  << " | Test recall@0.5: " << result.testRecall << '\n';
+                  << " | Month 7 AUC: " << result.testAuc
+                  << " | Success rate: " << (evaluation.successRate * 100.0) << "%"
+                  << " | Accuracy: " << (result.testAccuracy * 100.0) << "%"
+                  << " | Recall: " << (result.testRecall * 100.0) << "%\n";
     } catch (const std::exception &error) {
         std::cerr << "Data scraper failed: " << error.what() << '\n';
     }
