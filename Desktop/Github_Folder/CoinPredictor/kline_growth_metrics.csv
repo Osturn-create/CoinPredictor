@@ -1,2 +1,0 @@
-train_rows,month7_test_rows,positive_rows,predicted_positive_rows,true_positive_rows,train_auc,month7_auc,month7_accuracy,month7_success_rate,month7_recall
-240951,38250,155,7,0,0.901936,0.999085,0.999373,0.000000,0.000000
