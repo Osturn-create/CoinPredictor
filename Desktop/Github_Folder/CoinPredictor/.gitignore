@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+kline_growth*.csv
+gbdt_run.log
+coin_predictor
+coin_predictor_cpp*
+data_scraper
+risk_analyzer
+risk_analyzer_cpp*
