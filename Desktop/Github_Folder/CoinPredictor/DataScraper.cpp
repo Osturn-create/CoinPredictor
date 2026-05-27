@@ -20,6 +20,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <climits>
 #include <map>
 #include <set>
 #include <sstream>
@@ -107,7 +108,12 @@ struct ScraperOptions {
           slippage(kDefaultSlippage),
           thresholdObjective("profit"),
           profitSafety("explore"),
-          adaptiveThresholds(true) {
+          adaptiveThresholds(true),
+          splitMode("fixed"),
+          trainRatio(0.70),
+          validationRatio(0.15),
+          testRatio(0.15),
+          generateOnly(false) {
         thresholds.push_back(0.001);
         thresholds.push_back(0.002);
         thresholds.push_back(0.005);
@@ -153,7 +159,19 @@ struct ScraperOptions {
     std::string thresholdObjective;
     std::string profitSafety;
     bool adaptiveThresholds;
+    std::string splitMode;
+    double trainRatio;
+    double validationRatio;
+    double testRatio;
+    bool generateOnly;
     std::vector<double> thresholds;
+};
+
+struct MonthSplit {
+    MonthSplit() : train(0), validation(0), test(0) {}
+    int train;
+    int validation;
+    int test;
 };
 
 struct Sample {
@@ -478,6 +496,13 @@ int parseIntOption(const std::string &name, const std::string &value) {
     return static_cast<int>(parsed);
 }
 
+int parseMonthsOption(const std::string &value) {
+    if (value == "all" || value == "ALL" || value == "0") {
+        return 0;
+    }
+    return parseIntOption("--months", value);
+}
+
 std::vector<double> parseThresholdGrid(const std::string &text) {
     std::vector<double> thresholds;
     std::stringstream stream(text);
@@ -514,7 +539,12 @@ void printUsage() {
     std::cout
         << "Usage: coin_predictor train [options] [SYMBOL...]\n"
         << "Options:\n"
-        << "  --months N                 Download/generate N chronological months per symbol (default 8).\n"
+        << "  --months N|all             Download/generate N chronological months per symbol, or all available (default 8).\n"
+        << "  --split-mode MODE          fixed or ratio. ratio splits each symbol by its available month count.\n"
+        << "  --train-ratio X            Ratio split training fraction (default 0.70).\n"
+        << "  --validation-ratio X       Ratio split validation fraction (default 0.15).\n"
+        << "  --test-ratio X             Ratio split test fraction (default 0.15).\n"
+        << "  --generate-only            Write kline_growth_training.csv and skip in-memory C++ logistic training.\n"
         << "  --train-months N           Training months for C++ logistic split (default 6).\n"
         << "  --validation-months N      Validation months for threshold tuning (default 1).\n"
         << "  --test-months N            Out-of-sample test months (default 1).\n"
@@ -547,13 +577,26 @@ bool parseArguments(
             printUsage();
             return false;
         } else if (arg == "--months" || startsWith(arg, "--months=")) {
-            options.totalMonths = parseIntOption("--months", optionValue(args, i, "--months", arg));
+            options.totalMonths = parseMonthsOption(optionValue(args, i, "--months", arg));
+            if (options.totalMonths == 0) {
+                options.splitMode = "ratio";
+            }
         } else if (arg == "--train-months" || startsWith(arg, "--train-months=")) {
             options.trainingMonths = parseIntOption("--train-months", optionValue(args, i, "--train-months", arg));
         } else if (arg == "--validation-months" || startsWith(arg, "--validation-months=")) {
             options.validationMonths = parseIntOption("--validation-months", optionValue(args, i, "--validation-months", arg));
         } else if (arg == "--test-months" || startsWith(arg, "--test-months=")) {
             options.testMonths = parseIntOption("--test-months", optionValue(args, i, "--test-months", arg));
+        } else if (arg == "--split-mode" || startsWith(arg, "--split-mode=")) {
+            options.splitMode = optionValue(args, i, "--split-mode", arg);
+        } else if (arg == "--train-ratio" || startsWith(arg, "--train-ratio=")) {
+            options.trainRatio = parseDoubleOption("--train-ratio", optionValue(args, i, "--train-ratio", arg));
+        } else if (arg == "--validation-ratio" || startsWith(arg, "--validation-ratio=")) {
+            options.validationRatio = parseDoubleOption("--validation-ratio", optionValue(args, i, "--validation-ratio", arg));
+        } else if (arg == "--test-ratio" || startsWith(arg, "--test-ratio=")) {
+            options.testRatio = parseDoubleOption("--test-ratio", optionValue(args, i, "--test-ratio", arg));
+        } else if (arg == "--generate-only") {
+            options.generateOnly = true;
         } else if (arg == "--prediction-window" || startsWith(arg, "--prediction-window=")) {
             options.predictionWindowMinutes = parseIntOption("--prediction-window", optionValue(args, i, "--prediction-window", arg));
             if (!options.cooldownExplicit) {
@@ -603,8 +646,18 @@ bool parseArguments(
     if (options.trainingMonths <= 0 || options.validationMonths <= 0 || options.testMonths <= 0) {
         throw std::runtime_error("Train, validation, and test month counts must all be positive");
     }
-    if (options.totalMonths < options.requiredMonths()) {
+    if (options.totalMonths > 0 && options.totalMonths < options.requiredMonths()) {
         options.totalMonths = options.requiredMonths();
+    }
+    if (options.splitMode != "fixed" && options.splitMode != "ratio") {
+        throw std::runtime_error("--split-mode must be fixed or ratio");
+    }
+    if (options.trainRatio <= 0.0 || options.validationRatio <= 0.0 || options.testRatio <= 0.0) {
+        throw std::runtime_error("--train-ratio, --validation-ratio, and --test-ratio must be positive");
+    }
+    const double ratioSum = options.trainRatio + options.validationRatio + options.testRatio;
+    if (std::fabs(ratioSum - 1.0) > 0.001) {
+        throw std::runtime_error("--train-ratio + --validation-ratio + --test-ratio must equal 1.0");
     }
     if (options.predictionWindowMinutes <= 0) {
         throw std::runtime_error("--prediction-window must be positive");
@@ -676,11 +729,21 @@ std::vector<std::string> listKlineDates(const std::string &symbol) {
             }
         }
 
+        // S3 ListBucket V1 often omits NextMarker unless a delimiter is used.
+        // In that case the correct continuation marker is the last key from
+        // the current page; otherwise --months all stops after about 500 days
+        // because each date has both a .zip and .CHECKSUM key.
         const std::string nextMarker = parseTagValue(listing, "NextMarker");
-        if (nextMarker.empty() || nextMarker == marker) {
+        const std::string isTruncated = parseTagValue(listing, "IsTruncated");
+        if (!nextMarker.empty() && nextMarker != marker) {
+            marker = nextMarker;
+        } else if ((isTruncated == "true" || isTruncated == "True" || isTruncated == "1")
+                && !keys.empty()
+                && keys.back() != marker) {
+            marker = keys.back();
+        } else {
             break;
         }
-        marker = nextMarker;
     }
 
     return std::vector<std::string>(dates.begin(), dates.end());
@@ -707,13 +770,55 @@ std::vector<std::string> firstAvailableMonths(const std::vector<std::string> &da
         const std::string month = dates[i].substr(0, 7);
         if (seen.insert(month).second) {
             months.push_back(month);
-            if (static_cast<int>(months.size()) == count) {
+            if (count > 0 && static_cast<int>(months.size()) == count) {
                 break;
             }
         }
     }
 
     return months;
+}
+
+MonthSplit splitForMonthCount(int availableMonths, const ScraperOptions &options) {
+    MonthSplit split;
+    if (options.splitMode == "fixed") {
+        split.train = options.trainingMonths;
+        split.validation = options.validationMonths;
+        split.test = options.testMonths;
+        return split;
+    }
+
+    if (availableMonths < 3) {
+        return split;
+    }
+
+    split.validation = std::max(1, static_cast<int>(std::floor(availableMonths * options.validationRatio + 0.5)));
+    split.test = std::max(1, static_cast<int>(std::floor(availableMonths * options.testRatio + 0.5)));
+    if (split.validation + split.test >= availableMonths) {
+        split.validation = 1;
+        split.test = 1;
+    }
+    split.train = availableMonths - split.validation - split.test;
+    if (split.train < 1) {
+        split.train = 1;
+        if (split.validation > 1) {
+            --split.validation;
+        } else if (split.test > 1) {
+            --split.test;
+        }
+    }
+    return split;
+}
+
+std::string monthRangeDescription(const std::vector<std::string> &months, int start, int count) {
+    if (count <= 0 || start < 0 || start >= static_cast<int>(months.size())) {
+        return "none";
+    }
+    const int end = std::min(static_cast<int>(months.size()) - 1, start + count - 1);
+    if (start == end) {
+        return months[start];
+    }
+    return months[start] + ".." + months[end];
 }
 
 std::string tempZipPath(const std::string &symbol, const std::string &date) {
@@ -1075,12 +1180,7 @@ std::vector<Sample> makeSamples(
     return samples;
 }
 
-void writeTrainingCsv(const std::vector<Sample> &samples) {
-    std::ofstream out(kTrainingCsv.c_str());
-    if (!out) {
-        throw std::runtime_error("Unable to open training CSV for writing");
-    }
-
+void writeTrainingCsvHeader(std::ostream &out) {
     const std::vector<std::string> names = featureNames();
     out << "symbol,month,month_index,open_time,label,forward_return,trade_return,max_future_high_return,max_future_low_return";
     for (size_t i = 0; i < names.size(); ++i) {
@@ -1088,7 +1188,9 @@ void writeTrainingCsv(const std::vector<Sample> &samples) {
     }
     out << '\n';
     out << std::setprecision(12);
+}
 
+void writeTrainingCsvRows(std::ostream &out, const std::vector<Sample> &samples) {
     for (size_t i = 0; i < samples.size(); ++i) {
         out << csvEscape(samples[i].symbol) << ','
             << csvEscape(samples[i].month) << ','
@@ -1104,6 +1206,28 @@ void writeTrainingCsv(const std::vector<Sample> &samples) {
         }
         out << '\n';
     }
+}
+
+class TrainingCsvWriter {
+public:
+    TrainingCsvWriter() : out_(kTrainingCsv.c_str()) {
+        if (!out_) {
+            throw std::runtime_error("Unable to open training CSV for writing");
+        }
+        writeTrainingCsvHeader(out_);
+    }
+
+    void write(const std::vector<Sample> &samples) {
+        writeTrainingCsvRows(out_, samples);
+    }
+
+private:
+    std::ofstream out_;
+};
+
+void writeTrainingCsv(const std::vector<Sample> &samples) {
+    TrainingCsvWriter writer;
+    writer.write(samples);
 }
 
 Scaler fitScaler(const std::vector<Sample> &samples, size_t begin, size_t end) {
@@ -1709,18 +1833,21 @@ void scrapeHistoricalCoinData(const std::vector<std::string> &symbolOverrides) {
             return;
         }
         const std::vector<std::string> symbols = readRequestedSymbols(symbolArgs);
-        std::vector<Sample> allSamples;
         std::vector<Sample> trainingSamples;
         std::vector<Sample> validationSamples;
         std::vector<Sample> testSamples;
+        TrainingCsvWriter trainingWriter;
 
         for (size_t i = 0; i < symbols.size(); ++i) {
             try {
                 const std::vector<std::string> dates = listKlineDates(symbols[i]);
                 const std::vector<std::string> months = firstAvailableMonths(dates, options.totalMonths);
-                if (static_cast<int>(months.size()) < options.requiredMonths()) {
+                const MonthSplit split = splitForMonthCount(static_cast<int>(months.size()), options);
+                const int requiredMonths = split.train + split.validation + split.test;
+                if (static_cast<int>(months.size()) < requiredMonths || split.train <= 0 || split.validation <= 0 || split.test <= 0) {
                     std::cout << "Skipping " << symbols[i] << ": fewer than "
-                              << options.requiredMonths() << " months of 1m klines.\n";
+                              << (options.splitMode == "fixed" ? options.requiredMonths() : 3)
+                              << " months of 1m klines.\n";
                     continue;
                 }
 
@@ -1738,27 +1865,35 @@ void scrapeHistoricalCoinData(const std::vector<std::string> &symbolOverrides) {
                         static_cast<int>(monthIndex),
                         candles,
                         options);
-                    allSamples.insert(allSamples.end(), monthSamples.begin(), monthSamples.end());
+                    trainingWriter.write(monthSamples);
 
-                    if (static_cast<int>(monthIndex) < options.trainingMonths) {
-                        trainingSamples.insert(trainingSamples.end(), monthSamples.begin(), monthSamples.end());
+                    if (static_cast<int>(monthIndex) < split.train) {
                         symbolTrainSamples += monthSamples.size();
-                    } else if (static_cast<int>(monthIndex) < options.trainingMonths + options.validationMonths) {
-                        validationSamples.insert(validationSamples.end(), monthSamples.begin(), monthSamples.end());
+                        if (!options.generateOnly) {
+                            trainingSamples.insert(trainingSamples.end(), monthSamples.begin(), monthSamples.end());
+                        }
+                    } else if (static_cast<int>(monthIndex) < split.train + split.validation) {
                         symbolValidationSamples += monthSamples.size();
-                    } else if (static_cast<int>(monthIndex) < options.trainingMonths + options.validationMonths + options.testMonths) {
-                        testSamples.insert(testSamples.end(), monthSamples.begin(), monthSamples.end());
+                        if (!options.generateOnly) {
+                            validationSamples.insert(validationSamples.end(), monthSamples.begin(), monthSamples.end());
+                        }
+                    } else if (static_cast<int>(monthIndex) < split.train + split.validation + split.test) {
                         symbolTestSamples += monthSamples.size();
+                        if (!options.generateOnly) {
+                            testSamples.insert(testSamples.end(), monthSamples.begin(), monthSamples.end());
+                        }
                     }
                 }
 
                 std::cout << "Processed " << (i + 1) << "/" << symbols.size()
                           << ": " << symbols[i]
-                          << " train_months=" << months[0] << ".." << months[options.trainingMonths - 1]
+                          << " split_mode=" << options.splitMode
+                          << " available_months=" << months.size()
+                          << " train_months=" << monthRangeDescription(months, 0, split.train)
                           << " train_samples=" << symbolTrainSamples
-                          << " validation_month=" << months[options.trainingMonths]
+                          << " validation_months=" << monthRangeDescription(months, split.train, split.validation)
                           << " validation_samples=" << symbolValidationSamples
-                          << " test_month=" << months[options.trainingMonths + options.validationMonths]
+                          << " test_months=" << monthRangeDescription(months, split.train + split.validation, split.test)
                           << " test_samples=" << symbolTestSamples << '\n';
             } catch (const std::exception &error) {
                 std::cerr << "\nSkipping " << symbols[i] << ": " << error.what() << '\n';
@@ -1766,7 +1901,12 @@ void scrapeHistoricalCoinData(const std::vector<std::string> &symbolOverrides) {
             }
         }
 
-        writeTrainingCsv(allSamples);
+        if (options.generateOnly) {
+            std::cout << "Wrote " << kTrainingCsv
+                      << ". Skipped C++ logistic baseline because --generate-only was set.\n";
+            return;
+        }
+
         EvaluationMetrics validationMetrics;
         EvaluationMetrics testMetrics;
         const TrainingResult result = trainModel(trainingSamples, validationSamples, testSamples, options, validationMetrics, testMetrics);

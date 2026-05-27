@@ -15,6 +15,19 @@ import importlib.util
 import math
 import os
 import sys
+import tempfile
+import warnings
+
+try:
+    import numpy as np
+except ImportError:
+    np = None
+
+warnings.filterwarnings(
+    "ignore",
+    message="X does not have valid feature names, but LGBMClassifier was fitted with feature names",
+    category=UserWarning,
+)
 
 
 METADATA_COLUMNS = set([
@@ -74,6 +87,24 @@ def build_features(item, feature_columns, storage):
 
 def adaptive_thresholds(probabilities, base_thresholds, min_validation_trades):
     thresholds = set(value for value in base_thresholds if 0.0 <= value <= 1.0)
+    if np is not None and isinstance(probabilities, np.ndarray):
+        valid = probabilities[(probabilities >= 0.0) & (probabilities <= 1.0)]
+        if valid.size == 0:
+            return sorted(thresholds)
+        ordered = np.sort(valid)
+        ordered_count = int(ordered.size)
+        max_probability = float(ordered[-1])
+        quantiles = [0.50, 0.60, 0.70, 0.80, 0.85, 0.90, 0.925, 0.95, 0.975, 0.99, 0.995]
+        for quantile in quantiles:
+            index = int((ordered_count - 1) * quantile)
+            thresholds.add(float(ordered[index]))
+        target_counts = [max(1, min_validation_trades), max(1, min_validation_trades * 2), 10, 25, 50, 100, 250, 500, 1000]
+        for count in target_counts:
+            if count <= ordered_count:
+                thresholds.add(float(ordered[-count]))
+        thresholds.add(max(0.0, max_probability - 1e-12))
+        return sorted(thresholds)
+
     ordered = sorted(value for value in probabilities if 0.0 <= value <= 1.0)
     if not ordered:
         return sorted(thresholds)
@@ -122,6 +153,98 @@ class DataRow(object):
         self.features = features
 
 
+class CompactTable(object):
+    __slots__ = (
+        "symbols",
+        "months",
+        "symbol_codes",
+        "month_codes",
+        "month_indices",
+        "open_times",
+        "labels",
+        "forward_returns",
+        "trade_returns",
+        "max_future_high_returns",
+        "max_future_low_returns",
+        "features",
+        "memmap_path",
+    )
+
+    def __init__(self, symbols, months, symbol_codes, month_codes, month_indices, open_times,
+                 labels, forward_returns, trade_returns, max_future_high_returns,
+                 max_future_low_returns, features, memmap_path=None):
+        self.symbols = symbols
+        self.months = months
+        self.symbol_codes = symbol_codes
+        self.month_codes = month_codes
+        self.month_indices = month_indices
+        self.open_times = open_times
+        self.labels = labels
+        self.forward_returns = forward_returns
+        self.trade_returns = trade_returns
+        self.max_future_high_returns = max_future_high_returns
+        self.max_future_low_returns = max_future_low_returns
+        self.features = features
+        self.memmap_path = memmap_path
+
+    def cleanup(self):
+        if self.memmap_path:
+            try:
+                self.features.flush()
+            except Exception:
+                pass
+            try:
+                os.remove(self.memmap_path)
+            except OSError:
+                pass
+            self.memmap_path = None
+
+
+class CompactRows(object):
+    """A memory-light row view backed by one NumPy feature matrix.
+
+    The large LightGBM path uses this instead of one Python object plus one
+    feature array per candle. Subsets store integer row positions only, so split
+    logic remains chronological without duplicating metadata.
+    """
+
+    __slots__ = ("table", "indices")
+
+    def __init__(self, table, indices=None):
+        self.table = table
+        self.indices = indices
+
+    def __len__(self):
+        if self.indices is None:
+            return len(self.table.labels)
+        return len(self.indices)
+
+    def positions(self):
+        if self.indices is None:
+            return range(len(self.table.labels))
+        return self.indices
+
+    def subset(self, indices):
+        return CompactRows(self.table, indices)
+
+    def feature_matrix(self):
+        if self.indices is None:
+            return self.table.features
+        return self.table.features[self.indices, :]
+
+    def labels_array(self):
+        if self.indices is None:
+            return self.table.labels
+        return self.table.labels[self.indices]
+
+    def cleanup(self):
+        self.table.cleanup()
+
+
+def is_compact_rows(rows):
+    return isinstance(rows, CompactRows)
+
+
 def make_row(item, feature_columns, month_index_lookup, text_cache, feature_storage):
     symbol = cached_text(text_cache, item.get("symbol", ""))
     month = cached_text(text_cache, item.get("month", ""))
@@ -146,7 +269,137 @@ def make_row(item, feature_columns, month_index_lookup, text_cache, feature_stor
     )
 
 
-def load_rows(path, feature_storage="float32"):
+def csv_value(fields, positions, name, default=""):
+    position = positions.get(name)
+    if position is None or position >= len(fields):
+        return default
+    return fields[position]
+
+
+def count_csv_rows(path):
+    with open(path, newline="") as handle:
+        reader = csv.reader(handle)
+        try:
+            next(reader)
+        except StopIteration:
+            return 0
+        return sum(1 for _ in reader)
+
+
+def load_compact_rows(path, feature_storage="matrix32", memmap_dir=None):
+    if np is None:
+        raise ValueError("compact matrix storage requires numpy")
+
+    dtype = np.float32 if feature_storage in ("auto", "matrix32", "memmap32") else np.float64
+    use_memmap = feature_storage in ("memmap32", "memmap64")
+    row_count = count_csv_rows(path)
+    with open(path, newline="") as handle:
+        reader = csv.reader(handle)
+        try:
+            fieldnames = next(reader)
+        except StopIteration:
+            raise ValueError("empty CSV: {}".format(path))
+
+        positions = {name: index for index, name in enumerate(fieldnames)}
+        feature_columns = [name for name in fieldnames if name not in METADATA_COLUMNS]
+        if "label" not in positions:
+            raise ValueError("{} must contain a label column".format(path))
+        if "month_index" not in positions:
+            raise ValueError("compact storage requires a month_index column")
+        if not feature_columns:
+            raise ValueError("{} does not contain feature columns".format(path))
+
+        feature_positions = [positions[name] for name in feature_columns]
+        memmap_path = None
+        if use_memmap:
+            directory = memmap_dir or tempfile.gettempdir()
+            os.makedirs(directory, exist_ok=True)
+            descriptor, memmap_path = tempfile.mkstemp(
+                prefix="gbdt_features_",
+                suffix=".dat",
+                dir=directory,
+            )
+            os.close(descriptor)
+            features = np.memmap(
+                memmap_path,
+                dtype=dtype,
+                mode="w+",
+                shape=(row_count, len(feature_columns)),
+            )
+        else:
+            features = np.empty((row_count, len(feature_columns)), dtype=dtype)
+        symbol_codes = np.empty(row_count, dtype=np.int32)
+        month_codes = np.empty(row_count, dtype=np.int32)
+        month_indices = np.empty(row_count, dtype=np.int16)
+        open_times = np.empty(row_count, dtype=np.int64)
+        labels_values = np.empty(row_count, dtype=np.int8)
+        forward_returns = np.empty(row_count, dtype=np.float32)
+        trade_returns = np.empty(row_count, dtype=np.float32)
+        max_future_high_returns = np.empty(row_count, dtype=np.float32)
+        max_future_low_returns = np.empty(row_count, dtype=np.float32)
+        symbol_lookup = {}
+        month_lookup = {}
+        symbols = []
+        months = []
+
+        for row_index, fields in enumerate(reader):
+            symbol = csv_value(fields, positions, "symbol")
+            month = csv_value(fields, positions, "month")
+            symbol_code = symbol_lookup.get(symbol)
+            if symbol_code is None:
+                symbol_code = len(symbols)
+                symbol_lookup[symbol] = symbol_code
+                symbols.append(symbol)
+            month_code = month_lookup.get(month)
+            if month_code is None:
+                month_code = len(months)
+                month_lookup[month] = month_code
+                months.append(month)
+
+            symbol_codes[row_index] = symbol_code
+            month_codes[row_index] = month_code
+            month_indices[row_index] = int(safe_float(csv_value(fields, positions, "month_index"), 0.0))
+            open_times[row_index] = int(safe_float(csv_value(fields, positions, "open_time"), 0.0))
+            labels_values[row_index] = 1 if str(csv_value(fields, positions, "label", "0")).strip() == "1" else 0
+            forward_return = safe_float(csv_value(fields, positions, "forward_return"), 0.0)
+            trade_return = safe_float(csv_value(fields, positions, "trade_return"), forward_return)
+            forward_returns[row_index] = forward_return
+            trade_returns[row_index] = trade_return
+            max_future_high_returns[row_index] = safe_float(
+                csv_value(fields, positions, "max_future_high_return"),
+                forward_return,
+            )
+            max_future_low_returns[row_index] = safe_float(
+                csv_value(fields, positions, "max_future_low_return"),
+                forward_return,
+            )
+            for feature_index, field_index in enumerate(feature_positions):
+                features[row_index, feature_index] = safe_float(
+                    fields[field_index] if field_index < len(fields) else "",
+                    0.0,
+                )
+        if use_memmap:
+            features.flush()
+
+    table = CompactTable(
+        symbols,
+        months,
+        symbol_codes,
+        month_codes,
+        month_indices,
+        open_times,
+        labels_values,
+        forward_returns,
+        trade_returns,
+        max_future_high_returns,
+        max_future_low_returns,
+        features,
+        memmap_path,
+    )
+    return CompactRows(table), feature_columns, "forward_return" in positions
+
+
+def load_object_rows(path, feature_storage="float32"):
     with open(path, newline="") as handle:
         reader = csv.DictReader(handle)
         if not reader.fieldnames:
@@ -195,19 +448,192 @@ def load_rows(path, feature_storage="float32"):
     return rows, feature_columns, has_returns
 
 
+def load_rows(path, feature_storage="float32", memmap_dir=None):
+    if feature_storage in ("auto", "matrix32", "matrix64", "memmap32", "memmap64"):
+        try:
+            return load_compact_rows(path, feature_storage, memmap_dir)
+        except ValueError as error:
+            if feature_storage != "auto":
+                raise
+            print("compact storage unavailable ({}); falling back to per-row float32 storage".format(error), file=sys.stderr)
+    return load_object_rows(path, "float32" if feature_storage == "auto" else feature_storage)
+
+
 def labels(rows):
+    if is_compact_rows(rows):
+        return rows.labels_array()
     return [row.label for row in rows]
 
 
-def matrix(rows):
+def matrix(rows, storage=None):
+    if is_compact_rows(rows):
+        values = rows.feature_matrix()
+        if storage in ("float64", "matrix64", "memmap64"):
+            return np.ascontiguousarray(values, dtype=np.float64)
+        return np.ascontiguousarray(values, dtype=np.float32)
+    if storage in ("float32", "float64") and np is not None:
+        dtype = np.float32 if storage == "float32" else np.float64
+        if not rows:
+            return np.empty((0, 0), dtype=dtype)
+        feature_count = len(rows[0].features)
+        values = np.empty((len(rows), feature_count), dtype=dtype)
+        for index, row in enumerate(rows):
+            values[index, :] = row.features
+        return values
     return [row.features for row in rows]
 
 
+def model_matrix(rows, kind, args):
+    if is_compact_rows(rows):
+        return matrix(rows, args.feature_storage)
+    if kind == "lightgbm" and args.feature_storage in ("float32", "float64", "matrix32", "matrix64", "memmap32", "memmap64"):
+        return matrix(rows, args.feature_storage)
+    return matrix(rows)
+
+
+def model_labels(rows, kind):
+    values = labels(rows)
+    if kind == "lightgbm" and np is not None:
+        return np.asarray(values, dtype=np.int8)
+    return values
+
+
 def select_month_range(rows, start, end):
+    if is_compact_rows(rows):
+        month_indices = rows.table.month_indices
+        if rows.indices is None:
+            mask = (month_indices >= start) & (month_indices < end)
+            return rows.subset(np.nonzero(mask)[0].astype(np.int32, copy=False))
+        base = rows.indices
+        mask = (month_indices[base] >= start) & (month_indices[base] < end)
+        return rows.subset(base[mask])
     return [row for row in rows if start <= row.month_index < end]
 
 
+def ratio_split_counts(month_count, train_ratio, validation_ratio, test_ratio):
+    if month_count < 3:
+        return 0, 0, 0
+    validation_count = max(1, int(round(month_count * validation_ratio)))
+    test_count = max(1, int(round(month_count * test_ratio)))
+    if validation_count + test_count >= month_count:
+        validation_count = 1
+        test_count = 1
+    train_count = month_count - validation_count - test_count
+    if train_count < 1:
+        train_count = 1
+        if validation_count > 1:
+            validation_count -= 1
+        elif test_count > 1:
+            test_count -= 1
+    return train_count, validation_count, test_count
+
+
+def select_ratio_split(rows, args):
+    if is_compact_rows(rows):
+        months_by_symbol = {}
+        table = rows.table
+        for position in rows.positions():
+            symbol_code = int(table.symbol_codes[position])
+            months_by_symbol.setdefault(symbol_code, set()).add(int(table.month_indices[position]))
+
+        split_lookup = {}
+        for symbol_code, month_set in months_by_symbol.items():
+            months = sorted(month_set)
+            train_count, validation_count, test_count = ratio_split_counts(
+                len(months),
+                args.train_ratio,
+                args.validation_ratio,
+                args.test_ratio,
+            )
+            if not train_count or not validation_count or not test_count:
+                continue
+            for month in months[:train_count]:
+                split_lookup[(symbol_code, month)] = 1
+            for month in months[train_count:train_count + validation_count]:
+                split_lookup[(symbol_code, month)] = 2
+            for month in months[train_count + validation_count:train_count + validation_count + test_count]:
+                split_lookup[(symbol_code, month)] = 3
+
+        flags = np.zeros(len(rows), dtype=np.int8)
+        for local_index, position in enumerate(rows.positions()):
+            flags[local_index] = split_lookup.get(
+                (int(table.symbol_codes[position]), int(table.month_indices[position])),
+                0,
+            )
+        if rows.indices is None:
+            train_indices = np.nonzero(flags == 1)[0].astype(np.int32, copy=False)
+            validation_indices = np.nonzero(flags == 2)[0].astype(np.int32, copy=False)
+            test_indices = np.nonzero(flags == 3)[0].astype(np.int32, copy=False)
+        else:
+            train_indices = rows.indices[flags == 1]
+            validation_indices = rows.indices[flags == 2]
+            test_indices = rows.indices[flags == 3]
+        return rows.subset(train_indices), rows.subset(validation_indices), rows.subset(test_indices)
+
+    months_by_symbol = {}
+    for row in rows:
+        months_by_symbol.setdefault(row.symbol, set()).add(row.month_index)
+
+    split_lookup = {}
+    for symbol, month_set in months_by_symbol.items():
+        months = sorted(month_set)
+        train_count, validation_count, test_count = ratio_split_counts(
+            len(months),
+            args.train_ratio,
+            args.validation_ratio,
+            args.test_ratio,
+        )
+        if not train_count or not validation_count or not test_count:
+            continue
+        train_months = set(months[:train_count])
+        validation_months = set(months[train_count:train_count + validation_count])
+        test_months = set(months[train_count + validation_count:train_count + validation_count + test_count])
+        for month in train_months:
+            split_lookup[(symbol, month)] = "train"
+        for month in validation_months:
+            split_lookup[(symbol, month)] = "validation"
+        for month in test_months:
+            split_lookup[(symbol, month)] = "test"
+
+    train_rows = []
+    validation_rows = []
+    test_rows = []
+    for row in rows:
+        split = split_lookup.get((row.symbol, row.month_index))
+        if split == "train":
+            train_rows.append(row)
+        elif split == "validation":
+            validation_rows.append(row)
+        elif split == "test":
+            test_rows.append(row)
+    return train_rows, validation_rows, test_rows
+
+
 def auc_score_from_rows(probabilities, rows):
+    if is_compact_rows(rows):
+        y_true = rows.labels_array()
+        positives = int(np.sum(y_true))
+        negatives = len(rows) - positives
+        if positives == 0 or negatives == 0:
+            return 0.0
+        probability_values = np.asarray(probabilities, dtype=np.float32)
+        order = np.argsort(probability_values, kind="mergesort")
+        sorted_probabilities = probability_values[order]
+        sorted_labels = y_true[order]
+        rank_sum = 0.0
+        index = 0
+        row_count = len(rows)
+        while index < row_count:
+            next_index = index + 1
+            while next_index < row_count and sorted_probabilities[next_index] == sorted_probabilities[index]:
+                next_index += 1
+            positive_ties = int(np.sum(sorted_labels[index:next_index]))
+            if positive_ties:
+                average_rank = (index + 1 + next_index) / 2.0
+                rank_sum += positive_ties * average_rank
+            index = next_index
+        return (rank_sum - positives * (positives + 1) / 2.0) / float(positives * negatives)
+
     pairs = sorted((probability, row.label) for probability, row in zip(probabilities, rows))
     positives = sum(row.label for row in rows)
     negatives = len(rows) - positives
@@ -243,8 +669,139 @@ def trade_limit_key(row):
     return (row.symbol, row.month)
 
 
+def evaluate_compact(rows, probabilities, threshold, fee, slippage, cooldown_minutes=0,
+                     max_trades_per_symbol_month=0, compute_auc=True):
+    table = rows.table
+    actual_positive = 0
+    predicted_trades = 0
+    tp = fp = tn = fn = 0
+    returns = []
+    trade_returns = []
+    sum_return = 0.0
+    sum_trade_return = 0.0
+    sum_mfe = 0.0
+    sum_mae = 0.0
+    total_fee = 0.0
+    total_fee_slippage = 0.0
+    gross_profit = 0.0
+    gross_loss = 0.0
+    winning_trades = 0
+    equity = 0.0
+    peak = 0.0
+    max_drawdown = 0.0
+    next_allowed_signal_time = {}
+    trades_by_symbol_month = {}
+    cooldown_ms = max(0, int(cooldown_minutes)) * 60 * 1000
+
+    for local_index, position in enumerate(rows.positions()):
+        label = int(table.labels[position])
+        if label == 1:
+            actual_positive += 1
+        raw_signal = float(probabilities[local_index]) >= threshold
+        predicted = False
+        symbol_code = int(table.symbol_codes[position])
+        if raw_signal:
+            next_allowed = next_allowed_signal_time.get(symbol_code, 0)
+            open_time = int(table.open_times[position])
+            predicted = open_time >= next_allowed
+            if predicted and max_trades_per_symbol_month > 0:
+                limit_key = (symbol_code, int(table.month_codes[position]))
+                if trades_by_symbol_month.get(limit_key, 0) >= max_trades_per_symbol_month:
+                    predicted = False
+            if predicted:
+                if max_trades_per_symbol_month > 0:
+                    limit_key = (symbol_code, int(table.month_codes[position]))
+                    trades_by_symbol_month[limit_key] = trades_by_symbol_month.get(limit_key, 0) + 1
+                if cooldown_ms:
+                    next_allowed_signal_time[symbol_code] = open_time + cooldown_ms
+        if not predicted:
+            if label == 1:
+                fn += 1
+            else:
+                tn += 1
+            continue
+
+        predicted_trades += 1
+        if label == 1:
+            tp += 1
+        else:
+            fp += 1
+
+        forward_return = float(table.forward_returns[position])
+        trade_return = float(table.trade_returns[position])
+        max_future_high_return = float(table.max_future_high_returns[position])
+        max_future_low_return = float(table.max_future_low_returns[position])
+        after_fee = trade_return - fee
+        after_fee_slippage = trade_return - fee - slippage
+        total_fee += after_fee
+        total_fee_slippage += after_fee_slippage
+        sum_return += forward_return
+        sum_trade_return += trade_return
+        sum_mfe += max_future_high_return
+        sum_mae += max_future_low_return
+        returns.append(forward_return)
+        trade_returns.append(trade_return)
+        if trade_return > 0.0:
+            winning_trades += 1
+        if after_fee_slippage >= 0.0:
+            gross_profit += after_fee_slippage
+        else:
+            gross_loss += -after_fee_slippage
+        equity += after_fee_slippage
+        peak = max(peak, equity)
+        max_drawdown = max(max_drawdown, peak - equity)
+
+    total = len(rows)
+    precision = float(tp) / predicted_trades if predicted_trades else 0.0
+    recall = float(tp) / actual_positive if actual_positive else 0.0
+    accuracy = float(tp + tn) / total if total else 0.0
+    f1 = 2.0 * precision * recall / (precision + recall) if precision + recall else 0.0
+    trade_count = float(predicted_trades) if predicted_trades else 1.0
+
+    return {
+        "rows": total,
+        "actual_positive_rows": actual_positive,
+        "predicted_trades": predicted_trades,
+        "true_positive_rows": tp,
+        "false_positive_rows": fp,
+        "true_negative_rows": tn,
+        "false_negative_rows": fn,
+        "auc": auc_score_from_rows(probabilities, rows) if compute_auc else 0.0,
+        "accuracy": accuracy,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "win_rate": float(winning_trades) / predicted_trades if predicted_trades else 0.0,
+        "average_forward_return": sum_return / trade_count if predicted_trades else 0.0,
+        "median_forward_return": median(returns),
+        "average_trade_return": sum_trade_return / trade_count if predicted_trades else 0.0,
+        "median_trade_return": median(trade_returns),
+        "average_max_favorable_excursion": sum_mfe / trade_count if predicted_trades else 0.0,
+        "average_max_adverse_excursion": sum_mae / trade_count if predicted_trades else 0.0,
+        "average_profit_after_fee": total_fee / trade_count if predicted_trades else 0.0,
+        "average_profit_after_fee_and_slippage": total_fee_slippage / trade_count if predicted_trades else 0.0,
+        "total_profit_after_fee": total_fee,
+        "total_profit_after_fee_and_slippage": total_fee_slippage,
+        "profit_factor": gross_profit / gross_loss if gross_loss else (float("inf") if gross_profit else 0.0),
+        "max_drawdown": max_drawdown,
+        "selected_threshold": threshold,
+    }
+
+
 def evaluate(rows, probabilities, threshold, fee, slippage, cooldown_minutes=0,
              max_trades_per_symbol_month=0, compute_auc=True):
+    if is_compact_rows(rows):
+        return evaluate_compact(
+            rows,
+            probabilities,
+            threshold,
+            fee,
+            slippage,
+            cooldown_minutes,
+            max_trades_per_symbol_month,
+            compute_auc,
+        )
+
     actual_positive = 0
     predicted_trades = 0
     tp = fp = tn = fn = 0
@@ -557,6 +1114,8 @@ class ExternalModel(object):
 
     def predict_proba(self, x_rows):
         probabilities = self.model.predict_proba(x_rows)
+        if np is not None:
+            return np.asarray(probabilities)[:, 1].astype(np.float32, copy=True)
         return [float(row[1]) for row in probabilities]
 
     def feature_importance(self, feature_names):
@@ -589,7 +1148,7 @@ def choose_model_kind(requested):
 
 
 def class_weight_ratio(y_train, cap):
-    positives = sum(y_train)
+    positives = int(np.sum(y_train)) if np is not None and isinstance(y_train, np.ndarray) else sum(y_train)
     negatives = len(y_train) - positives
     if positives <= 0:
         return 1.0
@@ -609,6 +1168,11 @@ def make_model(kind, params, positive_weight):
             colsample_bytree=params["colsample_bytree"],
             min_child_samples=params["min_child_samples"],
             reg_lambda=params["reg_lambda"],
+            max_bin=params["max_bin"],
+            subsample_for_bin=params["subsample_for_bin"],
+            histogram_pool_size=params["histogram_pool_size"],
+            n_jobs=params["n_jobs"],
+            force_col_wise=True,
             objective="binary",
             scale_pos_weight=positive_weight,
             random_state=17,
@@ -628,13 +1192,22 @@ def candidate_params(kind, args):
         return [
             {"n_estimators": args.n_estimators, "learning_rate": args.learning_rate, "num_leaves": 31,
              "max_depth": -1, "subsample": 0.9, "colsample_bytree": 0.9,
-             "min_child_samples": 50, "reg_lambda": 2.0},
+             "min_child_samples": 50, "reg_lambda": 2.0, "max_bin": args.max_bin,
+             "subsample_for_bin": args.subsample_for_bin,
+             "histogram_pool_size": args.lightgbm_histogram_pool_mb,
+             "n_jobs": args.n_jobs},
             {"n_estimators": max(80, args.n_estimators // 2), "learning_rate": args.learning_rate * 1.6,
              "num_leaves": 31, "max_depth": 6, "subsample": 0.9, "colsample_bytree": 0.85,
-             "min_child_samples": 80, "reg_lambda": 4.0},
+             "min_child_samples": 80, "reg_lambda": 4.0, "max_bin": args.max_bin,
+             "subsample_for_bin": args.subsample_for_bin,
+             "histogram_pool_size": args.lightgbm_histogram_pool_mb,
+             "n_jobs": args.n_jobs},
             {"n_estimators": int(args.n_estimators * 1.5), "learning_rate": args.learning_rate * 0.7,
              "num_leaves": 63, "max_depth": -1, "subsample": 0.85, "colsample_bytree": 0.9,
-             "min_child_samples": 60, "reg_lambda": 3.0},
+             "min_child_samples": 60, "reg_lambda": 3.0, "max_bin": args.max_bin,
+             "subsample_for_bin": args.subsample_for_bin,
+             "histogram_pool_size": args.lightgbm_histogram_pool_mb,
+             "n_jobs": args.n_jobs},
         ]
     return [
         {"n_estimators": max(2, args.internal_estimators // 2), "learning_rate": args.internal_learning_rate,
@@ -647,9 +1220,9 @@ def candidate_params(kind, args):
 
 
 def fit_select_model(train_rows, validation_rows, feature_names, args, kind):
-    x_train = matrix(train_rows)
-    y_train = labels(train_rows)
-    x_validation = matrix(validation_rows)
+    x_train = model_matrix(train_rows, kind, args)
+    y_train = model_labels(train_rows, kind)
+    x_validation = model_matrix(validation_rows, kind, args)
     positive_weight = class_weight_ratio(y_train, args.positive_weight_cap)
 
     best = None
@@ -680,6 +1253,9 @@ def fit_select_model(train_rows, validation_rows, feature_names, args, kind):
         zero_trade_score = 0.0 if args.threshold_objective in ("profit", "avg_profit") and args.profit_safety == "strict" else -float("inf")
         score = threshold_score(metrics, args.threshold_objective, zero_trade_score)
         if best is None or score > best["score"]:
+            if best is not None:
+                old_model = best.pop("model", None)
+                del old_model
             best = {
                 "model": model,
                 "params": params,
@@ -687,6 +1263,14 @@ def fit_select_model(train_rows, validation_rows, feature_names, args, kind):
                 "validation_metrics": metrics,
                 "score": score,
             }
+        else:
+            del model
+        del probabilities
+        gc.collect()
+    del x_train
+    del y_train
+    del x_validation
+    gc.collect()
     return best
 
 
@@ -711,6 +1295,50 @@ def write_predictions(path, rows, probabilities, threshold, model_name, cooldown
                 "max_future_low_return",
                 "model_name",
             ])
+        if is_compact_rows(rows):
+            table = rows.table
+            threshold_is_list = isinstance(threshold, list)
+            next_allowed_signal_time = {}
+            trades_by_symbol_month = {}
+            cooldown_ms = max(0, int(cooldown_minutes)) * 60 * 1000
+            for index, position in enumerate(rows.positions()):
+                row_threshold = threshold[index] if threshold_is_list else threshold
+                probability = float(probabilities[index])
+                raw_signal = probability >= row_threshold
+                predicted = False
+                symbol_code = int(table.symbol_codes[position])
+                if raw_signal:
+                    next_allowed = next_allowed_signal_time.get(symbol_code, 0)
+                    open_time = int(table.open_times[position])
+                    predicted = open_time >= next_allowed
+                    if predicted and max_trades_per_symbol_month > 0:
+                        limit_key = (symbol_code, int(table.month_codes[position]))
+                        if trades_by_symbol_month.get(limit_key, 0) >= max_trades_per_symbol_month:
+                            predicted = False
+                    if predicted:
+                        if max_trades_per_symbol_month > 0:
+                            limit_key = (symbol_code, int(table.month_codes[position]))
+                            trades_by_symbol_month[limit_key] = trades_by_symbol_month.get(limit_key, 0) + 1
+                        if cooldown_ms:
+                            next_allowed_signal_time[symbol_code] = open_time + cooldown_ms
+                writer.writerow([
+                    table.symbols[symbol_code],
+                    table.months[int(table.month_codes[position])],
+                    int(table.month_indices[position]),
+                    int(table.open_times[position]),
+                    int(table.labels[position]),
+                    "{:.12g}".format(probability),
+                    "{:.12g}".format(row_threshold),
+                    1 if raw_signal else 0,
+                    1 if predicted else 0,
+                    "{:.12g}".format(float(table.forward_returns[position])),
+                    "{:.12g}".format(float(table.trade_returns[position])),
+                    "{:.12g}".format(float(table.max_future_high_returns[position])),
+                    "{:.12g}".format(float(table.max_future_low_returns[position])),
+                    model_name,
+                ])
+            return
+
         threshold_is_list = isinstance(threshold, list)
         next_allowed_signal_time = {}
         trades_by_symbol_month = {}
@@ -753,6 +1381,10 @@ def write_predictions(path, rows, probabilities, threshold, model_name, cooldown
 METRIC_COLUMNS = [
     "model",
     "split",
+    "split_mode",
+    "train_ratio",
+    "validation_ratio",
+    "test_ratio",
     "threshold_objective",
     "selected_threshold",
     "train_rows",
@@ -800,6 +1432,10 @@ def metrics_record(model_name, split, objective, threshold, train_rows, validati
     record = {
         "model": model_name,
         "split": split,
+        "split_mode": args.split_mode,
+        "train_ratio": args.train_ratio,
+        "validation_ratio": args.validation_ratio,
+        "test_ratio": args.test_ratio,
         "threshold_objective": objective,
         "selected_threshold": threshold,
         "train_rows": len(train_rows),
@@ -845,21 +1481,27 @@ def write_feature_importance(path, model, feature_names, model_name):
 
 
 def run_fixed_split(rows, feature_names, args, kind, model_name):
-    train_end = args.train_months
-    validation_end = train_end + args.validation_months
-    test_end = validation_end + args.test_months
-    train_rows = select_month_range(rows, 0, train_end)
-    validation_rows = select_month_range(rows, train_end, validation_end)
-    test_rows = select_month_range(rows, validation_end, test_end)
+    if args.split_mode == "ratio":
+        train_rows, validation_rows, test_rows = select_ratio_split(rows, args)
+    else:
+        train_end = args.train_months
+        validation_end = train_end + args.validation_months
+        test_end = validation_end + args.test_months
+        train_rows = select_month_range(rows, 0, train_end)
+        validation_rows = select_month_range(rows, train_end, validation_end)
+        test_rows = select_month_range(rows, validation_end, test_end)
     if not train_rows or not validation_rows or not test_rows:
         raise RuntimeError(
             "not enough rows for fixed split: train={}, validation={}, test={}".format(
                 len(train_rows), len(validation_rows), len(test_rows)
             )
-        )
+    )
 
     selected = fit_select_model(train_rows, validation_rows, feature_names, args, kind)
-    probabilities = selected["model"].predict_proba(matrix(test_rows))
+    x_test = model_matrix(test_rows, kind, args)
+    probabilities = selected["model"].predict_proba(x_test)
+    del x_test
+    gc.collect()
     test_metrics = evaluate(
         test_rows,
         probabilities,
@@ -899,6 +1541,10 @@ def aggregate_fold_records(records, model_name, objective):
     aggregate = {
         "model": model_name,
         "split": "walkforward_average",
+        "split_mode": records[0].get("split_mode", ""),
+        "train_ratio": records[0].get("train_ratio", 0.0),
+        "validation_ratio": records[0].get("validation_ratio", 0.0),
+        "test_ratio": records[0].get("test_ratio", 0.0),
         "threshold_objective": objective,
         "selected_threshold": sum(float(row["selected_threshold"]) for row in records) / len(records),
         "train_rows": sum(int(row["train_rows"]) for row in records),
@@ -908,15 +1554,25 @@ def aggregate_fold_records(records, model_name, objective):
         "adaptive_thresholds": records[0].get("adaptive_thresholds", 0),
     }
     for column in METRIC_COLUMNS:
-        if column in aggregate or column in ("model", "split", "threshold_objective", "profit_safety"):
+        if column in aggregate or column in ("model", "split", "split_mode", "threshold_objective", "profit_safety"):
             continue
         values = [row.get(column) for row in records if isinstance(row.get(column), (int, float))]
         aggregate[column] = sum(values) / len(values) if values else 0.0
     return aggregate
 
 
+def max_month_index(rows):
+    if not rows:
+        return -1
+    if is_compact_rows(rows):
+        if rows.indices is None:
+            return int(np.max(rows.table.month_indices))
+        return int(np.max(rows.table.month_indices[rows.indices]))
+    return max(row.month_index for row in rows)
+
+
 def run_walk_forward(rows, feature_names, args, kind, model_name):
-    max_month = max(row.month_index for row in rows) if rows else -1
+    max_month = max_month_index(rows)
     fold_records = []
     write_predictions(
         args.walk_predictions_out,
@@ -942,13 +1598,20 @@ def run_walk_forward(rows, feature_names, args, kind, model_name):
             continue
 
         selected = fit_select_model(train_rows, validation_rows, feature_names, args, kind)
-        positive_weight = class_weight_ratio(labels(final_train_rows), args.positive_weight_cap)
+        y_final = model_labels(final_train_rows, kind)
+        positive_weight = class_weight_ratio(y_final, args.positive_weight_cap)
         selected_model = selected.pop("model", None)
         del selected_model
         gc.collect()
         final_model = make_model(kind, selected["params"], positive_weight)
-        final_model.fit(matrix(final_train_rows), labels(final_train_rows), feature_names)
-        probabilities = final_model.predict_proba(matrix(test_rows))
+        x_final = model_matrix(final_train_rows, kind, args)
+        final_model.fit(x_final, y_final, feature_names)
+        del x_final
+        gc.collect()
+        x_test = model_matrix(test_rows, kind, args)
+        probabilities = final_model.predict_proba(x_test)
+        del x_test
+        gc.collect()
         metrics = evaluate(
             test_rows,
             probabilities,
@@ -984,6 +1647,7 @@ def run_walk_forward(rows, feature_names, args, kind, model_name):
         del selected
         del final_model
         del probabilities
+        del y_final
         del train_rows
         del validation_rows
         del final_train_rows
@@ -1071,9 +1735,13 @@ def build_parser():
     parser = argparse.ArgumentParser(description="Train/evaluate boosted trees on generated kline samples.")
     parser.add_argument("--input", default="kline_growth_training.csv")
     parser.add_argument("--model", choices=["auto", "lightgbm", "internal"], default="auto")
+    parser.add_argument("--split-mode", choices=["fixed", "ratio"], default="fixed")
     parser.add_argument("--train-months", type=int, default=6)
     parser.add_argument("--validation-months", type=int, default=1)
     parser.add_argument("--test-months", type=int, default=1)
+    parser.add_argument("--train-ratio", type=float, default=0.70)
+    parser.add_argument("--validation-ratio", type=float, default=0.15)
+    parser.add_argument("--test-ratio", type=float, default=0.15)
     parser.add_argument("--threshold-grid", default="0.001,0.002,0.005,0.01,0.02,0.05,0.10,0.15,0.20,0.30,0.40,0.50,0.60,0.70,0.80,0.90,0.95,0.99")
     parser.add_argument("--threshold-objective", choices=["profit", "avg_profit", "precision", "recall", "f1"], default="avg_profit")
     parser.add_argument("--fee", type=float, default=0.001)
@@ -1089,11 +1757,16 @@ def build_parser():
     parser.add_argument("--positive-weight-cap", type=float, default=50.0)
     parser.add_argument("--n-estimators", type=int, default=200)
     parser.add_argument("--learning-rate", type=float, default=0.05)
+    parser.add_argument("--max-bin", type=int, default=127)
+    parser.add_argument("--subsample-for-bin", type=int, default=200000)
+    parser.add_argument("--lightgbm-histogram-pool-mb", type=float, default=256.0)
+    parser.add_argument("--n-jobs", type=int, default=4)
     parser.add_argument("--internal-estimators", type=int, default=24)
     parser.add_argument("--internal-learning-rate", type=float, default=0.08)
     parser.add_argument("--internal-bins", type=int, default=12)
     parser.add_argument("--internal-l2", type=float, default=2.0)
-    parser.add_argument("--feature-storage", choices=["float32", "float64", "list"], default="float32")
+    parser.add_argument("--feature-storage", choices=["auto", "memmap32", "memmap64", "matrix32", "matrix64", "float32", "float64", "list"], default="auto")
+    parser.add_argument("--memmap-dir", default="")
     parser.add_argument("--walk-forward", action="store_true")
     parser.add_argument("--walk-train-months", type=int, default=6)
     parser.add_argument("--predictions-out", default="kline_growth_predictions_gbdt.csv")
@@ -1122,9 +1795,21 @@ def main(argv):
         raise ValueError("--min-selected-threshold must be between 0 and 1.01")
     if args.max_trades_per_symbol_month < 0:
         raise ValueError("--max-trades-per-symbol-month cannot be negative")
+    if args.max_bin < 2:
+        raise ValueError("--max-bin must be at least 2")
+    if args.subsample_for_bin <= 0:
+        raise ValueError("--subsample-for-bin must be positive")
+    if args.lightgbm_histogram_pool_mb <= 0.0:
+        raise ValueError("--lightgbm-histogram-pool-mb must be positive")
+    if args.train_ratio <= 0.0 or args.validation_ratio <= 0.0 or args.test_ratio <= 0.0:
+        raise ValueError("--train-ratio, --validation-ratio, and --test-ratio must be positive")
+    if abs((args.train_ratio + args.validation_ratio + args.test_ratio) - 1.0) > 0.001:
+        raise ValueError("--train-ratio + --validation-ratio + --test-ratio must equal 1.0")
     args.thresholds = parse_threshold_grid(args.threshold_grid)
     kind = choose_model_kind(args.model)
-    rows, feature_names, has_returns = load_rows(args.input, args.feature_storage)
+    if args.feature_storage == "auto":
+        args.feature_storage = "memmap32" if np is not None else "float32"
+    rows, feature_names, has_returns = load_rows(args.input, args.feature_storage, args.memmap_dir or None)
     if not has_returns and args.threshold_objective in ("profit", "avg_profit"):
         print("forward return columns are missing; falling back from profit objective to f1", file=sys.stderr)
         args.threshold_objective = "f1"
@@ -1142,6 +1827,8 @@ def main(argv):
     if args.walk_forward:
         walk_records = run_walk_forward(rows, feature_names, args, kind, model_name)
     print_comparison(fixed_record, walk_records, args)
+    if is_compact_rows(rows):
+        rows.cleanup()
     return 0
 
 
