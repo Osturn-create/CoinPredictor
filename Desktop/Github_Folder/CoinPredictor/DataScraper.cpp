@@ -16,12 +16,14 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <climits>
 #include <map>
+#include <queue>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -54,6 +56,7 @@ const int kDefaultTestMonths = 1;
 const int kDefaultPredictionWindowMinutes = 5;
 const double kDefaultGrowthThreshold = 0.05;
 const double kDefaultDownsideStop = 0.02;
+const double kDefaultMinNetReturn = 0.0;
 const int kDefaultEpochs = 8;
 const double kDefaultLearningRate = 0.04;
 const double kDefaultL2Regularization = 0.001;
@@ -61,7 +64,13 @@ const double kDefaultPositiveWeightCap = 50.0;
 const double kDefaultFee = 0.001;
 const double kDefaultSlippage = 0.0005;
 const int kDefaultMinValidationTrades = 5;
+const double kDefaultInitialCapital = 10000.0;
+const double kDefaultMaxPositionFraction = 0.10;
+const double kDefaultMaxVolumeFraction = 0.01;
+const int kDefaultMaxTradesPerPeriod = 10;
+const int kDefaultTradePeriodMinutes = 60;
 const int kRollingLookbackMinutes = 60;
+const int kDailyLookbackMinutes = 24 * 60;
 
 struct Candle {
     Candle()
@@ -93,12 +102,14 @@ struct ScraperOptions {
           testMonths(kDefaultTestMonths),
           totalMonths(kDefaultTrainingMonths + kDefaultValidationMonths + kDefaultTestMonths),
           predictionWindowMinutes(kDefaultPredictionWindowMinutes),
-          cooldownMinutes(kDefaultPredictionWindowMinutes),
-          cooldownExplicit(false),
+          holdingPeriodMinutes(kDefaultPredictionWindowMinutes),
+          holdingPeriodExplicit(false),
           growthThreshold(kDefaultGrowthThreshold),
           upsideTarget(kDefaultGrowthThreshold),
           downsideStop(kDefaultDownsideStop),
-          labelMode("future_high"),
+          minNetReturn(kDefaultMinNetReturn),
+          labelMode("target_stop"),
+          tiePolicy("stop_first"),
           epochs(kDefaultEpochs),
           learningRate(kDefaultLearningRate),
           l2Regularization(kDefaultL2Regularization),
@@ -106,6 +117,11 @@ struct ScraperOptions {
           minValidationTrades(kDefaultMinValidationTrades),
           fee(kDefaultFee),
           slippage(kDefaultSlippage),
+          initialCapital(kDefaultInitialCapital),
+          maxPositionFraction(kDefaultMaxPositionFraction),
+          maxVolumeFraction(kDefaultMaxVolumeFraction),
+          maxTradesPerPeriod(kDefaultMaxTradesPerPeriod),
+          tradePeriodMinutes(kDefaultTradePeriodMinutes),
           thresholdObjective("profit"),
           profitSafety("explore"),
           adaptiveThresholds(true),
@@ -113,7 +129,8 @@ struct ScraperOptions {
           trainRatio(0.70),
           validationRatio(0.15),
           testRatio(0.15),
-          generateOnly(false) {
+          generateOnly(false),
+          selfTest(false) {
         thresholds.push_back(0.001);
         thresholds.push_back(0.002);
         thresholds.push_back(0.005);
@@ -143,12 +160,14 @@ struct ScraperOptions {
     int testMonths;
     int totalMonths;
     int predictionWindowMinutes;
-    int cooldownMinutes;
-    bool cooldownExplicit;
+    int holdingPeriodMinutes;
+    bool holdingPeriodExplicit;
     double growthThreshold;
     double upsideTarget;
     double downsideStop;
+    double minNetReturn;
     std::string labelMode;
+    std::string tiePolicy;
     int epochs;
     double learningRate;
     double l2Regularization;
@@ -156,6 +175,11 @@ struct ScraperOptions {
     int minValidationTrades;
     double fee;
     double slippage;
+    double initialCapital;
+    double maxPositionFraction;
+    double maxVolumeFraction;
+    int maxTradesPerPeriod;
+    int tradePeriodMinutes;
     std::string thresholdObjective;
     std::string profitSafety;
     bool adaptiveThresholds;
@@ -164,6 +188,7 @@ struct ScraperOptions {
     double validationRatio;
     double testRatio;
     bool generateOnly;
+    bool selfTest;
     std::vector<double> thresholds;
 };
 
@@ -182,7 +207,8 @@ struct Sample {
           forwardReturn(0.0),
           tradeReturn(0.0),
           maxFutureHighReturn(0.0),
-          maxFutureLowReturn(0.0) {}
+          maxFutureLowReturn(0.0),
+          quoteVolume(0.0) {}
 
     std::string symbol;
     std::string month;
@@ -194,6 +220,7 @@ struct Sample {
     double tradeReturn;
     double maxFutureHighReturn;
     double maxFutureLowReturn;
+    double quoteVolume;
 };
 
 struct Scaler {
@@ -239,6 +266,17 @@ struct EvaluationMetrics {
           totalProfitAfterFeeAndSlippage(0.0),
           profitFactor(0.0),
           maxDrawdown(0.0),
+          initialCapital(0.0),
+          endingCapital(0.0),
+          portfolioProfit(0.0),
+          portfolioReturn(0.0),
+          averagePositionSize(0.0),
+          medianPositionSize(0.0),
+          tradesPerDay(0.0),
+          tradesPerMonth(0.0),
+          averageProfitPerTrade(0.0),
+          worstTrade(0.0),
+          maxCapitalDrawdown(0.0),
           threshold(0.0) {}
 
     int rows;
@@ -266,6 +304,17 @@ struct EvaluationMetrics {
     double totalProfitAfterFeeAndSlippage;
     double profitFactor;
     double maxDrawdown;
+    double initialCapital;
+    double endingCapital;
+    double portfolioProfit;
+    double portfolioReturn;
+    double averagePositionSize;
+    double medianPositionSize;
+    double tradesPerDay;
+    double tradesPerMonth;
+    double averageProfitPerTrade;
+    double worstTrade;
+    double maxCapitalDrawdown;
     double threshold;
 };
 
@@ -545,19 +594,27 @@ void printUsage() {
         << "  --validation-ratio X       Ratio split validation fraction (default 0.15).\n"
         << "  --test-ratio X             Ratio split test fraction (default 0.15).\n"
         << "  --generate-only            Write kline_growth_training.csv and skip in-memory C++ logistic training.\n"
+        << "  --self-test                Run fast offline label sanity checks and exit.\n"
         << "  --train-months N           Training months for C++ logistic split (default 6).\n"
         << "  --validation-months N      Validation months for threshold tuning (default 1).\n"
         << "  --test-months N            Out-of-sample test months (default 1).\n"
         << "  --prediction-window N      Forward prediction window in minutes (default 5).\n"
         << "  --growth-threshold X       Original future-high label threshold, e.g. 0.05.\n"
-        << "  --label-mode MODE          future_high or target_stop.\n"
+        << "  --label-mode MODE          future_high or target_stop (default target_stop).\n"
         << "  --upside-target X          Target-stop upside target percent (default 0.05).\n"
         << "  --downside-stop X          Target-stop downside stop percent (default 0.02).\n"
+        << "  --tie-policy MODE          Same-candle target/stop behavior: stop_first, target_first, or skip.\n"
+        << "  --min-net-return X         Minimum target return after fee and slippage (default 0).\n"
         << "  --learning-rate X          Logistic learning rate (default 0.04).\n"
         << "  --epochs N                 Logistic SGD epochs (default 8).\n"
         << "  --l2 X                     Logistic L2 regularization strength (default 0.001).\n"
         << "  --positive-weight-cap X    Max positive class weight (default 50).\n"
-        << "  --cooldown-minutes N       Minimum minutes between executed signals per symbol (default prediction window).\n"
+        << "  --initial-capital X        Starting portfolio capital used by backtest sizing (default 10000).\n"
+        << "  --max-position-fraction X  Max starting-capital fraction per trade (default 0.10).\n"
+        << "  --max-volume-fraction X    Max candle quote-volume fraction per trade (default 0.01).\n"
+        << "  --max-trades-per-period N  Max entries across all symbols per trading period (default 10).\n"
+        << "  --trade-period-minutes N   Trading-period length for the entry cap (default 60).\n"
+        << "  --holding-period-minutes N Cash lock duration after entry (default prediction window).\n"
         << "  --min-validation-trades N  Minimum validation trades required for a threshold (default 5).\n"
         << "  --threshold-objective NAME profit, precision, recall, or f1 (default profit).\n"
         << "  --profit-safety MODE       strict keeps no-trade if validation profit is negative; explore picks best available (default explore).\n"
@@ -597,10 +654,12 @@ bool parseArguments(
             options.testRatio = parseDoubleOption("--test-ratio", optionValue(args, i, "--test-ratio", arg));
         } else if (arg == "--generate-only") {
             options.generateOnly = true;
+        } else if (arg == "--self-test") {
+            options.selfTest = true;
         } else if (arg == "--prediction-window" || startsWith(arg, "--prediction-window=")) {
             options.predictionWindowMinutes = parseIntOption("--prediction-window", optionValue(args, i, "--prediction-window", arg));
-            if (!options.cooldownExplicit) {
-                options.cooldownMinutes = options.predictionWindowMinutes;
+            if (!options.holdingPeriodExplicit) {
+                options.holdingPeriodMinutes = options.predictionWindowMinutes;
             }
         } else if (arg == "--growth-threshold" || startsWith(arg, "--growth-threshold=")) {
             options.growthThreshold = parseDoubleOption("--growth-threshold", optionValue(args, i, "--growth-threshold", arg));
@@ -611,6 +670,10 @@ bool parseArguments(
             options.upsideTarget = parseDoubleOption("--upside-target", optionValue(args, i, "--upside-target", arg));
         } else if (arg == "--downside-stop" || startsWith(arg, "--downside-stop=")) {
             options.downsideStop = parseDoubleOption("--downside-stop", optionValue(args, i, "--downside-stop", arg));
+        } else if (arg == "--tie-policy" || startsWith(arg, "--tie-policy=")) {
+            options.tiePolicy = optionValue(args, i, "--tie-policy", arg);
+        } else if (arg == "--min-net-return" || startsWith(arg, "--min-net-return=")) {
+            options.minNetReturn = parseDoubleOption("--min-net-return", optionValue(args, i, "--min-net-return", arg));
         } else if (arg == "--learning-rate" || startsWith(arg, "--learning-rate=")) {
             options.learningRate = parseDoubleOption("--learning-rate", optionValue(args, i, "--learning-rate", arg));
         } else if (arg == "--epochs" || startsWith(arg, "--epochs=")) {
@@ -619,9 +682,31 @@ bool parseArguments(
             options.l2Regularization = parseDoubleOption("--l2", optionValue(args, i, "--l2", arg));
         } else if (arg == "--positive-weight-cap" || startsWith(arg, "--positive-weight-cap=")) {
             options.positiveWeightCap = parseDoubleOption("--positive-weight-cap", optionValue(args, i, "--positive-weight-cap", arg));
+        } else if (arg == "--initial-capital" || startsWith(arg, "--initial-capital=")) {
+            options.initialCapital = parseDoubleOption("--initial-capital", optionValue(args, i, "--initial-capital", arg));
+        } else if (arg == "--max-position-fraction" || startsWith(arg, "--max-position-fraction=")) {
+            options.maxPositionFraction = parseDoubleOption("--max-position-fraction", optionValue(args, i, "--max-position-fraction", arg));
+        } else if (arg == "--max-volume-fraction" || startsWith(arg, "--max-volume-fraction=")) {
+            options.maxVolumeFraction = parseDoubleOption("--max-volume-fraction", optionValue(args, i, "--max-volume-fraction", arg));
+        } else if (arg == "--max-trades-per-period" || startsWith(arg, "--max-trades-per-period=")) {
+            options.maxTradesPerPeriod = parseIntOption("--max-trades-per-period", optionValue(args, i, "--max-trades-per-period", arg));
+        } else if (arg == "--trade-period-minutes" || startsWith(arg, "--trade-period-minutes=")) {
+            options.tradePeriodMinutes = parseIntOption("--trade-period-minutes", optionValue(args, i, "--trade-period-minutes", arg));
+        } else if (arg == "--holding-period-minutes" || startsWith(arg, "--holding-period-minutes=")) {
+            options.holdingPeriodMinutes = parseIntOption("--holding-period-minutes", optionValue(args, i, "--holding-period-minutes", arg));
+            options.holdingPeriodExplicit = true;
         } else if (arg == "--cooldown-minutes" || startsWith(arg, "--cooldown-minutes=")) {
-            options.cooldownMinutes = parseIntOption("--cooldown-minutes", optionValue(args, i, "--cooldown-minutes", arg));
-            options.cooldownExplicit = true;
+            if (parseIntOption("--cooldown-minutes", optionValue(args, i, "--cooldown-minutes", arg)) < 0) {
+                throw std::runtime_error("--cooldown-minutes cannot be negative");
+            }
+            std::cerr << "Warning: --cooldown-minutes is retained for compatibility and ignored; "
+                      << "portfolio entry limits replace cooldown.\n";
+        } else if (arg == "--max-trades-per-symbol-month" || startsWith(arg, "--max-trades-per-symbol-month=")) {
+            if (parseIntOption("--max-trades-per-symbol-month", optionValue(args, i, "--max-trades-per-symbol-month", arg)) < 0) {
+                throw std::runtime_error("--max-trades-per-symbol-month cannot be negative");
+            }
+            std::cerr << "Warning: --max-trades-per-symbol-month is retained for compatibility and ignored; "
+                      << "use --max-trades-per-period.\n";
         } else if (arg == "--min-validation-trades" || startsWith(arg, "--min-validation-trades=")) {
             options.minValidationTrades = parseIntOption("--min-validation-trades", optionValue(args, i, "--min-validation-trades", arg));
         } else if (arg == "--threshold-objective" || startsWith(arg, "--threshold-objective=")) {
@@ -662,14 +747,35 @@ bool parseArguments(
     if (options.predictionWindowMinutes <= 0) {
         throw std::runtime_error("--prediction-window must be positive");
     }
-    if (options.cooldownMinutes < 0) {
-        throw std::runtime_error("--cooldown-minutes cannot be negative");
+    if (options.initialCapital <= 0.0) {
+        throw std::runtime_error("--initial-capital must be positive");
+    }
+    if (options.maxPositionFraction <= 0.0 || options.maxPositionFraction > 1.0) {
+        throw std::runtime_error("--max-position-fraction must be between 0 and 1");
+    }
+    if (options.maxVolumeFraction <= 0.0 || options.maxVolumeFraction > 1.0) {
+        throw std::runtime_error("--max-volume-fraction must be between 0 and 1");
+    }
+    if (options.maxTradesPerPeriod <= 0 || options.tradePeriodMinutes <= 0 || options.holdingPeriodMinutes <= 0) {
+        throw std::runtime_error("Portfolio period, trade cap, and holding period must be positive");
     }
     if (options.minValidationTrades < 0) {
         throw std::runtime_error("--min-validation-trades cannot be negative");
     }
     if (options.labelMode != "future_high" && options.labelMode != "target_stop") {
         throw std::runtime_error("--label-mode must be future_high or target_stop");
+    }
+    if (options.tiePolicy != "stop_first" && options.tiePolicy != "target_first" && options.tiePolicy != "skip") {
+        throw std::runtime_error("--tie-policy must be stop_first, target_first, or skip");
+    }
+    if (options.minNetReturn < 0.0) {
+        throw std::runtime_error("--min-net-return cannot be negative");
+    }
+    if (options.upsideTarget <= 0.0 || options.downsideStop <= 0.0) {
+        throw std::runtime_error("--upside-target and --downside-stop must be positive");
+    }
+    if (options.labelMode == "target_stop" && options.upsideTarget - options.fee - options.slippage < options.minNetReturn) {
+        throw std::runtime_error("--upside-target minus fee and slippage must be at least --min-net-return");
     }
     if (options.thresholdObjective == "success_rate") {
         options.thresholdObjective = "precision";
@@ -978,6 +1084,13 @@ std::vector<std::string> featureNames() {
     names.push_back("candle_body_range_ratio");
     names.push_back("upper_wick_pct");
     names.push_back("lower_wick_pct");
+    names.push_back("distance_from_high_24h");
+    names.push_back("distance_from_low_24h");
+    names.push_back("rolling_quote_volume_mean_60m");
+    names.push_back("rolling_quote_volume_zscore_60m");
+    names.push_back("relative_quote_volume_previous_hour");
+    names.push_back("taker_buy_ratio_mean_60m");
+    names.push_back("taker_buy_ratio_zscore_60m");
     return names;
 }
 
@@ -1060,6 +1173,92 @@ double takerBuyRatio(const Candle &candle) {
     return clipped(safeRatio(candle.takerBuyBaseVolume, candle.volume), 0.0, 1.0);
 }
 
+struct RollingWindowStats {
+    RollingWindowStats() : sum(0.0), sumSquares(0.0) {}
+
+    void push(double value, size_t maxSize) {
+        values.push_back(value);
+        sum += value;
+        sumSquares += value * value;
+        if (values.size() > maxSize) {
+            const double removed = values.front();
+            values.pop_front();
+            sum -= removed;
+            sumSquares -= removed * removed;
+        }
+    }
+
+    double mean() const {
+        return values.empty() ? 0.0 : sum / static_cast<double>(values.size());
+    }
+
+    double stddev() const {
+        if (values.empty()) {
+            return 1.0;
+        }
+        const double average = mean();
+        const double variance = std::max(0.0, sumSquares / static_cast<double>(values.size()) - average * average);
+        const double result = std::sqrt(variance);
+        return result < 1e-12 ? 1.0 : result;
+    }
+
+    std::deque<double> values;
+    double sum;
+    double sumSquares;
+};
+
+struct FeatureContext {
+    std::vector<double> quoteVolumeMean;
+    std::vector<double> quoteVolumeStddev;
+    std::vector<double> takerBuyMean;
+    std::vector<double> takerBuyStddev;
+    std::vector<double> high24h;
+    std::vector<double> low24h;
+};
+
+FeatureContext buildFeatureContext(const std::vector<Candle> &candles) {
+    FeatureContext context;
+    const size_t count = candles.size();
+    context.quoteVolumeMean.resize(count, 0.0);
+    context.quoteVolumeStddev.resize(count, 1.0);
+    context.takerBuyMean.resize(count, 0.0);
+    context.takerBuyStddev.resize(count, 1.0);
+    context.high24h.resize(count, 0.0);
+    context.low24h.resize(count, 0.0);
+
+    RollingWindowStats quoteVolume;
+    RollingWindowStats takerBuy;
+    std::deque<size_t> highIndices;
+    std::deque<size_t> lowIndices;
+    for (size_t i = 0; i < count; ++i) {
+        context.quoteVolumeMean[i] = quoteVolume.mean();
+        context.quoteVolumeStddev[i] = quoteVolume.stddev();
+        context.takerBuyMean[i] = takerBuy.mean();
+        context.takerBuyStddev[i] = takerBuy.stddev();
+
+        while (!highIndices.empty() && highIndices.front() + kDailyLookbackMinutes <= i) {
+            highIndices.pop_front();
+        }
+        while (!lowIndices.empty() && lowIndices.front() + kDailyLookbackMinutes <= i) {
+            lowIndices.pop_front();
+        }
+        while (!highIndices.empty() && candles[highIndices.back()].high <= candles[i].high) {
+            highIndices.pop_back();
+        }
+        while (!lowIndices.empty() && candles[lowIndices.back()].low >= candles[i].low) {
+            lowIndices.pop_back();
+        }
+        highIndices.push_back(i);
+        lowIndices.push_back(i);
+        context.high24h[i] = candles[highIndices.front()].high;
+        context.low24h[i] = candles[lowIndices.front()].low;
+
+        quoteVolume.push(candles[i].quoteVolume, kRollingLookbackMinutes);
+        takerBuy.push(takerBuyRatio(candles[i]), kRollingLookbackMinutes);
+    }
+    return context;
+}
+
 std::vector<Sample> makeSamples(
     const std::string &symbol,
     const std::string &month,
@@ -1071,6 +1270,7 @@ std::vector<Sample> makeSamples(
     if (candles.size() <= historyStart + static_cast<size_t>(options.predictionWindowMinutes)) {
         return samples;
     }
+    const FeatureContext context = buildFeatureContext(candles);
 
     for (size_t i = historyStart; i + options.predictionWindowMinutes < candles.size(); ++i) {
         const Candle &now = candles[i];
@@ -1090,15 +1290,28 @@ std::vector<Sample> makeSamples(
         sample.tradeReturn = sample.forwardReturn;
         sample.maxFutureHighReturn = safeRatio(futureHigh, now.close) - 1.0;
         sample.maxFutureLowReturn = safeRatio(futureLow, now.close) - 1.0;
+        sample.quoteVolume = now.quoteVolume;
 
         if (options.labelMode == "target_stop") {
             const double targetPrice = now.close * (1.0 + options.upsideTarget);
             const double stopPrice = now.close * (1.0 - options.downsideStop);
+            bool skipSample = false;
             sample.label = 0;
             for (int forward = 1; forward <= options.predictionWindowMinutes; ++forward) {
                 const bool hitStop = candles[i + forward].low <= stopPrice;
                 const bool hitTarget = candles[i + forward].high >= targetPrice;
-                // Intraminute ordering is unknown in kline data; treat same-candle target/stop ties conservatively.
+                // Intraminute ordering is unknown in kline data, so ties must be explicit.
+                if (hitStop && hitTarget) {
+                    if (options.tiePolicy == "skip") {
+                        skipSample = true;
+                        break;
+                    }
+                    if (options.tiePolicy == "target_first") {
+                        sample.label = 1;
+                        sample.tradeReturn = options.upsideTarget;
+                        break;
+                    }
+                }
                 if (hitStop) {
                     sample.label = 0;
                     sample.tradeReturn = -options.downsideStop;
@@ -1109,6 +1322,9 @@ std::vector<Sample> makeSamples(
                     sample.tradeReturn = options.upsideTarget;
                     break;
                 }
+            }
+            if (skipSample) {
+                continue;
             }
         } else {
             sample.label = sample.maxFutureHighReturn >= options.growthThreshold ? 1 : 0;
@@ -1173,6 +1389,22 @@ std::vector<Sample> makeSamples(
         sample.features.push_back(clipped(safeRatio(body, range), 0.0, 1.0));
         sample.features.push_back(clipped(safeRatio(upperWick, range), 0.0, 1.0));
         sample.features.push_back(clipped(safeRatio(lowerWick, range), 0.0, 1.0));
+        sample.features.push_back(clipped(safeRatio(now.close, context.high24h[i]) - 1.0, -1.0, 1.0));
+        sample.features.push_back(clipped(safeRatio(now.close, context.low24h[i]) - 1.0, -1.0, 1.0));
+        sample.features.push_back(std::log(1.0 + std::max(0.0, context.quoteVolumeMean[i])));
+        sample.features.push_back(clipped(
+            (now.quoteVolume - context.quoteVolumeMean[i]) / context.quoteVolumeStddev[i],
+            -20.0,
+            20.0));
+        sample.features.push_back(clipped(
+            safeRatio(now.quoteVolume, context.quoteVolumeMean[i] + 1e-12),
+            0.0,
+            50.0));
+        sample.features.push_back(clipped(context.takerBuyMean[i], 0.0, 1.0));
+        sample.features.push_back(clipped(
+            (takerBuyRatio(now) - context.takerBuyMean[i]) / context.takerBuyStddev[i],
+            -20.0,
+            20.0));
 
         samples.push_back(sample);
     }
@@ -1180,9 +1412,72 @@ std::vector<Sample> makeSamples(
     return samples;
 }
 
+const Sample *sampleAtTime(const std::vector<Sample> &samples, long long timeOrder) {
+    for (size_t i = 0; i < samples.size(); ++i) {
+        if (samples[i].timeOrder == timeOrder) {
+            return &samples[i];
+        }
+    }
+    return NULL;
+}
+
+void runSelfTests() {
+    std::vector<Candle> base(70);
+    for (size_t i = 0; i < base.size(); ++i) {
+        base[i].openTime = static_cast<long long>(i) * 60000LL;
+        base[i].open = 100.0;
+        base[i].high = 100.2;
+        base[i].low = 99.8;
+        base[i].close = 100.0;
+        base[i].volume = 1000.0;
+        base[i].quoteVolume = 100000.0;
+        base[i].trades = 100.0;
+        base[i].takerBuyBaseVolume = 500.0;
+    }
+
+    ScraperOptions options;
+    options.labelMode = "target_stop";
+    options.predictionWindowMinutes = 5;
+    options.upsideTarget = 0.05;
+    options.downsideStop = 0.02;
+
+    std::vector<Candle> target = base;
+    target[61].high = 106.0;
+    const std::vector<Sample> targetSamples = makeSamples("TEST", "2020-01", 0, target, options);
+    const Sample *targetSample = sampleAtTime(targetSamples, 60LL * 60000LL);
+    if (!targetSample || targetSample->label != 1 || std::fabs(targetSample->tradeReturn - 0.05) > 1e-12) {
+        throw std::runtime_error("self-test failed: target-first outcome");
+    }
+
+    std::vector<Candle> stop = base;
+    stop[61].low = 97.0;
+    const std::vector<Sample> stopSamples = makeSamples("TEST", "2020-01", 0, stop, options);
+    const Sample *stopSample = sampleAtTime(stopSamples, 60LL * 60000LL);
+    if (!stopSample || stopSample->label != 0 || std::fabs(stopSample->tradeReturn + 0.02) > 1e-12) {
+        throw std::runtime_error("self-test failed: stop outcome");
+    }
+
+    std::vector<Candle> tie = base;
+    tie[61].high = 106.0;
+    tie[61].low = 97.0;
+    options.tiePolicy = "skip";
+    const std::vector<Sample> skippedTieSamples = makeSamples("TEST", "2020-01", 0, tie, options);
+    if (sampleAtTime(skippedTieSamples, 60LL * 60000LL)) {
+        throw std::runtime_error("self-test failed: skip tie policy");
+    }
+    options.tiePolicy = "target_first";
+    const std::vector<Sample> tieTargetSamples = makeSamples("TEST", "2020-01", 0, tie, options);
+    const Sample *tieTarget = sampleAtTime(tieTargetSamples, 60LL * 60000LL);
+    if (!tieTarget || tieTarget->label != 1) {
+        throw std::runtime_error("self-test failed: target_first tie policy");
+    }
+
+    std::cout << "C++ offline self-tests passed.\n";
+}
+
 void writeTrainingCsvHeader(std::ostream &out) {
     const std::vector<std::string> names = featureNames();
-    out << "symbol,month,month_index,open_time,label,forward_return,trade_return,max_future_high_return,max_future_low_return";
+    out << "symbol,month,month_index,open_time,label,forward_return,trade_return,max_future_high_return,max_future_low_return,quote_volume";
     for (size_t i = 0; i < names.size(); ++i) {
         out << ',' << names[i];
     }
@@ -1200,7 +1495,8 @@ void writeTrainingCsvRows(std::ostream &out, const std::vector<Sample> &samples)
             << samples[i].forwardReturn << ','
             << samples[i].tradeReturn << ','
             << samples[i].maxFutureHighReturn << ','
-            << samples[i].maxFutureLowReturn;
+            << samples[i].maxFutureLowReturn << ','
+            << samples[i].quoteVolume;
         for (size_t j = 0; j < samples[i].features.size(); ++j) {
             out << ',' << samples[i].features[j];
         }
@@ -1210,7 +1506,7 @@ void writeTrainingCsvRows(std::ostream &out, const std::vector<Sample> &samples)
 
 class TrainingCsvWriter {
 public:
-    TrainingCsvWriter() : out_(kTrainingCsv.c_str()) {
+    TrainingCsvWriter() : out_(kTrainingCsv.c_str()), rowsWritten_(0) {
         if (!out_) {
             throw std::runtime_error("Unable to open training CSV for writing");
         }
@@ -1219,10 +1515,17 @@ public:
 
     void write(const std::vector<Sample> &samples) {
         writeTrainingCsvRows(out_, samples);
+        rowsWritten_ += samples.size();
+        out_.flush();
+    }
+
+    size_t rowsWritten() const {
+        return rowsWritten_;
     }
 
 private:
     std::ofstream out_;
+    size_t rowsWritten_;
 };
 
 void writeTrainingCsv(const std::vector<Sample> &samples) {
@@ -1339,13 +1642,155 @@ double medianValue(std::vector<double> values) {
     return (values[middle - 1] + values[middle]) / 2.0;
 }
 
+long long minuteBucketForTimestamp(long long timestamp) {
+    const long long absolute = timestamp < 0 ? -timestamp : timestamp;
+    if (absolute >= 100000000000000LL) {
+        return timestamp / (60LL * 1000000LL);
+    }
+    if (absolute >= 100000000000LL) {
+        return timestamp / (60LL * 1000LL);
+    }
+    return timestamp / 60LL;
+}
+
+struct OpenPortfolioPosition {
+    long long closeMinute;
+    size_t sequence;
+    double size;
+    double profit;
+};
+
+struct OpenPortfolioPositionSooner {
+    bool operator()(const OpenPortfolioPosition &left, const OpenPortfolioPosition &right) const {
+        if (left.closeMinute != right.closeMinute) {
+            return left.closeMinute > right.closeMinute;
+        }
+        return left.sequence > right.sequence;
+    }
+};
+
+struct PortfolioExecution {
+    PortfolioExecution()
+        : endingCapital(0.0),
+          portfolioProfit(0.0),
+          portfolioReturn(0.0),
+          averagePositionSize(0.0),
+          medianPositionSize(0.0),
+          averageProfitPerTrade(0.0),
+          worstTrade(0.0),
+          maxCapitalDrawdown(0.0) {}
+
+    std::map<size_t, double> positions;
+    double endingCapital;
+    double portfolioProfit;
+    double portfolioReturn;
+    double averagePositionSize;
+    double medianPositionSize;
+    double averageProfitPerTrade;
+    double worstTrade;
+    double maxCapitalDrawdown;
+};
+
+PortfolioExecution simulatePortfolio(
+    const std::vector<Sample> &samples,
+    const std::vector<double> &probabilities,
+    double threshold,
+    const ScraperOptions &options) {
+    std::vector<size_t> signals;
+    for (size_t i = 0; i < samples.size(); ++i) {
+        if (probabilities[i] >= threshold) {
+            signals.push_back(i);
+        }
+    }
+    std::sort(signals.begin(), signals.end(), [&](size_t left, size_t right) {
+        const long long leftMinute = minuteBucketForTimestamp(samples[left].timeOrder);
+        const long long rightMinute = minuteBucketForTimestamp(samples[right].timeOrder);
+        if (leftMinute != rightMinute) {
+            return leftMinute < rightMinute;
+        }
+        return probabilities[left] > probabilities[right];
+    });
+
+    PortfolioExecution result;
+    double cash = options.initialCapital;
+    double invested = 0.0;
+    double peakEquity = options.initialCapital;
+    std::deque<long long> recentEntryMinutes;
+    std::priority_queue<OpenPortfolioPosition, std::vector<OpenPortfolioPosition>, OpenPortfolioPositionSooner> openPositions;
+    size_t sequence = 0;
+    double positionSizeSum = 0.0;
+    std::vector<double> positionSizes;
+    std::vector<double> positionProfits;
+
+    const double fixedPositionCap = options.initialCapital * options.maxPositionFraction;
+    const double feeAndSlippage = options.fee + options.slippage;
+    const auto releasePositions = [&](long long untilMinute, double &releaseCash, double &releaseInvested,
+                                      double &releasePeak, double &releaseDrawdown) {
+        while (!openPositions.empty() && openPositions.top().closeMinute <= untilMinute) {
+            const OpenPortfolioPosition position = openPositions.top();
+            openPositions.pop();
+            releaseInvested -= position.size;
+            releaseCash += position.size + position.profit;
+            const double equity = releaseCash + releaseInvested;
+            releasePeak = std::max(releasePeak, equity);
+            releaseDrawdown = std::max(releaseDrawdown, releasePeak - equity);
+        }
+    };
+
+    for (size_t order = 0; order < signals.size(); ++order) {
+        const size_t index = signals[order];
+        const long long minute = minuteBucketForTimestamp(samples[index].timeOrder);
+        releasePositions(minute, cash, invested, peakEquity, result.maxCapitalDrawdown);
+        while (!recentEntryMinutes.empty()
+                && recentEntryMinutes.front() <= minute - options.tradePeriodMinutes) {
+            recentEntryMinutes.pop_front();
+        }
+        if (recentEntryMinutes.size() >= static_cast<size_t>(options.maxTradesPerPeriod)) {
+            continue;
+        }
+        const double volumeCap = samples[index].quoteVolume * options.maxVolumeFraction;
+        const double positionSize = std::min(fixedPositionCap, std::min(volumeCap, cash));
+        if (positionSize <= 0.0) {
+            continue;
+        }
+
+        OpenPortfolioPosition position;
+        position.closeMinute = minute + options.holdingPeriodMinutes;
+        position.sequence = sequence++;
+        position.size = positionSize;
+        position.profit = positionSize * (samples[index].tradeReturn - feeAndSlippage);
+        openPositions.push(position);
+        cash -= positionSize;
+        invested += positionSize;
+        recentEntryMinutes.push_back(minute);
+        result.positions[index] = positionSize;
+        positionSizeSum += positionSize;
+        positionSizes.push_back(positionSize);
+        positionProfits.push_back(position.profit);
+    }
+
+    releasePositions(LLONG_MAX, cash, invested, peakEquity, result.maxCapitalDrawdown);
+    result.endingCapital = cash;
+    result.portfolioProfit = cash - options.initialCapital;
+    result.portfolioReturn = result.portfolioProfit / options.initialCapital;
+    result.averagePositionSize = result.positions.empty()
+        ? 0.0
+        : positionSizeSum / static_cast<double>(result.positions.size());
+    result.medianPositionSize = medianValue(positionSizes);
+    result.averageProfitPerTrade = result.positions.empty()
+        ? 0.0
+        : result.portfolioProfit / static_cast<double>(result.positions.size());
+    result.worstTrade = positionProfits.empty()
+        ? 0.0
+        : *std::min_element(positionProfits.begin(), positionProfits.end());
+    return result;
+}
+
 EvaluationMetrics evaluatePredictions(
     const std::vector<Sample> &samples,
     const std::vector<double> &probabilities,
     double threshold,
-    double fee,
-    double slippage,
-    int cooldownMinutes) {
+    const ScraperOptions &options) {
     EvaluationMetrics metrics;
     metrics.rows = static_cast<int>(samples.size());
     metrics.threshold = threshold;
@@ -1362,8 +1807,9 @@ EvaluationMetrics evaluatePredictions(
     double equity = 0.0;
     double peakEquity = 0.0;
     int winningTrades = 0;
-    std::map<std::string, long long> nextAllowedSignalTime;
-    const long long cooldownMs = static_cast<long long>(std::max(0, cooldownMinutes)) * 60LL * 1000LL;
+    std::set<long long> tradingDays;
+    std::set<std::string> tradingMonths;
+    const PortfolioExecution execution = simulatePortfolio(samples, probabilities, threshold, options);
 
     for (size_t i = 0; i < samples.size(); ++i) {
         scores.push_back(std::pair<double, int>(probabilities[i], samples[i].label));
@@ -1371,16 +1817,7 @@ EvaluationMetrics evaluatePredictions(
             ++metrics.actualPositiveRows;
         }
 
-        const bool rawSignal = probabilities[i] >= threshold;
-        bool predicted = false;
-        if (rawSignal) {
-            const std::map<std::string, long long>::const_iterator found = nextAllowedSignalTime.find(samples[i].symbol);
-            const long long nextAllowed = found == nextAllowedSignalTime.end() ? 0LL : found->second;
-            predicted = samples[i].timeOrder >= nextAllowed;
-            if (predicted && cooldownMs > 0) {
-                nextAllowedSignalTime[samples[i].symbol] = samples[i].timeOrder + cooldownMs;
-            }
-        }
+        const bool predicted = execution.positions.find(i) != execution.positions.end();
         if (!predicted) {
             if (samples[i].label == 1) {
                 ++metrics.falseNegativeRows;
@@ -1391,14 +1828,16 @@ EvaluationMetrics evaluatePredictions(
         }
 
         ++metrics.predictedTrades;
+        tradingDays.insert(minuteBucketForTimestamp(samples[i].timeOrder) / (24LL * 60LL));
+        tradingMonths.insert(samples[i].month);
         if (samples[i].label == 1) {
             ++metrics.truePositiveRows;
         } else {
             ++metrics.falsePositiveRows;
         }
 
-        const double afterFee = samples[i].tradeReturn - fee;
-        const double afterFeeAndSlippage = samples[i].tradeReturn - fee - slippage;
+        const double afterFee = samples[i].tradeReturn - options.fee;
+        const double afterFeeAndSlippage = samples[i].tradeReturn - options.fee - options.slippage;
         metrics.totalProfitAfterFee += afterFee;
         metrics.totalProfitAfterFeeAndSlippage += afterFeeAndSlippage;
         sumForwardReturn += samples[i].forwardReturn;
@@ -1449,6 +1888,21 @@ EvaluationMetrics evaluatePredictions(
             ? grossProfit / grossLoss
             : (grossProfit > 0.0 ? std::numeric_limits<double>::infinity() : 0.0);
     }
+    metrics.initialCapital = options.initialCapital;
+    metrics.endingCapital = execution.endingCapital;
+    metrics.portfolioProfit = execution.portfolioProfit;
+    metrics.portfolioReturn = execution.portfolioReturn;
+    metrics.averagePositionSize = execution.averagePositionSize;
+    metrics.medianPositionSize = execution.medianPositionSize;
+    metrics.tradesPerDay = tradingDays.empty()
+        ? 0.0
+        : static_cast<double>(metrics.predictedTrades) / static_cast<double>(tradingDays.size());
+    metrics.tradesPerMonth = tradingMonths.empty()
+        ? 0.0
+        : static_cast<double>(metrics.predictedTrades) / static_cast<double>(tradingMonths.size());
+    metrics.averageProfitPerTrade = execution.averageProfitPerTrade;
+    metrics.worstTrade = execution.worstTrade;
+    metrics.maxCapitalDrawdown = execution.maxCapitalDrawdown;
 
     return metrics;
 }
@@ -1528,7 +1982,7 @@ double thresholdScore(const EvaluationMetrics &metrics, const std::string &objec
     if (objective == "f1") {
         return metrics.f1;
     }
-    return metrics.totalProfitAfterFeeAndSlippage;
+    return metrics.portfolioProfit;
 }
 
 double tuneThreshold(
@@ -1550,7 +2004,7 @@ double tuneThreshold(
     double fallbackScore = -std::numeric_limits<double>::infinity();
     if (strictProfit) {
         bestThreshold = 1.01;
-        bestMetrics = evaluatePredictions(validationSamples, validationProbabilities, bestThreshold, options.fee, options.slippage, options.cooldownMinutes);
+        bestMetrics = evaluatePredictions(validationSamples, validationProbabilities, bestThreshold, options);
         hasBest = true;
     }
     for (size_t i = 0; i < thresholds.size(); ++i) {
@@ -1558,9 +2012,7 @@ double tuneThreshold(
             validationSamples,
             validationProbabilities,
             thresholds[i],
-            options.fee,
-            options.slippage,
-            options.cooldownMinutes);
+            options);
         const double score = thresholdScore(metrics, options.thresholdObjective, zeroTradeProfitScore);
         if (metrics.predictedTrades < options.minValidationTrades) {
             if (metrics.predictedTrades > 0 && score > fallbackScore) {
@@ -1586,7 +2038,7 @@ double tuneThreshold(
             return bestThreshold;
         }
         bestThreshold = 1.01;
-        bestMetrics = evaluatePredictions(validationSamples, validationProbabilities, bestThreshold, options.fee, options.slippage, options.cooldownMinutes);
+        bestMetrics = evaluatePredictions(validationSamples, validationProbabilities, bestThreshold, options);
     }
     return bestThreshold;
 }
@@ -1597,30 +2049,21 @@ void writePredictionsCsv(
     const std::vector<double> &probabilities,
     double threshold,
     const std::string &modelName,
-    int cooldownMinutes) {
+    const ScraperOptions &options) {
     std::ofstream out(path.c_str());
     if (!out) {
         throw std::runtime_error("Unable to open predictions CSV for writing: " + path);
     }
 
-    out << "symbol,month,month_index,open_time,label,probability,selected_threshold,raw_signal,predicted,"
+    out << "symbol,month,month_index,open_time,label,probability,selected_threshold,raw_signal,predicted,position_size,"
         << "forward_return,trade_return,max_future_high_return,max_future_low_return,model_name\n";
     out << std::setprecision(12);
-    std::map<std::string, long long> nextAllowedSignalTime;
-    const long long cooldownMs = static_cast<long long>(std::max(0, cooldownMinutes)) * 60LL * 1000LL;
+    const PortfolioExecution execution = simulatePortfolio(samples, probabilities, threshold, options);
     for (size_t i = 0; i < samples.size(); ++i) {
         const int rawSignal = probabilities[i] >= threshold ? 1 : 0;
-        int predicted = 0;
-        if (rawSignal) {
-            const std::map<std::string, long long>::const_iterator found = nextAllowedSignalTime.find(samples[i].symbol);
-            const long long nextAllowed = found == nextAllowedSignalTime.end() ? 0LL : found->second;
-            if (samples[i].timeOrder >= nextAllowed) {
-                predicted = 1;
-                if (cooldownMs > 0) {
-                    nextAllowedSignalTime[samples[i].symbol] = samples[i].timeOrder + cooldownMs;
-                }
-            }
-        }
+        const std::map<size_t, double>::const_iterator position = execution.positions.find(i);
+        const int predicted = position == execution.positions.end() ? 0 : 1;
+        const double positionSize = predicted ? position->second : 0.0;
         out << csvEscape(samples[i].symbol) << ','
             << csvEscape(samples[i].month) << ','
             << samples[i].monthIndex << ','
@@ -1630,6 +2073,7 @@ void writePredictionsCsv(
             << threshold << ','
             << rawSignal << ','
             << predicted << ','
+            << positionSize << ','
             << samples[i].forwardReturn << ','
             << samples[i].tradeReturn << ','
             << samples[i].maxFutureHighReturn << ','
@@ -1733,10 +2177,10 @@ TrainingResult trainModel(
     const std::vector<double> testProbabilities = predictProbabilities(testSamples, result.scaler, result.weights);
     result.trainAuc = auc(trainScores);
     result.selectedThreshold = tuneThreshold(validationSamples, validationProbabilities, options, validationMetrics);
-    testMetrics = evaluatePredictions(testSamples, testProbabilities, result.selectedThreshold, options.fee, options.slippage, options.cooldownMinutes);
+    testMetrics = evaluatePredictions(testSamples, testProbabilities, result.selectedThreshold, options);
 
-    writePredictionsCsv(kLogisticPredictionsCsv, testSamples, testProbabilities, result.selectedThreshold, "logistic", options.cooldownMinutes);
-    writePredictionsCsv(kPredictionsCsv, testSamples, testProbabilities, result.selectedThreshold, "logistic", options.cooldownMinutes);
+    writePredictionsCsv(kLogisticPredictionsCsv, testSamples, testProbabilities, result.selectedThreshold, "logistic", options);
+    writePredictionsCsv(kPredictionsCsv, testSamples, testProbabilities, result.selectedThreshold, "logistic", options);
     return result;
 }
 
@@ -1757,7 +2201,10 @@ void writeMetricsCsv(
         << "average_forward_return,median_forward_return,average_trade_return,median_trade_return,"
         << "average_max_favorable_excursion,average_max_adverse_excursion,"
         << "average_profit_after_fee,average_profit_after_fee_and_slippage,total_profit_after_fee,"
-        << "total_profit_after_fee_and_slippage,profit_factor,max_drawdown,fee,slippage,cooldown_minutes,"
+        << "total_profit_after_fee_and_slippage,profit_factor,max_drawdown,"
+        << "initial_capital,ending_capital,portfolio_profit,portfolio_return,average_position_size,median_position_size,"
+        << "trades_per_day,trades_per_month,average_profit_per_trade,worst_trade,max_capital_drawdown,"
+        << "fee,slippage,max_position_fraction,max_volume_fraction,max_trades_per_period,trade_period_minutes,holding_period_minutes,"
         << "min_validation_trades,profit_safety,adaptive_thresholds\n";
     metrics << "logistic,"
             << csvEscape(options.thresholdObjective) << ','
@@ -1790,9 +2237,24 @@ void writeMetricsCsv(
             << testMetrics.totalProfitAfterFeeAndSlippage << ','
             << testMetrics.profitFactor << ','
             << testMetrics.maxDrawdown << ','
+            << testMetrics.initialCapital << ','
+            << testMetrics.endingCapital << ','
+            << testMetrics.portfolioProfit << ','
+            << testMetrics.portfolioReturn << ','
+            << testMetrics.averagePositionSize << ','
+            << testMetrics.medianPositionSize << ','
+            << testMetrics.tradesPerDay << ','
+            << testMetrics.tradesPerMonth << ','
+            << testMetrics.averageProfitPerTrade << ','
+            << testMetrics.worstTrade << ','
+            << testMetrics.maxCapitalDrawdown << ','
             << options.fee << ','
             << options.slippage << ','
-            << options.cooldownMinutes << ','
+            << options.maxPositionFraction << ','
+            << options.maxVolumeFraction << ','
+            << options.maxTradesPerPeriod << ','
+            << options.tradePeriodMinutes << ','
+            << options.holdingPeriodMinutes << ','
             << options.minValidationTrades << ','
             << csvEscape(options.profitSafety) << ','
             << (options.adaptiveThresholds ? 1 : 0) << '\n';
@@ -1832,6 +2294,10 @@ void scrapeHistoricalCoinData(const std::vector<std::string> &symbolOverrides) {
         if (!parseArguments(symbolOverrides, options, symbolArgs)) {
             return;
         }
+        if (options.selfTest) {
+            runSelfTests();
+            return;
+        }
         const std::vector<std::string> symbols = readRequestedSymbols(symbolArgs);
         std::vector<Sample> trainingSamples;
         std::vector<Sample> validationSamples;
@@ -1866,6 +2332,12 @@ void scrapeHistoricalCoinData(const std::vector<std::string> &symbolOverrides) {
                         candles,
                         options);
                     trainingWriter.write(monthSamples);
+                    std::cout << "Generated symbol=" << symbols[i]
+                              << " month=" << months[monthIndex]
+                              << " candles_loaded=" << candles.size()
+                              << " rows_written=" << monthSamples.size()
+                              << " cumulative_rows=" << trainingWriter.rowsWritten()
+                              << '\n' << std::flush;
 
                     if (static_cast<int>(monthIndex) < split.train) {
                         symbolTrainSamples += monthSamples.size();
@@ -1921,7 +2393,8 @@ void scrapeHistoricalCoinData(const std::vector<std::string> &symbolOverrides) {
                   << " | Success rate: " << (evaluation.successRate * 100.0) << "%"
                   << " | Accuracy: " << (testMetrics.accuracy * 100.0) << "%"
                   << " | Recall: " << (testMetrics.recall * 100.0) << "%"
-                  << " | Net after fee+slippage: " << testMetrics.totalProfitAfterFeeAndSlippage << "\n";
+                  << " | Portfolio profit: " << testMetrics.portfolioProfit
+                  << " | Portfolio return: " << (testMetrics.portfolioReturn * 100.0) << "%\n";
     } catch (const std::exception &error) {
         std::cerr << "Data scraper failed: " << error.what() << '\n';
     }

@@ -1,6 +1,8 @@
 .venv/
+.gbdt_cache/
 __pycache__/
 kline_growth*.csv
+kline_growth_run_summary.json
 gbdt_run.log
 coin_predictor
 coin_predictor_cpp*

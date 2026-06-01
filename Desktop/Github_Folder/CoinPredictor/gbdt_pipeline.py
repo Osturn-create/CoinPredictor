@@ -9,19 +9,31 @@ symbol's month_index.
 import argparse
 from array import array
 import bisect
+from collections import deque
 import csv
+import datetime
 import gc
+import hashlib
+import heapq
 import importlib.util
+import json
 import math
 import os
+import subprocess
 import sys
 import tempfile
+import time
 import warnings
 
 try:
     import numpy as np
 except ImportError:
     np = None
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 warnings.filterwarnings(
     "ignore",
@@ -40,7 +52,39 @@ METADATA_COLUMNS = set([
     "trade_return",
     "max_future_high_return",
     "max_future_low_return",
+    "quote_volume",
 ])
+
+RECONSTRUCTED_QUOTE_VOLUME_DISCOUNT = 0.99999
+CACHE_VERSION = 1
+START_TIME = time.time()
+CACHE_LOAD_INFO = {}
+TEMP_PREDICTION_PATHS = set()
+AUC_SAMPLE_ROWS = 1000000
+
+
+def log_memory(stage):
+    elapsed = time.time() - START_TIME
+    if psutil is None:
+        print("[progress {:8.1f}s] {}".format(elapsed, stage), flush=True)
+        return
+    rss_gib = psutil.Process(os.getpid()).memory_info().rss / float(1024 ** 3)
+    print("[progress {:8.1f}s rss={:.2f} GiB] {}".format(elapsed, rss_gib, stage), flush=True)
+
+
+def close_memmap(values):
+    if values is None:
+        return
+    try:
+        values.flush()
+    except Exception:
+        pass
+    mmap = getattr(values, "_mmap", None)
+    if mmap is not None:
+        try:
+            mmap.close()
+        except Exception:
+            pass
 
 
 def sigmoid(value):
@@ -85,10 +129,14 @@ def build_features(item, feature_columns, storage):
     return [safe_float(item.get(name), 0.0) for name in feature_columns]
 
 
-def adaptive_thresholds(probabilities, base_thresholds, min_validation_trades):
+def adaptive_thresholds(probabilities, base_thresholds, min_validation_trades, max_sample_rows=1000000):
     thresholds = set(value for value in base_thresholds if 0.0 <= value <= 1.0)
     if np is not None and isinstance(probabilities, np.ndarray):
-        valid = probabilities[(probabilities >= 0.0) & (probabilities <= 1.0)]
+        values = probabilities
+        if max_sample_rows and len(values) > max_sample_rows:
+            sample_positions = np.linspace(0, len(values) - 1, num=max_sample_rows, dtype=np.int64)
+            values = values[sample_positions]
+        valid = values[(values >= 0.0) & (values <= 1.0)]
         if valid.size == 0:
             return sorted(thresholds)
         ordered = np.sort(valid)
@@ -105,7 +153,10 @@ def adaptive_thresholds(probabilities, base_thresholds, min_validation_trades):
         thresholds.add(max(0.0, max_probability - 1e-12))
         return sorted(thresholds)
 
-    ordered = sorted(value for value in probabilities if 0.0 <= value <= 1.0)
+    values = probabilities
+    if max_sample_rows and len(values) > max_sample_rows:
+        values = [values[int(index * (len(values) - 1) / float(max_sample_rows - 1))] for index in range(max_sample_rows)]
+    ordered = sorted(value for value in values if 0.0 <= value <= 1.0)
     if not ordered:
         return sorted(thresholds)
 
@@ -115,7 +166,7 @@ def adaptive_thresholds(probabilities, base_thresholds, min_validation_trades):
         thresholds.add(ordered[index])
 
     # Include thresholds that roughly target small, medium, and large numbers of
-    # raw validation signals. Cooldown is applied later during evaluation.
+    # raw validation signals. Portfolio entry limits are applied during evaluation.
     target_counts = [max(1, min_validation_trades), max(1, min_validation_trades * 2), 10, 25, 50, 100, 250, 500, 1000]
     for count in target_counts:
         if count <= len(ordered):
@@ -136,11 +187,12 @@ class DataRow(object):
         "trade_return",
         "max_future_high_return",
         "max_future_low_return",
+        "quote_volume",
         "features",
     )
 
     def __init__(self, symbol, month, month_index, open_time, label, forward_return, trade_return,
-                 max_future_high_return, max_future_low_return, features):
+                 max_future_high_return, max_future_low_return, quote_volume, features):
         self.symbol = symbol
         self.month = month
         self.month_index = month_index
@@ -150,6 +202,7 @@ class DataRow(object):
         self.trade_return = trade_return
         self.max_future_high_return = max_future_high_return
         self.max_future_low_return = max_future_low_return
+        self.quote_volume = quote_volume
         self.features = features
 
 
@@ -166,13 +219,17 @@ class CompactTable(object):
         "trade_returns",
         "max_future_high_returns",
         "max_future_low_returns",
+        "quote_volumes",
         "features",
+        "feature_lookup",
         "memmap_path",
+        "remove_memmap_on_cleanup",
     )
 
     def __init__(self, symbols, months, symbol_codes, month_codes, month_indices, open_times,
                  labels, forward_returns, trade_returns, max_future_high_returns,
-                 max_future_low_returns, features, memmap_path=None):
+                 max_future_low_returns, quote_volumes, features, feature_lookup, memmap_path=None,
+                 remove_memmap_on_cleanup=True):
         self.symbols = symbols
         self.months = months
         self.symbol_codes = symbol_codes
@@ -184,19 +241,21 @@ class CompactTable(object):
         self.trade_returns = trade_returns
         self.max_future_high_returns = max_future_high_returns
         self.max_future_low_returns = max_future_low_returns
+        self.quote_volumes = quote_volumes
         self.features = features
+        self.feature_lookup = feature_lookup
         self.memmap_path = memmap_path
+        self.remove_memmap_on_cleanup = remove_memmap_on_cleanup
 
     def cleanup(self):
         if self.memmap_path:
-            try:
-                self.features.flush()
-            except Exception:
-                pass
-            try:
-                os.remove(self.memmap_path)
-            except OSError:
-                pass
+            close_memmap(self.features)
+            self.features = None
+            if self.remove_memmap_on_cleanup:
+                try:
+                    os.remove(self.memmap_path)
+                except OSError:
+                    pass
             self.memmap_path = None
 
 
@@ -255,6 +314,14 @@ def make_row(item, feature_columns, month_index_lookup, text_cache, feature_stor
     trade_return = safe_float(item.get("trade_return"), forward_return)
     max_future_high_return = safe_float(item.get("max_future_high_return"), forward_return)
     max_future_low_return = safe_float(item.get("max_future_low_return"), forward_return)
+    features = build_features(item, feature_columns, feature_storage)
+    quote_volume = safe_float(item.get("quote_volume"), 0.0)
+    if quote_volume <= 0.0 and "log_quote_volume" in feature_columns:
+        quote_volume = max(
+            0.0,
+            math.expm1(float(features[feature_columns.index("log_quote_volume")]))
+            * RECONSTRUCTED_QUOTE_VOLUME_DISCOUNT,
+        )
     return DataRow(
         symbol,
         month,
@@ -265,7 +332,8 @@ def make_row(item, feature_columns, month_index_lookup, text_cache, feature_stor
         trade_return,
         max_future_high_return,
         max_future_low_return,
-        build_features(item, feature_columns, feature_storage),
+        quote_volume,
+        features,
     )
 
 
@@ -286,7 +354,8 @@ def count_csv_rows(path):
         return sum(1 for _ in reader)
 
 
-def load_compact_rows(path, feature_storage="matrix32", memmap_dir=None):
+def load_compact_rows(path, feature_storage="matrix32", memmap_dir=None, feature_path=None,
+                      remove_memmap_on_cleanup=True):
     if np is None:
         raise ValueError("compact matrix storage requires numpy")
 
@@ -308,18 +377,23 @@ def load_compact_rows(path, feature_storage="matrix32", memmap_dir=None):
             raise ValueError("compact storage requires a month_index column")
         if not feature_columns:
             raise ValueError("{} does not contain feature columns".format(path))
+        if "log_quote_volume" not in feature_columns:
+            raise ValueError("{} must contain log_quote_volume for compact portfolio sizing".format(path))
 
         feature_positions = [positions[name] for name in feature_columns]
         memmap_path = None
         if use_memmap:
             directory = memmap_dir or tempfile.gettempdir()
             os.makedirs(directory, exist_ok=True)
-            descriptor, memmap_path = tempfile.mkstemp(
-                prefix="gbdt_features_",
-                suffix=".dat",
-                dir=directory,
-            )
-            os.close(descriptor)
+            if feature_path:
+                memmap_path = feature_path
+            else:
+                descriptor, memmap_path = tempfile.mkstemp(
+                    prefix="gbdt_features_",
+                    suffix=".dat",
+                    dir=directory,
+                )
+                os.close(descriptor)
             features = np.memmap(
                 memmap_path,
                 dtype=dtype,
@@ -337,6 +411,7 @@ def load_compact_rows(path, feature_storage="matrix32", memmap_dir=None):
         trade_returns = np.empty(row_count, dtype=np.float32)
         max_future_high_returns = np.empty(row_count, dtype=np.float32)
         max_future_low_returns = np.empty(row_count, dtype=np.float32)
+        quote_volumes = np.empty(row_count, dtype=np.float32) if "quote_volume" in positions else None
         symbol_lookup = {}
         month_lookup = {}
         symbols = []
@@ -373,11 +448,15 @@ def load_compact_rows(path, feature_storage="matrix32", memmap_dir=None):
                 csv_value(fields, positions, "max_future_low_return"),
                 forward_return,
             )
+            if quote_volumes is not None:
+                quote_volumes[row_index] = safe_float(csv_value(fields, positions, "quote_volume"), 0.0)
             for feature_index, field_index in enumerate(feature_positions):
                 features[row_index, feature_index] = safe_float(
                     fields[field_index] if field_index < len(fields) else "",
                     0.0,
                 )
+            if row_index and row_index % 1000000 == 0:
+                log_memory("CSV parse progress: {:,}/{:,} rows".format(row_index, row_count))
         if use_memmap:
             features.flush()
 
@@ -393,8 +472,11 @@ def load_compact_rows(path, feature_storage="matrix32", memmap_dir=None):
         trade_returns,
         max_future_high_returns,
         max_future_low_returns,
+        quote_volumes,
         features,
+        {name: index for index, name in enumerate(feature_columns)},
         memmap_path,
+        remove_memmap_on_cleanup,
     )
     return CompactRows(table), feature_columns, "forward_return" in positions
 
@@ -413,6 +495,8 @@ def load_object_rows(path, feature_storage="float32"):
             raise ValueError("{} must contain a label column".format(path))
         if not feature_columns:
             raise ValueError("{} does not contain feature columns".format(path))
+        if "quote_volume" not in reader.fieldnames and "log_quote_volume" not in feature_columns:
+            raise ValueError("{} must contain quote_volume or log_quote_volume".format(path))
 
         raw_rows = []
         symbol_months = {}
@@ -448,7 +532,141 @@ def load_object_rows(path, feature_storage="float32"):
     return rows, feature_columns, has_returns
 
 
-def load_rows(path, feature_storage="float32", memmap_dir=None):
+def cache_paths(path, cache_dir, dtype):
+    source_path = os.path.abspath(path)
+    source_hash = hashlib.sha1(source_path.encode("utf-8")).hexdigest()[:12]
+    stem = os.path.splitext(os.path.basename(path))[0]
+    prefix = os.path.join(cache_dir, "{}-{}-{}".format(stem, source_hash, np.dtype(dtype).name))
+    return {
+        "features": prefix + ".features.dat",
+        "metadata": prefix + ".metadata.npz",
+        "manifest": prefix + ".manifest.json",
+    }
+
+
+def source_csv_info(path):
+    stat = os.stat(path)
+    return {
+        "source_csv_path": os.path.abspath(path),
+        "source_csv_mtime_ns": getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1000000000)),
+        "source_csv_size": stat.st_size,
+    }
+
+
+def cache_manifest_matches(manifest, path, dtype, paths):
+    source = source_csv_info(path)
+    return (
+        manifest.get("version") == CACHE_VERSION
+        and manifest.get("source_csv_path") == source["source_csv_path"]
+        and manifest.get("source_csv_mtime_ns") == source["source_csv_mtime_ns"]
+        and manifest.get("source_csv_size") == source["source_csv_size"]
+        and manifest.get("feature_dtype") == np.dtype(dtype).name
+        and manifest.get("row_count", 0) >= 0
+        and bool(manifest.get("feature_columns"))
+        and os.path.exists(paths["features"])
+        and os.path.exists(paths["metadata"])
+    )
+
+
+def load_cached_compact_rows(path, feature_storage, cache_dir, rebuild_cache=False):
+    dtype = np.float32 if feature_storage == "memmap32" else np.float64
+    os.makedirs(cache_dir, exist_ok=True)
+    paths = cache_paths(path, cache_dir, dtype)
+    manifest = None
+    if not rebuild_cache and os.path.exists(paths["manifest"]):
+        try:
+            with open(paths["manifest"], encoding="utf-8") as handle:
+                manifest = json.load(handle)
+        except (OSError, ValueError):
+            manifest = None
+
+    if manifest and cache_manifest_matches(manifest, path, dtype, paths):
+        with np.load(paths["metadata"], allow_pickle=False) as metadata:
+            quote_volumes = metadata["quote_volumes"]
+            if quote_volumes.size == 0:
+                quote_volumes = None
+            table = CompactTable(
+                [str(value) for value in metadata["symbols"]],
+                [str(value) for value in metadata["months"]],
+                metadata["symbol_codes"],
+                metadata["month_codes"],
+                metadata["month_indices"],
+                metadata["open_times"],
+                metadata["labels"],
+                metadata["forward_returns"],
+                metadata["trade_returns"],
+                metadata["max_future_high_returns"],
+                metadata["max_future_low_returns"],
+                quote_volumes,
+                np.memmap(
+                    paths["features"],
+                    dtype=dtype,
+                    mode="r",
+                    shape=(int(manifest["row_count"]), len(manifest["feature_columns"])),
+                ),
+                {name: index for index, name in enumerate(manifest["feature_columns"])},
+                paths["features"],
+                False,
+            )
+        CACHE_LOAD_INFO.update({"status": "hit", "paths": paths, "manifest": manifest})
+        log_memory("Loaded compatible binary cache")
+        return CompactRows(table), list(manifest["feature_columns"]), bool(manifest.get("has_returns"))
+
+    for cache_path in paths.values():
+        try:
+            os.remove(cache_path)
+        except OSError:
+            pass
+
+    log_memory("Building binary cache from CSV")
+    rows, feature_columns, has_returns = load_compact_rows(
+        path,
+        feature_storage,
+        cache_dir,
+        paths["features"],
+        remove_memmap_on_cleanup=False,
+    )
+    table = rows.table
+    np.savez_compressed(
+        paths["metadata"],
+        symbols=np.asarray(table.symbols),
+        months=np.asarray(table.months),
+        symbol_codes=table.symbol_codes,
+        month_codes=table.month_codes,
+        month_indices=table.month_indices,
+        open_times=table.open_times,
+        labels=table.labels,
+        forward_returns=table.forward_returns,
+        trade_returns=table.trade_returns,
+        max_future_high_returns=table.max_future_high_returns,
+        max_future_low_returns=table.max_future_low_returns,
+        quote_volumes=table.quote_volumes if table.quote_volumes is not None else np.asarray([], dtype=np.float32),
+    )
+    manifest = source_csv_info(path)
+    manifest.update({
+        "version": CACHE_VERSION,
+        "feature_dtype": np.dtype(dtype).name,
+        "feature_columns": feature_columns,
+        "row_count": len(rows),
+        "has_returns": has_returns,
+    })
+    with open(paths["manifest"], "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2, sort_keys=True)
+    CACHE_LOAD_INFO.update({"status": "rebuilt", "paths": paths, "manifest": manifest})
+    log_memory("Finished binary cache build")
+    return rows, feature_columns, has_returns
+
+
+def load_rows(path, feature_storage="float32", memmap_dir=None, cache_dir=None,
+              rebuild_cache=False, disable_cache=False):
+    if feature_storage in ("memmap32", "memmap64") and not disable_cache:
+        persistent_cache_dir = cache_dir or os.path.join(os.path.dirname(os.path.abspath(path)), ".gbdt_cache")
+        return load_cached_compact_rows(path, feature_storage, persistent_cache_dir, rebuild_cache)
+    CACHE_LOAD_INFO.clear()
+    CACHE_LOAD_INFO.update({
+        "status": "disabled" if disable_cache else "not_applicable",
+        "feature_storage": feature_storage,
+    })
     if feature_storage in ("auto", "matrix32", "matrix64", "memmap32", "memmap64"):
         try:
             return load_compact_rows(path, feature_storage, memmap_dir)
@@ -463,6 +681,101 @@ def labels(rows):
     if is_compact_rows(rows):
         return rows.labels_array()
     return [row.label for row in rows]
+
+
+def compact_positions_array(rows):
+    if rows.indices is not None:
+        return rows.indices
+    return np.arange(len(rows), dtype=np.int32)
+
+
+def evenly_sample_array(values, target_count):
+    count = len(values)
+    if target_count <= 0:
+        return values[:0]
+    if count <= target_count:
+        return values
+    take_positions = np.linspace(0, count - 1, num=target_count, dtype=np.int64)
+    return values[take_positions]
+
+
+def sample_label_targets(positive_count, negative_count, max_rows, mode, max_positive_fraction):
+    if positive_count <= 0 or negative_count <= 0:
+        return min(positive_count, max_rows), max(0, min(negative_count, max_rows - min(positive_count, max_rows)))
+    if mode == "balanced":
+        positive_target = min(positive_count, max(1, max_rows // 2))
+        negative_target = max_rows - positive_target
+        return positive_target, min(negative_count, negative_target)
+    if mode == "chronological":
+        total = positive_count + negative_count
+        positive_target = int(round(max_rows * positive_count / float(total)))
+        positive_target = min(positive_count, max(1, positive_target))
+        negative_target = max_rows - positive_target
+        return positive_target, min(negative_count, negative_target)
+
+    positive_cap = max(1, int(round(max_rows * max_positive_fraction)))
+    positive_target = min(positive_count, positive_cap)
+    negative_target = max_rows - positive_target
+    if negative_target > negative_count:
+        negative_target = negative_count
+        positive_target = min(positive_count, max_rows - negative_target)
+    return positive_target, negative_target
+
+
+def sample_rows(rows, max_rows, label_aware=False, sample_mode="stratified", max_positive_fraction=0.33):
+    if not max_rows or max_rows <= 0 or len(rows) <= max_rows:
+        return rows
+
+    if is_compact_rows(rows):
+        base = compact_positions_array(rows)
+        if not label_aware or sample_mode == "chronological":
+            sampled = evenly_sample_array(base, max_rows).astype(np.int32, copy=False)
+            return rows.subset(sampled)
+
+        row_labels = rows.table.labels[base]
+        positives = base[row_labels == 1]
+        negatives = base[row_labels == 0]
+        if len(positives) == 0 or len(negatives) == 0:
+            sampled = evenly_sample_array(base, max_rows).astype(np.int32, copy=False)
+            return rows.subset(sampled)
+
+        positive_target, negative_target = sample_label_targets(
+            len(positives),
+            len(negatives),
+            max_rows,
+            sample_mode,
+            max_positive_fraction,
+        )
+
+        sampled_positive = evenly_sample_array(positives, positive_target)
+        sampled_negative = evenly_sample_array(negatives, negative_target)
+        sampled = np.concatenate((sampled_positive, sampled_negative)).astype(np.int32, copy=False)
+        sampled.sort()
+        return rows.subset(sampled)
+
+    if not label_aware:
+        if max_rows <= 1:
+            return rows[:1]
+        positions = [int(round(i * (len(rows) - 1) / float(max_rows - 1))) for i in range(max_rows)]
+        return [rows[position] for position in positions]
+
+    positives = [row for row in rows if row.label == 1]
+    negatives = [row for row in rows if row.label == 0]
+    if not positives or not negatives:
+        return sample_rows(rows, max_rows, label_aware=False, sample_mode=sample_mode, max_positive_fraction=max_positive_fraction)
+    positive_target, negative_target = sample_label_targets(
+        len(positives),
+        len(negatives),
+        max_rows,
+        sample_mode,
+        max_positive_fraction,
+    )
+    sampled = (
+        sample_rows(positives, positive_target, label_aware=False, sample_mode=sample_mode, max_positive_fraction=max_positive_fraction)
+        + sample_rows(negatives, negative_target, label_aware=False, sample_mode=sample_mode, max_positive_fraction=max_positive_fraction)
+    )
+    sampled.sort(key=lambda row: (row.month_index, row.open_time, row.symbol))
+    return sampled
 
 
 def matrix(rows, storage=None):
@@ -498,6 +811,14 @@ def model_labels(rows, kind):
     return values
 
 
+def rows_slice(rows, start, end):
+    if is_compact_rows(rows):
+        if rows.indices is None:
+            return rows.subset(np.arange(start, end, dtype=np.int32))
+        return rows.subset(rows.indices[start:end])
+    return rows[start:end]
+
+
 def select_month_range(rows, start, end):
     if is_compact_rows(rows):
         month_indices = rows.table.month_indices
@@ -530,15 +851,20 @@ def ratio_split_counts(month_count, train_ratio, validation_ratio, test_ratio):
 
 def select_ratio_split(rows, args):
     if is_compact_rows(rows):
-        months_by_symbol = {}
         table = rows.table
-        for position in rows.positions():
-            symbol_code = int(table.symbol_codes[position])
-            months_by_symbol.setdefault(symbol_code, set()).add(int(table.month_indices[position]))
+        base = rows.indices
+        if base is None:
+            symbol_values = table.symbol_codes
+            month_values = table.month_indices
+        else:
+            symbol_values = table.symbol_codes[base]
+            month_values = table.month_indices[base]
+        max_symbol_code = int(np.max(symbol_values)) if len(symbol_values) else -1
+        max_month_index = int(np.max(month_values)) if len(month_values) else -1
+        split_lookup = np.zeros((max_symbol_code + 1, max_month_index + 1), dtype=np.int8)
 
-        split_lookup = {}
-        for symbol_code, month_set in months_by_symbol.items():
-            months = sorted(month_set)
+        for symbol_code in np.unique(symbol_values):
+            months = sorted(int(month) for month in np.unique(month_values[symbol_values == symbol_code]))
             train_count, validation_count, test_count = ratio_split_counts(
                 len(months),
                 args.train_ratio,
@@ -548,26 +874,21 @@ def select_ratio_split(rows, args):
             if not train_count or not validation_count or not test_count:
                 continue
             for month in months[:train_count]:
-                split_lookup[(symbol_code, month)] = 1
+                split_lookup[int(symbol_code), month] = 1
             for month in months[train_count:train_count + validation_count]:
-                split_lookup[(symbol_code, month)] = 2
+                split_lookup[int(symbol_code), month] = 2
             for month in months[train_count + validation_count:train_count + validation_count + test_count]:
-                split_lookup[(symbol_code, month)] = 3
+                split_lookup[int(symbol_code), month] = 3
 
-        flags = np.zeros(len(rows), dtype=np.int8)
-        for local_index, position in enumerate(rows.positions()):
-            flags[local_index] = split_lookup.get(
-                (int(table.symbol_codes[position]), int(table.month_indices[position])),
-                0,
-            )
+        flags = split_lookup[symbol_values, month_values]
         if rows.indices is None:
             train_indices = np.nonzero(flags == 1)[0].astype(np.int32, copy=False)
             validation_indices = np.nonzero(flags == 2)[0].astype(np.int32, copy=False)
             test_indices = np.nonzero(flags == 3)[0].astype(np.int32, copy=False)
         else:
-            train_indices = rows.indices[flags == 1]
-            validation_indices = rows.indices[flags == 2]
-            test_indices = rows.indices[flags == 3]
+            train_indices = base[flags == 1]
+            validation_indices = base[flags == 2]
+            test_indices = base[flags == 3]
         return rows.subset(train_indices), rows.subset(validation_indices), rows.subset(test_indices)
 
     months_by_symbol = {}
@@ -612,6 +933,10 @@ def select_ratio_split(rows, args):
 def auc_score_from_rows(probabilities, rows):
     if is_compact_rows(rows):
         y_true = rows.labels_array()
+        if AUC_SAMPLE_ROWS and len(y_true) > AUC_SAMPLE_ROWS:
+            positions = np.linspace(0, len(y_true) - 1, num=AUC_SAMPLE_ROWS, dtype=np.int64)
+            y_true = y_true[positions]
+            probabilities = np.asarray(probabilities)[positions]
         positives = int(np.sum(y_true))
         negatives = len(rows) - positives
         if positives == 0 or negatives == 0:
@@ -665,14 +990,220 @@ def median(values):
     return (ordered[middle - 1] + ordered[middle]) / 2.0
 
 
-def trade_limit_key(row):
-    return (row.symbol, row.month)
+def open_time_minute(open_time):
+    value = int(open_time)
+    absolute = abs(value)
+    if absolute >= 100000000000000:
+        return value // (60 * 1000000)
+    if absolute >= 100000000000:
+        return value // (60 * 1000)
+    return value // 60
 
 
-def evaluate_compact(rows, probabilities, threshold, fee, slippage, cooldown_minutes=0,
-                     max_trades_per_symbol_month=0, compute_auc=True):
+def compact_quote_volume(table, position):
+    if table.quote_volumes is not None:
+        raw_quote_volume = float(table.quote_volumes[position])
+        if raw_quote_volume > 0.0:
+            return raw_quote_volume
+    feature_index = table.feature_lookup.get("log_quote_volume")
+    if feature_index is None:
+        raise ValueError("compact rows require log_quote_volume for portfolio sizing")
+    # Legacy CSVs do not have raw quote volume. Keep reconstruction slightly
+    # conservative so float32 feature storage cannot exceed the volume cap.
+    return max(
+        0.0,
+        math.expm1(float(table.features[position, feature_index]))
+        * RECONSTRUCTED_QUOTE_VOLUME_DISCOUNT,
+    )
+
+
+def compact_signal_indices(probabilities, threshold, batch_size=1000000):
+    chunks = []
+    for start in range(0, len(probabilities), batch_size):
+        end = min(len(probabilities), start + batch_size)
+        selected = np.nonzero(np.asarray(probabilities[start:end]) >= threshold)[0]
+        if selected.size:
+            chunks.append((selected + start).astype(np.int32, copy=False))
+    if not chunks:
+        return np.asarray([], dtype=np.int32)
+    if len(chunks) == 1:
+        return chunks[0]
+    return np.concatenate(chunks).astype(np.int32, copy=False)
+
+
+def compact_open_time_minutes(open_times):
+    values = np.asarray(open_times, dtype=np.int64)
+    result = np.empty(len(values), dtype=np.int64)
+    microseconds = np.abs(values) >= 100000000000000
+    milliseconds = (~microseconds) & (np.abs(values) >= 100000000000)
+    seconds = ~(microseconds | milliseconds)
+    result[microseconds] = values[microseconds] // (60 * 1000000)
+    result[milliseconds] = values[milliseconds] // (60 * 1000)
+    result[seconds] = values[seconds] // 60
+    return result
+
+
+def portfolio_execution(rows, probabilities, threshold, fee, slippage, initial_capital,
+                        max_position_fraction, max_volume_fraction, max_trades_per_period,
+                        trade_period_minutes, holding_period_minutes):
+    if initial_capital <= 0.0:
+        raise ValueError("--initial-capital must be positive")
+
+    if is_compact_rows(rows):
+        signal_indices = compact_signal_indices(probabilities, threshold)
+        if rows.indices is None:
+            absolute_positions = signal_indices
+        else:
+            absolute_positions = rows.indices[signal_indices]
+        signal_minutes = compact_open_time_minutes(rows.table.open_times[absolute_positions])
+        signal_probabilities = np.asarray(probabilities)[signal_indices]
+        order = np.lexsort((-signal_probabilities, signal_minutes))
+
+        def quote_volume(signal_index):
+            return compact_quote_volume(rows.table, int(absolute_positions[signal_index]))
+
+        def trade_return(signal_index):
+            return float(rows.table.trade_returns[int(absolute_positions[signal_index])])
+
+        def local_index(signal_index):
+            return int(signal_indices[signal_index])
+    else:
+        signal_indices = [index for index, probability in enumerate(probabilities) if probability >= threshold]
+        order = sorted(
+            range(len(signal_indices)),
+            key=lambda index: (
+                open_time_minute(rows[signal_indices[index]].open_time),
+                -float(probabilities[signal_indices[index]]),
+            ),
+        )
+        signal_minutes = [open_time_minute(rows[index].open_time) for index in signal_indices]
+
+        def quote_volume(signal_index):
+            return rows[signal_indices[signal_index]].quote_volume
+
+        def trade_return(signal_index):
+            return rows[signal_indices[signal_index]].trade_return
+
+        def local_index(signal_index):
+            return signal_indices[signal_index]
+
+    cash = float(initial_capital)
+    invested = 0.0
+    peak_equity = float(initial_capital)
+    max_drawdown = 0.0
+    recent_entry_minutes = deque()
+    open_positions = []
+    executed = {}
+    executed_pnls = {}
+    executed_minutes = {}
+    sequence = 0
+    fixed_position_cap = initial_capital * max_position_fraction
+
+    def release_positions(until_minute):
+        nonlocal cash, invested, peak_equity, max_drawdown
+        while open_positions and open_positions[0][0] <= until_minute:
+            _, _, position_size, pnl = heapq.heappop(open_positions)
+            invested -= position_size
+            cash += position_size + pnl
+            equity = cash + invested
+            peak_equity = max(peak_equity, equity)
+            max_drawdown = max(max_drawdown, peak_equity - equity)
+
+    for ordered_index in order:
+        minute = int(signal_minutes[ordered_index])
+        release_positions(minute)
+        while recent_entry_minutes and recent_entry_minutes[0] <= minute - trade_period_minutes:
+            recent_entry_minutes.popleft()
+        if len(recent_entry_minutes) >= max_trades_per_period:
+            continue
+        volume_cap = quote_volume(ordered_index) * max_volume_fraction
+        position_size = min(fixed_position_cap, volume_cap, cash)
+        if position_size <= 0.0:
+            continue
+        cash -= position_size
+        invested += position_size
+        net_return = trade_return(ordered_index) - fee - slippage
+        pnl = position_size * net_return
+        heapq.heappush(
+            open_positions,
+            (minute + holding_period_minutes, sequence, position_size, pnl),
+        )
+        sequence += 1
+        recent_entry_minutes.append(minute)
+        index = local_index(ordered_index)
+        executed[index] = position_size
+        executed_pnls[index] = pnl
+        executed_minutes[index] = minute
+
+    release_positions(sys.maxsize)
+    portfolio_profit = cash - initial_capital
+    position_sizes = list(executed.values())
+    return {
+        "executed": executed,
+        "executed_pnls": executed_pnls,
+        "executed_minutes": executed_minutes,
+        "ending_capital": cash,
+        "portfolio_profit": portfolio_profit,
+        "portfolio_return": portfolio_profit / initial_capital,
+        "max_capital_drawdown": max_drawdown,
+        "average_position_size": sum(position_sizes) / len(position_sizes) if position_sizes else 0.0,
+        "median_position_size": median(position_sizes),
+        "average_profit_per_trade": portfolio_profit / len(position_sizes) if position_sizes else 0.0,
+        "worst_trade": min(executed_pnls.values()) if executed_pnls else 0.0,
+    }
+
+
+def raw_classification_metrics(rows, probabilities, threshold, batch_size=1000000):
+    raw_trades = 0
+    raw_true_positives = 0
+    if is_compact_rows(rows) and np is not None:
+        labels_array = rows.labels_array()
+        for start in range(0, len(rows), batch_size):
+            end = min(len(rows), start + batch_size)
+            raw_signal = np.asarray(probabilities[start:end]) >= threshold
+            signal_count = int(np.sum(raw_signal))
+            raw_trades += signal_count
+            if signal_count:
+                raw_true_positives += int(np.sum(labels_array[start:end][raw_signal]))
+        actual_positive = int(np.sum(labels_array))
+    else:
+        actual_positive = sum(row.label for row in rows)
+        for row, probability in zip(rows, probabilities):
+            if probability >= threshold:
+                raw_trades += 1
+                raw_true_positives += row.label
+    raw_false_positives = raw_trades - raw_true_positives
+    raw_precision = float(raw_true_positives) / raw_trades if raw_trades else 0.0
+    raw_recall = float(raw_true_positives) / actual_positive if actual_positive else 0.0
+    raw_f1 = 2.0 * raw_precision * raw_recall / (raw_precision + raw_recall) if raw_precision + raw_recall else 0.0
+    return {
+        "raw_signal_trades": raw_trades,
+        "raw_true_positive_rows": raw_true_positives,
+        "raw_false_positive_rows": raw_false_positives,
+        "raw_precision": raw_precision,
+        "raw_recall": raw_recall,
+        "raw_f1": raw_f1,
+    }
+
+
+def execution_frequency_metrics(execution):
+    minutes = list(execution["executed_minutes"].values())
+    if not minutes:
+        return {"trades_per_day": 0.0, "trades_per_month": 0.0}
+    days = set(minute // (24 * 60) for minute in minutes)
+    months = set(datetime.datetime.fromtimestamp(minute * 60, datetime.timezone.utc).strftime("%Y-%m") for minute in minutes)
+    return {
+        "trades_per_day": len(minutes) / float(len(days)),
+        "trades_per_month": len(minutes) / float(len(months)),
+    }
+
+
+def evaluate_compact(rows, probabilities, threshold, fee, slippage, compute_auc=True, initial_capital=10000.0,
+                     max_position_fraction=0.10, max_volume_fraction=0.01,
+                     max_trades_per_period=10, trade_period_minutes=60,
+                     holding_period_minutes=5):
     table = rows.table
-    actual_positive = 0
+    actual_positive = int(np.sum(rows.labels_array()))
     predicted_trades = 0
     tp = fp = tn = fn = 0
     returns = []
@@ -689,38 +1220,27 @@ def evaluate_compact(rows, probabilities, threshold, fee, slippage, cooldown_min
     equity = 0.0
     peak = 0.0
     max_drawdown = 0.0
-    next_allowed_signal_time = {}
-    trades_by_symbol_month = {}
-    cooldown_ms = max(0, int(cooldown_minutes)) * 60 * 1000
+    raw_metrics = raw_classification_metrics(rows, probabilities, threshold)
+    execution = portfolio_execution(
+        rows,
+        probabilities,
+        threshold,
+        fee,
+        slippage,
+        initial_capital,
+        max_position_fraction,
+        max_volume_fraction,
+        max_trades_per_period,
+        trade_period_minutes,
+        holding_period_minutes,
+    )
 
-    for local_index, position in enumerate(rows.positions()):
+    for local_index, position_size in execution["executed"].items():
+        if rows.indices is None:
+            position = local_index
+        else:
+            position = int(rows.indices[local_index])
         label = int(table.labels[position])
-        if label == 1:
-            actual_positive += 1
-        raw_signal = float(probabilities[local_index]) >= threshold
-        predicted = False
-        symbol_code = int(table.symbol_codes[position])
-        if raw_signal:
-            next_allowed = next_allowed_signal_time.get(symbol_code, 0)
-            open_time = int(table.open_times[position])
-            predicted = open_time >= next_allowed
-            if predicted and max_trades_per_symbol_month > 0:
-                limit_key = (symbol_code, int(table.month_codes[position]))
-                if trades_by_symbol_month.get(limit_key, 0) >= max_trades_per_symbol_month:
-                    predicted = False
-            if predicted:
-                if max_trades_per_symbol_month > 0:
-                    limit_key = (symbol_code, int(table.month_codes[position]))
-                    trades_by_symbol_month[limit_key] = trades_by_symbol_month.get(limit_key, 0) + 1
-                if cooldown_ms:
-                    next_allowed_signal_time[symbol_code] = open_time + cooldown_ms
-        if not predicted:
-            if label == 1:
-                fn += 1
-            else:
-                tn += 1
-            continue
-
         predicted_trades += 1
         if label == 1:
             tp += 1
@@ -752,13 +1272,15 @@ def evaluate_compact(rows, probabilities, threshold, fee, slippage, cooldown_min
         max_drawdown = max(max_drawdown, peak - equity)
 
     total = len(rows)
+    fn = actual_positive - tp
+    tn = total - actual_positive - fp
     precision = float(tp) / predicted_trades if predicted_trades else 0.0
     recall = float(tp) / actual_positive if actual_positive else 0.0
     accuracy = float(tp + tn) / total if total else 0.0
     f1 = 2.0 * precision * recall / (precision + recall) if precision + recall else 0.0
     trade_count = float(predicted_trades) if predicted_trades else 1.0
 
-    return {
+    metrics = {
         "rows": total,
         "actual_positive_rows": actual_positive,
         "predicted_trades": predicted_trades,
@@ -784,12 +1306,26 @@ def evaluate_compact(rows, probabilities, threshold, fee, slippage, cooldown_min
         "total_profit_after_fee_and_slippage": total_fee_slippage,
         "profit_factor": gross_profit / gross_loss if gross_loss else (float("inf") if gross_profit else 0.0),
         "max_drawdown": max_drawdown,
+        "initial_capital": initial_capital,
+        "ending_capital": execution["ending_capital"],
+        "portfolio_profit": execution["portfolio_profit"],
+        "portfolio_return": execution["portfolio_return"],
+        "average_position_size": execution["average_position_size"],
+        "median_position_size": execution["median_position_size"],
+        "average_profit_per_trade": execution["average_profit_per_trade"],
+        "worst_trade": execution["worst_trade"],
+        "max_capital_drawdown": execution["max_capital_drawdown"],
         "selected_threshold": threshold,
     }
+    metrics.update(raw_metrics)
+    metrics.update(execution_frequency_metrics(execution))
+    return metrics
 
 
-def evaluate(rows, probabilities, threshold, fee, slippage, cooldown_minutes=0,
-             max_trades_per_symbol_month=0, compute_auc=True):
+def evaluate(rows, probabilities, threshold, fee, slippage, compute_auc=True, initial_capital=10000.0,
+             max_position_fraction=0.10, max_volume_fraction=0.01,
+             max_trades_per_period=10, trade_period_minutes=60,
+             holding_period_minutes=5):
     if is_compact_rows(rows):
         return evaluate_compact(
             rows,
@@ -797,12 +1333,16 @@ def evaluate(rows, probabilities, threshold, fee, slippage, cooldown_minutes=0,
             threshold,
             fee,
             slippage,
-            cooldown_minutes,
-            max_trades_per_symbol_month,
             compute_auc,
+            initial_capital,
+            max_position_fraction,
+            max_volume_fraction,
+            max_trades_per_period,
+            trade_period_minutes,
+            holding_period_minutes,
         )
 
-    actual_positive = 0
+    actual_positive = sum(row.label for row in rows)
     predicted_trades = 0
     tp = fp = tn = fn = 0
     returns = []
@@ -819,35 +1359,23 @@ def evaluate(rows, probabilities, threshold, fee, slippage, cooldown_minutes=0,
     equity = 0.0
     peak = 0.0
     max_drawdown = 0.0
-    next_allowed_signal_time = {}
-    trades_by_symbol_month = {}
-    cooldown_ms = max(0, int(cooldown_minutes)) * 60 * 1000
-
-    for row, probability in zip(rows, probabilities):
-        if row.label == 1:
-            actual_positive += 1
-        raw_signal = probability >= threshold
-        predicted = False
-        if raw_signal:
-            next_allowed = next_allowed_signal_time.get(row.symbol, 0)
-            predicted = row.open_time >= next_allowed
-            if predicted and max_trades_per_symbol_month > 0:
-                limit_key = trade_limit_key(row)
-                if trades_by_symbol_month.get(limit_key, 0) >= max_trades_per_symbol_month:
-                    predicted = False
-            if predicted:
-                if max_trades_per_symbol_month > 0:
-                    limit_key = trade_limit_key(row)
-                    trades_by_symbol_month[limit_key] = trades_by_symbol_month.get(limit_key, 0) + 1
-                if cooldown_ms:
-                    next_allowed_signal_time[row.symbol] = row.open_time + cooldown_ms
-        if not predicted:
-            if row.label == 1:
-                fn += 1
-            else:
-                tn += 1
-            continue
-
+    raw_metrics = raw_classification_metrics(rows, probabilities, threshold)
+    execution = portfolio_execution(
+        rows,
+        probabilities,
+        threshold,
+        fee,
+        slippage,
+        initial_capital,
+        max_position_fraction,
+        max_volume_fraction,
+        max_trades_per_period,
+        trade_period_minutes,
+        holding_period_minutes,
+    )
+    for index, position_size in execution["executed"].items():
+        del position_size
+        row = rows[index]
         predicted_trades += 1
         if row.label == 1:
             tp += 1
@@ -875,13 +1403,15 @@ def evaluate(rows, probabilities, threshold, fee, slippage, cooldown_minutes=0,
         max_drawdown = max(max_drawdown, peak - equity)
 
     total = len(rows)
+    fn = actual_positive - tp
+    tn = total - actual_positive - fp
     precision = float(tp) / predicted_trades if predicted_trades else 0.0
     recall = float(tp) / actual_positive if actual_positive else 0.0
     accuracy = float(tp + tn) / total if total else 0.0
     f1 = 2.0 * precision * recall / (precision + recall) if precision + recall else 0.0
     trade_count = float(predicted_trades) if predicted_trades else 1.0
 
-    return {
+    metrics = {
         "rows": total,
         "actual_positive_rows": actual_positive,
         "predicted_trades": predicted_trades,
@@ -907,36 +1437,62 @@ def evaluate(rows, probabilities, threshold, fee, slippage, cooldown_minutes=0,
         "total_profit_after_fee_and_slippage": total_fee_slippage,
         "profit_factor": gross_profit / gross_loss if gross_loss else (float("inf") if gross_profit else 0.0),
         "max_drawdown": max_drawdown,
+        "initial_capital": initial_capital,
+        "ending_capital": execution["ending_capital"],
+        "portfolio_profit": execution["portfolio_profit"],
+        "portfolio_return": execution["portfolio_return"],
+        "average_position_size": execution["average_position_size"],
+        "median_position_size": execution["median_position_size"],
+        "average_profit_per_trade": execution["average_profit_per_trade"],
+        "worst_trade": execution["worst_trade"],
+        "max_capital_drawdown": execution["max_capital_drawdown"],
         "selected_threshold": threshold,
     }
+    metrics.update(raw_metrics)
+    metrics.update(execution_frequency_metrics(execution))
+    return metrics
 
 
 def threshold_score(metrics, objective, zero_trade_profit_score=0.0):
     if metrics["predicted_trades"] == 0:
         return zero_trade_profit_score if objective in ("profit", "avg_profit") else -float("inf")
     if objective == "avg_profit":
-        return metrics["average_profit_after_fee_and_slippage"]
+        return metrics["portfolio_profit"] / metrics["predicted_trades"]
     if objective == "precision":
         return metrics["precision"]
     if objective == "recall":
         return metrics["recall"]
     if objective == "f1":
         return metrics["f1"]
-    return metrics["total_profit_after_fee_and_slippage"]
+    return metrics["portfolio_profit"]
 
 
-def tune_threshold(rows, probabilities, thresholds, objective, fee, slippage, cooldown_minutes,
+def threshold_rank(metrics, objective, zero_trade_profit_score=0.0):
+    trades = metrics["predicted_trades"]
+    average_profit = metrics["portfolio_profit"] / trades if trades else 0.0
+    return (
+        threshold_score(metrics, objective, zero_trade_profit_score),
+        metrics["portfolio_profit"],
+        average_profit,
+        metrics["precision"],
+        -trades,
+    )
+
+
+def tune_threshold(rows, probabilities, thresholds, objective, fee, slippage,
                    min_validation_trades, max_validation_trades, min_validation_precision,
-                   max_trades_per_symbol_month, profit_safety):
+                   profit_safety, initial_capital,
+                   max_position_fraction, max_volume_fraction, max_trades_per_period,
+                   trade_period_minutes, holding_period_minutes):
     best_threshold = thresholds[0]
     best_metrics = None
-    best_score = -float("inf")
+    best_rank = (-float("inf"),) * 5
     profit_objective = objective in ("profit", "avg_profit")
     strict_profit = profit_objective and profit_safety == "strict"
     zero_trade_profit_score = 0.0 if strict_profit else -float("inf")
     fallback_threshold = None
     fallback_metrics = None
-    fallback_score = -float("inf")
+    fallback_rank = (-float("inf"),) * 5
     if strict_profit:
         best_threshold = 1.01
         best_metrics = evaluate(
@@ -945,11 +1501,15 @@ def tune_threshold(rows, probabilities, thresholds, objective, fee, slippage, co
             best_threshold,
             fee,
             slippage,
-            cooldown_minutes,
-            max_trades_per_symbol_month,
             compute_auc=False,
+            initial_capital=initial_capital,
+            max_position_fraction=max_position_fraction,
+            max_volume_fraction=max_volume_fraction,
+            max_trades_per_period=max_trades_per_period,
+            trade_period_minutes=trade_period_minutes,
+            holding_period_minutes=holding_period_minutes,
         )
-        best_score = 0.0
+        best_rank = threshold_rank(best_metrics, objective, zero_trade_profit_score)
     for threshold in thresholds:
         metrics = evaluate(
             rows,
@@ -957,24 +1517,28 @@ def tune_threshold(rows, probabilities, thresholds, objective, fee, slippage, co
             threshold,
             fee,
             slippage,
-            cooldown_minutes,
-            max_trades_per_symbol_month,
             compute_auc=False,
+            initial_capital=initial_capital,
+            max_position_fraction=max_position_fraction,
+            max_volume_fraction=max_volume_fraction,
+            max_trades_per_period=max_trades_per_period,
+            trade_period_minutes=trade_period_minutes,
+            holding_period_minutes=holding_period_minutes,
         )
-        score = threshold_score(metrics, objective, zero_trade_profit_score)
+        rank = threshold_rank(metrics, objective, zero_trade_profit_score)
         too_few = metrics["predicted_trades"] < min_validation_trades
         too_many = max_validation_trades > 0 and metrics["predicted_trades"] > max_validation_trades
         too_imprecise = metrics["predicted_trades"] > 0 and metrics["precision"] < min_validation_precision
         if too_many or too_imprecise:
             continue
         if too_few:
-            if metrics["predicted_trades"] > 0 and score > fallback_score:
+            if metrics["predicted_trades"] > 0 and rank > fallback_rank:
                 fallback_threshold = threshold
                 fallback_metrics = metrics
-                fallback_score = score
+                fallback_rank = rank
             continue
-        if score > best_score:
-            best_score = score
+        if rank > best_rank:
+            best_rank = rank
             best_threshold = threshold
             best_metrics = metrics
     if best_metrics is None:
@@ -989,9 +1553,13 @@ def tune_threshold(rows, probabilities, thresholds, objective, fee, slippage, co
                 best_threshold,
                 fee,
                 slippage,
-                cooldown_minutes,
-                max_trades_per_symbol_month,
                 compute_auc=False,
+                initial_capital=initial_capital,
+                max_position_fraction=max_position_fraction,
+                max_volume_fraction=max_volume_fraction,
+                max_trades_per_period=max_trades_per_period,
+                trade_period_minutes=trade_period_minutes,
+                holding_period_minutes=holding_period_minutes,
             )
     return best_threshold, best_metrics
 
@@ -1017,7 +1585,8 @@ class InternalStumpGBDT(object):
                 thresholds.append(value)
         return thresholds
 
-    def fit(self, x_train, y_train, feature_names):
+    def fit(self, x_train, y_train, feature_names, x_validation=None, y_validation=None, args=None):
+        del x_validation, y_validation, args
         row_count = len(x_train)
         if row_count == 0:
             raise ValueError("cannot fit internal GBDT with zero rows")
@@ -1107,13 +1676,28 @@ class ExternalModel(object):
         self.model = model
         self.kind = kind
 
-    def fit(self, x_train, y_train, feature_names):
+    def fit(self, x_train, y_train, feature_names, x_validation=None, y_validation=None, args=None):
         del feature_names
-        self.model.fit(x_train, y_train)
+        fit_kwargs = {}
+        training_classes = np.unique(y_train) if np is not None else set(y_train)
+        if x_validation is not None and y_validation is not None and len(y_validation) and len(training_classes) > 1:
+            from lightgbm import early_stopping, log_evaluation
+            fit_kwargs["eval_set"] = [(x_validation, y_validation)]
+            fit_kwargs["eval_metric"] = args.eval_metric if args is not None else "binary_logloss"
+            callbacks = []
+            if args is not None and args.early_stopping_rounds > 0:
+                callbacks.append(early_stopping(args.early_stopping_rounds, verbose=False))
+            if args is not None:
+                callbacks.append(log_evaluation(args.log_evaluation_period))
+            if callbacks:
+                fit_kwargs["callbacks"] = callbacks
+        self.model.fit(x_train, y_train, **fit_kwargs)
         return self
 
     def predict_proba(self, x_rows):
-        probabilities = self.model.predict_proba(x_rows)
+        best_iteration = getattr(self.model, "best_iteration_", None)
+        kwargs = {"num_iteration": best_iteration} if best_iteration else {}
+        probabilities = self.model.predict_proba(x_rows, **kwargs)
         if np is not None:
             return np.asarray(probabilities)[:, 1].astype(np.float32, copy=True)
         return [float(row[1]) for row in probabilities]
@@ -1127,6 +1711,10 @@ class ExternalModel(object):
             (name, float(value), float(value) / total if total else 0.0)
             for name, value in zip(feature_names, importances)
         ]
+
+    def best_iteration(self):
+        value = getattr(self.model, "best_iteration_", None)
+        return int(value) if value else None
 
 
 def external_available(module_name):
@@ -1155,6 +1743,27 @@ def class_weight_ratio(y_train, cap):
     return min(cap, negatives / float(positives))
 
 
+def positive_label_count(rows):
+    if is_compact_rows(rows):
+        labels_array = rows.table.labels
+        if rows.indices is None:
+            return int(np.sum(labels_array))
+        total = 0
+        batch_size = 5000000
+        for start in range(0, len(rows.indices), batch_size):
+            total += int(np.sum(labels_array[rows.indices[start:start + batch_size]]))
+        return total
+    return sum(row.label for row in rows)
+
+
+def class_weight_ratio_for_rows(rows, cap):
+    positives = positive_label_count(rows)
+    negatives = len(rows) - positives
+    if positives <= 0:
+        return 1.0
+    return min(cap, negatives / float(positives))
+
+
 def make_model(kind, params, positive_weight):
     if kind == "lightgbm":
         from lightgbm import LGBMClassifier
@@ -1167,6 +1776,8 @@ def make_model(kind, params, positive_weight):
             subsample_freq=1,
             colsample_bytree=params["colsample_bytree"],
             min_child_samples=params["min_child_samples"],
+            min_split_gain=params["min_split_gain"],
+            reg_alpha=params["reg_alpha"],
             reg_lambda=params["reg_lambda"],
             max_bin=params["max_bin"],
             subsample_for_bin=params["subsample_for_bin"],
@@ -1190,21 +1801,24 @@ def make_model(kind, params, positive_weight):
 def candidate_params(kind, args):
     if kind == "lightgbm":
         return [
-            {"n_estimators": args.n_estimators, "learning_rate": args.learning_rate, "num_leaves": 31,
-             "max_depth": -1, "subsample": 0.9, "colsample_bytree": 0.9,
-             "min_child_samples": 50, "reg_lambda": 2.0, "max_bin": args.max_bin,
+            {"n_estimators": args.n_estimators, "learning_rate": args.learning_rate, "num_leaves": 15,
+             "max_depth": 5, "subsample": 0.9, "colsample_bytree": 0.85,
+             "min_child_samples": 100, "min_split_gain": 0.01, "reg_alpha": 1.0,
+             "reg_lambda": 5.0, "max_bin": args.max_bin,
              "subsample_for_bin": args.subsample_for_bin,
              "histogram_pool_size": args.lightgbm_histogram_pool_mb,
              "n_jobs": args.n_jobs},
             {"n_estimators": max(80, args.n_estimators // 2), "learning_rate": args.learning_rate * 1.6,
              "num_leaves": 31, "max_depth": 6, "subsample": 0.9, "colsample_bytree": 0.85,
-             "min_child_samples": 80, "reg_lambda": 4.0, "max_bin": args.max_bin,
+             "min_child_samples": 80, "min_split_gain": 0.0, "reg_alpha": 0.25,
+             "reg_lambda": 4.0, "max_bin": args.max_bin,
              "subsample_for_bin": args.subsample_for_bin,
              "histogram_pool_size": args.lightgbm_histogram_pool_mb,
              "n_jobs": args.n_jobs},
             {"n_estimators": int(args.n_estimators * 1.5), "learning_rate": args.learning_rate * 0.7,
              "num_leaves": 63, "max_depth": -1, "subsample": 0.85, "colsample_bytree": 0.9,
-             "min_child_samples": 60, "reg_lambda": 3.0, "max_bin": args.max_bin,
+             "min_child_samples": 60, "min_split_gain": 0.0, "reg_alpha": 0.1,
+             "reg_lambda": 3.0, "max_bin": args.max_bin,
              "subsample_for_bin": args.subsample_for_bin,
              "histogram_pool_size": args.lightgbm_histogram_pool_mb,
              "n_jobs": args.n_jobs},
@@ -1219,20 +1833,168 @@ def candidate_params(kind, args):
     ]
 
 
+def cleanup_probabilities(probabilities):
+    if np is not None and isinstance(probabilities, np.memmap):
+        path = os.path.abspath(str(probabilities.filename))
+        close_memmap(probabilities)
+        if path in TEMP_PREDICTION_PATHS:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            TEMP_PREDICTION_PATHS.discard(path)
+
+
+def predict_probabilities(model, rows, kind, args, stage="prediction"):
+    row_count = len(rows)
+    batch_size = max(1, int(args.prediction_batch_rows))
+    if np is not None:
+        use_memmap = row_count > batch_size
+        if use_memmap:
+            directory = args.memmap_dir or tempfile.gettempdir()
+            os.makedirs(directory, exist_ok=True)
+            descriptor, path = tempfile.mkstemp(prefix="gbdt_probabilities_", suffix=".dat", dir=directory)
+            os.close(descriptor)
+            path = os.path.abspath(path)
+            TEMP_PREDICTION_PATHS.add(path)
+            probabilities = np.memmap(path, dtype=np.float32, mode="w+", shape=(row_count,))
+        else:
+            probabilities = np.empty(row_count, dtype=np.float32)
+        for start in range(0, row_count, batch_size):
+            end = min(row_count, start + batch_size)
+            chunk_rows = rows_slice(rows, start, end)
+            x_chunk = model_matrix(chunk_rows, kind, args)
+            probabilities[start:end] = model.predict_proba(x_chunk)
+            del x_chunk
+            del chunk_rows
+            if start and start % max(batch_size, 1000000) == 0:
+                log_memory("{} progress: {:,}/{:,} rows".format(stage, start, row_count))
+        if isinstance(probabilities, np.memmap):
+            probabilities.flush()
+        gc.collect()
+        log_memory("{} complete: {:,} rows".format(stage, row_count))
+        return probabilities
+
+    probabilities = []
+    for start in range(0, row_count, batch_size):
+        end = min(row_count, start + batch_size)
+        chunk_rows = rows_slice(rows, start, end)
+        x_chunk = model_matrix(chunk_rows, kind, args)
+        probabilities.extend(model.predict_proba(x_chunk))
+        del x_chunk
+        del chunk_rows
+    gc.collect()
+    log_memory("{} complete: {:,} rows".format(stage, row_count))
+    return probabilities
+
+
 def fit_select_model(train_rows, validation_rows, feature_names, args, kind):
-    x_train = model_matrix(train_rows, kind, args)
-    y_train = model_labels(train_rows, kind)
-    x_validation = model_matrix(validation_rows, kind, args)
-    positive_weight = class_weight_ratio(y_train, args.positive_weight_cap)
+    fit_train_rows = sample_rows(
+        train_rows,
+        args.max_train_rows,
+        label_aware=True,
+        sample_mode=args.train_sample_mode,
+        max_positive_fraction=args.max_positive_sample_fraction,
+    )
+    fit_validation_rows = sample_rows(
+        validation_rows,
+        args.max_validation_rows,
+        label_aware=False,
+        sample_mode="chronological",
+        max_positive_fraction=args.max_positive_sample_fraction,
+    )
+    if len(fit_train_rows) != len(train_rows) or len(fit_validation_rows) != len(validation_rows):
+        sampled_positives = positive_label_count(fit_train_rows)
+        print(
+            "Fitting on sampled rows: train {}/{} positives={} validation {}/{}".format(
+                len(fit_train_rows),
+                len(train_rows),
+                sampled_positives,
+                len(fit_validation_rows),
+                len(validation_rows),
+            ),
+            flush=True,
+        )
+    log_memory("Row sampling complete")
+
+    x_train = model_matrix(fit_train_rows, kind, args)
+    y_train = model_labels(fit_train_rows, kind)
+    x_validation = model_matrix(fit_validation_rows, kind, args)
+    y_validation = model_labels(fit_validation_rows, kind)
+    positive_weight = class_weight_ratio_for_rows(train_rows, args.positive_weight_cap)
 
     best = None
     for params in candidate_params(kind, args):
         model = make_model(kind, params, positive_weight)
-        model.fit(x_train, y_train, feature_names)
+        model.fit(x_train, y_train, feature_names, x_validation, y_validation, args)
+        log_memory("LightGBM candidate fit complete" if kind == "lightgbm" else "Internal candidate fit complete")
         probabilities = model.predict_proba(x_validation)
+        log_memory("Sampled validation prediction complete")
         thresholds = args.thresholds
         if not args.disable_adaptive_thresholds:
-            thresholds = adaptive_thresholds(probabilities, args.thresholds, args.min_validation_trades)
+            thresholds = adaptive_thresholds(
+                probabilities,
+                args.thresholds,
+                args.min_validation_trades,
+                args.adaptive_threshold_sample_rows,
+            )
+        thresholds = [threshold for threshold in thresholds if threshold >= args.min_selected_threshold]
+        if not thresholds:
+            thresholds = [1.01]
+        threshold, metrics = tune_threshold(
+            fit_validation_rows,
+            probabilities,
+            thresholds,
+            args.threshold_objective,
+            args.fee,
+            args.slippage,
+            args.min_validation_trades,
+            args.max_validation_trades,
+            args.min_validation_precision,
+            args.profit_safety,
+            args.initial_capital,
+            args.max_position_fraction,
+            args.max_volume_fraction,
+            args.max_trades_per_period,
+            args.trade_period_minutes,
+            args.holding_period_minutes,
+        )
+        zero_trade_score = 0.0 if args.threshold_objective in ("profit", "avg_profit") and args.profit_safety == "strict" else -float("inf")
+        score = threshold_score(metrics, args.threshold_objective, zero_trade_score)
+        if best is None or threshold_rank(metrics, args.threshold_objective, zero_trade_score) > best["rank"]:
+            if best is not None:
+                old_model = best.pop("model", None)
+                del old_model
+            best = {
+                "model": model,
+                "params": dict(params),
+                "threshold": threshold,
+                "validation_metrics": metrics,
+                "score": score,
+                "rank": threshold_rank(metrics, args.threshold_objective, zero_trade_score),
+            }
+            if hasattr(model, "best_iteration") and model.best_iteration():
+                best["best_iteration"] = model.best_iteration()
+                best["params"]["n_estimators"] = model.best_iteration()
+        else:
+            del model
+        del probabilities
+        gc.collect()
+    del x_train
+    del y_train
+    del x_validation
+    del y_validation
+    gc.collect()
+    if best is not None and len(fit_validation_rows) != len(validation_rows) and not args.skip_full_validation_retune:
+        probabilities = predict_probabilities(best["model"], validation_rows, kind, args, "full validation retune prediction")
+        thresholds = args.thresholds
+        if not args.disable_adaptive_thresholds:
+            thresholds = adaptive_thresholds(
+                probabilities,
+                args.thresholds,
+                args.min_validation_trades,
+                args.adaptive_threshold_sample_rows,
+            )
         thresholds = [threshold for threshold in thresholds if threshold >= args.min_selected_threshold]
         if not thresholds:
             thresholds = [1.01]
@@ -1243,39 +2005,42 @@ def fit_select_model(train_rows, validation_rows, feature_names, args, kind):
             args.threshold_objective,
             args.fee,
             args.slippage,
-            args.cooldown_minutes,
             args.min_validation_trades,
             args.max_validation_trades,
             args.min_validation_precision,
-            args.max_trades_per_symbol_month,
             args.profit_safety,
+            args.initial_capital,
+            args.max_position_fraction,
+            args.max_volume_fraction,
+            args.max_trades_per_period,
+            args.trade_period_minutes,
+            args.holding_period_minutes,
         )
-        zero_trade_score = 0.0 if args.threshold_objective in ("profit", "avg_profit") and args.profit_safety == "strict" else -float("inf")
-        score = threshold_score(metrics, args.threshold_objective, zero_trade_score)
-        if best is None or score > best["score"]:
-            if best is not None:
-                old_model = best.pop("model", None)
-                del old_model
-            best = {
-                "model": model,
-                "params": params,
-                "threshold": threshold,
-                "validation_metrics": metrics,
-                "score": score,
-            }
-        else:
-            del model
+        best["threshold"] = threshold
+        best["validation_metrics"] = metrics
+        best["score"] = threshold_score(
+            metrics,
+            args.threshold_objective,
+            0.0 if args.threshold_objective in ("profit", "avg_profit") and args.profit_safety == "strict" else -float("inf"),
+        )
+        best["rank"] = threshold_rank(
+            metrics,
+            args.threshold_objective,
+            0.0 if args.threshold_objective in ("profit", "avg_profit") and args.profit_safety == "strict" else -float("inf"),
+        )
+        cleanup_probabilities(probabilities)
         del probabilities
         gc.collect()
-    del x_train
-    del y_train
-    del x_validation
-    gc.collect()
+        log_memory("Full validation threshold retune complete")
     return best
 
 
-def write_predictions(path, rows, probabilities, threshold, model_name, cooldown_minutes,
-                      max_trades_per_symbol_month=0, append=False):
+def write_predictions(path, rows, probabilities, threshold, model_name,
+                      append=False, output_mode="all",
+                      initial_capital=10000.0, max_position_fraction=0.10,
+                      max_volume_fraction=0.01, max_trades_per_period=10,
+                      trade_period_minutes=60, holding_period_minutes=5,
+                      fee=0.0, slippage=0.0):
     with open(path, "a" if append else "w", newline="") as handle:
         writer = csv.writer(handle)
         if not append:
@@ -1289,38 +2054,41 @@ def write_predictions(path, rows, probabilities, threshold, model_name, cooldown
                 "selected_threshold",
                 "raw_signal",
                 "predicted",
+                "position_size",
                 "forward_return",
                 "trade_return",
                 "max_future_high_return",
                 "max_future_low_return",
                 "model_name",
             ])
+        if output_mode == "none":
+            log_memory("Prediction CSV output skipped (--prediction-output-mode none)")
+            return
+        execution = portfolio_execution(
+            rows,
+            probabilities,
+            threshold,
+            fee,
+            slippage,
+            initial_capital,
+            max_position_fraction,
+            max_volume_fraction,
+            max_trades_per_period,
+            trade_period_minutes,
+            holding_period_minutes,
+        )
+        executed = execution["executed"]
         if is_compact_rows(rows):
             table = rows.table
             threshold_is_list = isinstance(threshold, list)
-            next_allowed_signal_time = {}
-            trades_by_symbol_month = {}
-            cooldown_ms = max(0, int(cooldown_minutes)) * 60 * 1000
-            for index, position in enumerate(rows.positions()):
+            output_indices = sorted(executed) if output_mode == "trades" else range(len(rows))
+            for index in output_indices:
+                position = index if rows.indices is None else int(rows.indices[index])
                 row_threshold = threshold[index] if threshold_is_list else threshold
                 probability = float(probabilities[index])
                 raw_signal = probability >= row_threshold
-                predicted = False
                 symbol_code = int(table.symbol_codes[position])
-                if raw_signal:
-                    next_allowed = next_allowed_signal_time.get(symbol_code, 0)
-                    open_time = int(table.open_times[position])
-                    predicted = open_time >= next_allowed
-                    if predicted and max_trades_per_symbol_month > 0:
-                        limit_key = (symbol_code, int(table.month_codes[position]))
-                        if trades_by_symbol_month.get(limit_key, 0) >= max_trades_per_symbol_month:
-                            predicted = False
-                    if predicted:
-                        if max_trades_per_symbol_month > 0:
-                            limit_key = (symbol_code, int(table.month_codes[position]))
-                            trades_by_symbol_month[limit_key] = trades_by_symbol_month.get(limit_key, 0) + 1
-                        if cooldown_ms:
-                            next_allowed_signal_time[symbol_code] = open_time + cooldown_ms
+                predicted = index in executed
                 writer.writerow([
                     table.symbols[symbol_code],
                     table.months[int(table.month_codes[position])],
@@ -1331,35 +2099,24 @@ def write_predictions(path, rows, probabilities, threshold, model_name, cooldown
                     "{:.12g}".format(row_threshold),
                     1 if raw_signal else 0,
                     1 if predicted else 0,
+                    "{:.12g}".format(executed.get(index, 0.0)),
                     "{:.12g}".format(float(table.forward_returns[position])),
                     "{:.12g}".format(float(table.trade_returns[position])),
                     "{:.12g}".format(float(table.max_future_high_returns[position])),
                     "{:.12g}".format(float(table.max_future_low_returns[position])),
                     model_name,
                 ])
+            log_memory("Prediction CSV output complete: {}".format(path))
             return
 
         threshold_is_list = isinstance(threshold, list)
-        next_allowed_signal_time = {}
-        trades_by_symbol_month = {}
-        cooldown_ms = max(0, int(cooldown_minutes)) * 60 * 1000
-        for index, (row, probability) in enumerate(zip(rows, probabilities)):
+        output_indices = sorted(executed) if output_mode == "trades" else range(len(rows))
+        for index in output_indices:
+            row = rows[index]
+            probability = probabilities[index]
             row_threshold = threshold[index] if threshold_is_list else threshold
             raw_signal = probability >= row_threshold
-            predicted = False
-            if raw_signal:
-                next_allowed = next_allowed_signal_time.get(row.symbol, 0)
-                predicted = row.open_time >= next_allowed
-                if predicted and max_trades_per_symbol_month > 0:
-                    limit_key = trade_limit_key(row)
-                    if trades_by_symbol_month.get(limit_key, 0) >= max_trades_per_symbol_month:
-                        predicted = False
-                if predicted:
-                    if max_trades_per_symbol_month > 0:
-                        limit_key = trade_limit_key(row)
-                        trades_by_symbol_month[limit_key] = trades_by_symbol_month.get(limit_key, 0) + 1
-                    if cooldown_ms:
-                        next_allowed_signal_time[row.symbol] = row.open_time + cooldown_ms
+            predicted = index in executed
             writer.writerow([
                 row.symbol,
                 row.month,
@@ -1370,12 +2127,14 @@ def write_predictions(path, rows, probabilities, threshold, model_name, cooldown
                 "{:.12g}".format(row_threshold),
                 1 if raw_signal else 0,
                 1 if predicted else 0,
+                "{:.12g}".format(executed.get(index, 0.0)),
                 "{:.12g}".format(row.forward_return),
                 "{:.12g}".format(row.trade_return),
                 "{:.12g}".format(row.max_future_high_return),
                 "{:.12g}".format(row.max_future_low_return),
                 model_name,
             ])
+    log_memory("Prediction CSV output complete: {}".format(path))
 
 
 METRIC_COLUMNS = [
@@ -1398,6 +2157,12 @@ METRIC_COLUMNS = [
     "predicted_trades",
     "true_positive_rows",
     "false_positive_rows",
+    "raw_signal_trades",
+    "raw_true_positive_rows",
+    "raw_false_positive_rows",
+    "raw_precision",
+    "raw_recall",
+    "raw_f1",
     "win_rate",
     "average_forward_return",
     "median_forward_return",
@@ -1411,8 +2176,22 @@ METRIC_COLUMNS = [
     "total_profit_after_fee_and_slippage",
     "profit_factor",
     "max_drawdown",
-    "cooldown_minutes",
-    "max_trades_per_symbol_month",
+    "initial_capital",
+    "ending_capital",
+    "portfolio_profit",
+    "portfolio_return",
+    "average_position_size",
+    "median_position_size",
+    "trades_per_day",
+    "trades_per_month",
+    "average_profit_per_trade",
+    "worst_trade",
+    "max_capital_drawdown",
+    "max_position_fraction",
+    "max_volume_fraction",
+    "max_trades_per_period",
+    "trade_period_minutes",
+    "holding_period_minutes",
     "min_validation_trades",
     "max_validation_trades",
     "min_validation_precision",
@@ -1424,6 +2203,8 @@ METRIC_COLUMNS = [
     "validation_recall",
     "validation_average_profit_after_fee_and_slippage",
     "validation_total_profit_after_fee_and_slippage",
+    "validation_portfolio_profit",
+    "validation_portfolio_return",
 ]
 
 
@@ -1441,8 +2222,12 @@ def metrics_record(model_name, split, objective, threshold, train_rows, validati
         "train_rows": len(train_rows),
         "validation_rows": len(validation_rows),
         "test_rows": len(test_rows),
-        "cooldown_minutes": args.cooldown_minutes,
-        "max_trades_per_symbol_month": args.max_trades_per_symbol_month,
+        "initial_capital": args.initial_capital,
+        "max_position_fraction": args.max_position_fraction,
+        "max_volume_fraction": args.max_volume_fraction,
+        "max_trades_per_period": args.max_trades_per_period,
+        "trade_period_minutes": args.trade_period_minutes,
+        "holding_period_minutes": args.holding_period_minutes,
         "min_validation_trades": args.min_validation_trades,
         "max_validation_trades": args.max_validation_trades,
         "min_validation_precision": args.min_validation_precision,
@@ -1457,6 +2242,8 @@ def metrics_record(model_name, split, objective, threshold, train_rows, validati
             "validation_recall": validation_metrics["recall"],
             "validation_average_profit_after_fee_and_slippage": validation_metrics["average_profit_after_fee_and_slippage"],
             "validation_total_profit_after_fee_and_slippage": validation_metrics["total_profit_after_fee_and_slippage"],
+            "validation_portfolio_profit": validation_metrics["portfolio_profit"],
+            "validation_portfolio_return": validation_metrics["portfolio_return"],
         })
     record.update(metrics)
     return record
@@ -1468,6 +2255,7 @@ def write_metrics(path, records):
         writer.writeheader()
         for record in records:
             writer.writerow(record)
+    log_memory("Metrics CSV output complete: {}".format(path))
 
 
 def write_feature_importance(path, model, feature_names, model_name):
@@ -1495,21 +2283,24 @@ def run_fixed_split(rows, feature_names, args, kind, model_name):
             "not enough rows for fixed split: train={}, validation={}, test={}".format(
                 len(train_rows), len(validation_rows), len(test_rows)
             )
-    )
+        )
 
+    log_memory("Fixed split created: train={:,} validation={:,} test={:,}".format(
+        len(train_rows), len(validation_rows), len(test_rows)))
     selected = fit_select_model(train_rows, validation_rows, feature_names, args, kind)
-    x_test = model_matrix(test_rows, kind, args)
-    probabilities = selected["model"].predict_proba(x_test)
-    del x_test
-    gc.collect()
+    probabilities = predict_probabilities(selected["model"], test_rows, kind, args, "fixed test prediction")
     test_metrics = evaluate(
         test_rows,
         probabilities,
         selected["threshold"],
         args.fee,
         args.slippage,
-        args.cooldown_minutes,
-        args.max_trades_per_symbol_month,
+        initial_capital=args.initial_capital,
+        max_position_fraction=args.max_position_fraction,
+        max_volume_fraction=args.max_volume_fraction,
+        max_trades_per_period=args.max_trades_per_period,
+        trade_period_minutes=args.trade_period_minutes,
+        holding_period_minutes=args.holding_period_minutes,
     )
     write_predictions(
         args.predictions_out,
@@ -1517,11 +2308,18 @@ def run_fixed_split(rows, feature_names, args, kind, model_name):
         probabilities,
         selected["threshold"],
         model_name,
-        args.cooldown_minutes,
-        args.max_trades_per_symbol_month,
+        output_mode=args.prediction_output_mode,
+        initial_capital=args.initial_capital,
+        max_position_fraction=args.max_position_fraction,
+        max_volume_fraction=args.max_volume_fraction,
+        max_trades_per_period=args.max_trades_per_period,
+        trade_period_minutes=args.trade_period_minutes,
+        holding_period_minutes=args.holding_period_minutes,
+        fee=args.fee,
+        slippage=args.slippage,
     )
     write_feature_importance(args.feature_importance_out, selected["model"], feature_names, model_name)
-    return metrics_record(
+    record = metrics_record(
         model_name,
         "fixed",
         args.threshold_objective,
@@ -1532,7 +2330,11 @@ def run_fixed_split(rows, feature_names, args, kind, model_name):
         test_metrics,
         args,
         selected["validation_metrics"],
-    ), selected
+    )
+    cleanup_probabilities(probabilities)
+    del probabilities
+    gc.collect()
+    return record, selected
 
 
 def aggregate_fold_records(records, model_name, objective):
@@ -1580,8 +2382,15 @@ def run_walk_forward(rows, feature_names, args, kind, model_name):
         [],
         0.0,
         model_name,
-        args.cooldown_minutes,
-        args.max_trades_per_symbol_month,
+        output_mode=args.prediction_output_mode,
+        initial_capital=args.initial_capital,
+        max_position_fraction=args.max_position_fraction,
+        max_volume_fraction=args.max_volume_fraction,
+        max_trades_per_period=args.max_trades_per_period,
+        trade_period_minutes=args.trade_period_minutes,
+        holding_period_minutes=args.holding_period_minutes,
+        fee=args.fee,
+        slippage=args.slippage,
     )
     for fold_start in range(0, max_month - args.walk_train_months + 1):
         test_month = fold_start + args.walk_train_months
@@ -1597,29 +2406,47 @@ def run_walk_forward(rows, feature_names, args, kind, model_name):
         if not train_rows or not validation_rows or not final_train_rows or not test_rows:
             continue
 
+        log_memory("Walk-forward fold {} split created: train={:,} validation={:,} test={:,}".format(
+            fold_start + 1, len(train_rows), len(validation_rows), len(test_rows)))
         selected = fit_select_model(train_rows, validation_rows, feature_names, args, kind)
-        y_final = model_labels(final_train_rows, kind)
-        positive_weight = class_weight_ratio(y_final, args.positive_weight_cap)
+        fit_final_train_rows = sample_rows(
+            final_train_rows,
+            args.max_final_train_rows,
+            label_aware=True,
+            sample_mode=args.train_sample_mode,
+            max_positive_fraction=args.max_positive_sample_fraction,
+        )
+        if len(fit_final_train_rows) != len(final_train_rows):
+            print(
+                "Walk-forward final fit sample: train {}/{}".format(
+                    len(fit_final_train_rows),
+                    len(final_train_rows),
+                )
+        )
+        y_final = model_labels(fit_final_train_rows, kind)
+        positive_weight = class_weight_ratio_for_rows(final_train_rows, args.positive_weight_cap)
         selected_model = selected.pop("model", None)
         del selected_model
         gc.collect()
         final_model = make_model(kind, selected["params"], positive_weight)
-        x_final = model_matrix(final_train_rows, kind, args)
+        x_final = model_matrix(fit_final_train_rows, kind, args)
         final_model.fit(x_final, y_final, feature_names)
+        log_memory("Walk-forward final fit complete")
         del x_final
         gc.collect()
-        x_test = model_matrix(test_rows, kind, args)
-        probabilities = final_model.predict_proba(x_test)
-        del x_test
-        gc.collect()
+        probabilities = predict_probabilities(final_model, test_rows, kind, args, "walk-forward test prediction")
         metrics = evaluate(
             test_rows,
             probabilities,
             selected["threshold"],
             args.fee,
             args.slippage,
-            args.cooldown_minutes,
-            args.max_trades_per_symbol_month,
+            initial_capital=args.initial_capital,
+            max_position_fraction=args.max_position_fraction,
+            max_volume_fraction=args.max_volume_fraction,
+            max_trades_per_period=args.max_trades_per_period,
+            trade_period_minutes=args.trade_period_minutes,
+            holding_period_minutes=args.holding_period_minutes,
         )
         write_predictions(
             args.walk_predictions_out,
@@ -1627,9 +2454,16 @@ def run_walk_forward(rows, feature_names, args, kind, model_name):
             probabilities,
             selected["threshold"],
             model_name,
-            args.cooldown_minutes,
-            args.max_trades_per_symbol_month,
             append=True,
+            output_mode=args.prediction_output_mode,
+            initial_capital=args.initial_capital,
+            max_position_fraction=args.max_position_fraction,
+            max_volume_fraction=args.max_volume_fraction,
+            max_trades_per_period=args.max_trades_per_period,
+            trade_period_minutes=args.trade_period_minutes,
+            holding_period_minutes=args.holding_period_minutes,
+            fee=args.fee,
+            slippage=args.slippage,
         )
         record = metrics_record(
             model_name,
@@ -1646,13 +2480,16 @@ def run_walk_forward(rows, feature_names, args, kind, model_name):
         fold_records.append(record)
         del selected
         del final_model
+        cleanup_probabilities(probabilities)
         del probabilities
         del y_final
+        del fit_final_train_rows
         del train_rows
         del validation_rows
         del final_train_rows
         del test_rows
         gc.collect()
+        log_memory("Walk-forward fold {} cleanup complete".format(fold_start + 1))
 
     if fold_records:
         aggregate = aggregate_fold_records(fold_records, model_name, args.threshold_objective)
@@ -1696,39 +2533,138 @@ def print_comparison(gbdt_record, walk_records, args):
     else:
         print("Logistic: metrics file not found at {}".format(args.logistic_metrics_in))
     print(
-        "GBDT: model={} threshold={:.4g} precision={:.4f} recall={:.4f} net_fee_slippage={:.6f} safety={}".format(
+        "GBDT: model={} threshold={:.4g} precision={:.4f} recall={:.4f} portfolio_profit={:.2f} portfolio_return={:.4%} safety={}".format(
             gbdt_record["model"],
             float(gbdt_record["selected_threshold"]),
             float(gbdt_record["precision"]),
             float(gbdt_record["recall"]),
-            float(gbdt_record["total_profit_after_fee_and_slippage"]),
+            float(gbdt_record["portfolio_profit"]),
+            float(gbdt_record["portfolio_return"]),
             args.profit_safety,
         )
     )
     print(
-        "GBDT validation: trades={} precision={:.4f} recall={:.4f} net_fee_slippage={:.6f}".format(
+        "GBDT validation: trades={} precision={:.4f} recall={:.4f} portfolio_profit={:.2f} portfolio_return={:.4%}".format(
             int(float(gbdt_record.get("validation_predicted_trades", 0))),
             float(gbdt_record.get("validation_precision", 0.0)),
             float(gbdt_record.get("validation_recall", 0.0)),
-            float(gbdt_record.get("validation_total_profit_after_fee_and_slippage", 0.0)),
+            float(gbdt_record.get("validation_portfolio_profit", 0.0)),
+            float(gbdt_record.get("validation_portfolio_return", 0.0)),
         )
     )
     aggregate = walk_records[-1] if walk_records and walk_records[-1].get("split") == "walkforward_average" else None
     if aggregate:
         print(
-            "Walk-forward average: folds={} precision={:.4f} recall={:.4f} net_fee_slippage={:.6f}".format(
+            "Walk-forward average: folds={} precision={:.4f} recall={:.4f} portfolio_profit={:.2f} portfolio_return={:.4%}".format(
                 len(walk_records) - 1,
                 float(aggregate["precision"]),
                 float(aggregate["recall"]),
-                float(aggregate["total_profit_after_fee_and_slippage"]),
+                float(aggregate["portfolio_profit"]),
+                float(aggregate["portfolio_return"]),
             )
         )
 
-    logistic_profit = metric_float(logistic, "total_profit_after_fee_and_slippage") if logistic else None
-    gbdt_profit = float(gbdt_record["total_profit_after_fee_and_slippage"])
-    if logistic_profit is not None:
-        better = "GBDT" if gbdt_profit > logistic_profit else "Logistic"
-        print("{} performed better on profit after fee+slippage for the fixed test split.".format(better))
+    if logistic:
+        print("Logistic comparison is legacy until the C++ baseline is regenerated with portfolio sizing.")
+
+
+def git_commit():
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return ""
+
+
+def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_record, walk_records):
+    aggregate = walk_records[-1] if walk_records and walk_records[-1].get("split") == "walkforward_average" else None
+    run_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    summary = {
+        "run_at_utc": run_at,
+        "git_commit": git_commit(),
+        "args": vars(args),
+        "input_csv": os.path.abspath(args.input),
+        "input_csv_rows": len(rows),
+        "feature_count": len(feature_names),
+        "feature_names": feature_names,
+        "model_kind": kind,
+        "best_params": fixed_selected.get("params", {}),
+        "best_iteration": fixed_selected.get("best_iteration"),
+        "cache": CACHE_LOAD_INFO,
+        "memory_settings": {
+            "feature_storage": args.feature_storage,
+            "memmap_dir": args.memmap_dir,
+            "cache_dir": args.cache_dir,
+            "max_train_rows": args.max_train_rows,
+            "max_validation_rows": args.max_validation_rows,
+            "max_final_train_rows": args.max_final_train_rows,
+            "prediction_batch_rows": args.prediction_batch_rows,
+            "max_bin": args.max_bin,
+            "subsample_for_bin": args.subsample_for_bin,
+            "lightgbm_histogram_pool_mb": args.lightgbm_histogram_pool_mb,
+            "n_jobs": args.n_jobs,
+        },
+        "fixed_metrics": fixed_record,
+        "walk_forward_aggregate_metrics": aggregate,
+    }
+    with open(args.run_summary_out, "w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2, sort_keys=True)
+
+    experiment_fields = [
+        "run_at_utc",
+        "git_commit",
+        "input_csv",
+        "input_csv_rows",
+        "feature_count",
+        "model_kind",
+        "selected_threshold",
+        "portfolio_profit",
+        "portfolio_return",
+        "precision",
+        "recall",
+        "raw_precision",
+        "raw_recall",
+        "walk_forward_folds",
+        "walk_forward_portfolio_profit",
+        "walk_forward_portfolio_return",
+        "feature_storage",
+        "max_train_rows",
+        "prediction_batch_rows",
+        "best_params",
+    ]
+    experiment = {
+        "run_at_utc": run_at,
+        "git_commit": summary["git_commit"],
+        "input_csv": summary["input_csv"],
+        "input_csv_rows": len(rows),
+        "feature_count": len(feature_names),
+        "model_kind": kind,
+        "selected_threshold": fixed_record.get("selected_threshold", 0.0),
+        "portfolio_profit": fixed_record.get("portfolio_profit", 0.0),
+        "portfolio_return": fixed_record.get("portfolio_return", 0.0),
+        "precision": fixed_record.get("precision", 0.0),
+        "recall": fixed_record.get("recall", 0.0),
+        "raw_precision": fixed_record.get("raw_precision", 0.0),
+        "raw_recall": fixed_record.get("raw_recall", 0.0),
+        "walk_forward_folds": len(walk_records) - 1 if aggregate else 0,
+        "walk_forward_portfolio_profit": aggregate.get("portfolio_profit", 0.0) if aggregate else 0.0,
+        "walk_forward_portfolio_return": aggregate.get("portfolio_return", 0.0) if aggregate else 0.0,
+        "feature_storage": args.feature_storage,
+        "max_train_rows": args.max_train_rows,
+        "prediction_batch_rows": args.prediction_batch_rows,
+        "best_params": json.dumps(fixed_selected.get("params", {}), sort_keys=True),
+    }
+    write_header = not os.path.exists(args.experiment_summary_out) or os.path.getsize(args.experiment_summary_out) == 0
+    with open(args.experiment_summary_out, "a", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=experiment_fields)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(experiment)
+    log_memory("Run summaries written")
 
 
 def build_parser():
@@ -1746,43 +2682,66 @@ def build_parser():
     parser.add_argument("--threshold-objective", choices=["profit", "avg_profit", "precision", "recall", "f1"], default="avg_profit")
     parser.add_argument("--fee", type=float, default=0.001)
     parser.add_argument("--slippage", type=float, default=0.0005)
-    parser.add_argument("--cooldown-minutes", type=int, default=10)
     parser.add_argument("--min-validation-trades", type=int, default=5)
     parser.add_argument("--max-validation-trades", type=int, default=250)
     parser.add_argument("--min-validation-precision", type=float, default=0.25)
     parser.add_argument("--min-selected-threshold", type=float, default=0.90)
-    parser.add_argument("--max-trades-per-symbol-month", type=int, default=50)
+    parser.add_argument("--initial-capital", type=float, default=10000.0)
+    parser.add_argument("--max-position-fraction", type=float, default=0.10)
+    parser.add_argument("--max-volume-fraction", type=float, default=0.01)
+    parser.add_argument("--max-trades-per-period", type=int, default=10)
+    parser.add_argument("--trade-period-minutes", type=int, default=60)
+    parser.add_argument("--holding-period-minutes", type=int, default=5)
     parser.add_argument("--profit-safety", choices=["strict", "explore"], default="explore")
     parser.add_argument("--disable-adaptive-thresholds", action="store_true")
     parser.add_argument("--positive-weight-cap", type=float, default=50.0)
     parser.add_argument("--n-estimators", type=int, default=200)
     parser.add_argument("--learning-rate", type=float, default=0.05)
-    parser.add_argument("--max-bin", type=int, default=127)
-    parser.add_argument("--subsample-for-bin", type=int, default=200000)
-    parser.add_argument("--lightgbm-histogram-pool-mb", type=float, default=256.0)
-    parser.add_argument("--n-jobs", type=int, default=4)
+    parser.add_argument("--max-bin", type=int, default=63)
+    parser.add_argument("--subsample-for-bin", type=int, default=100000)
+    parser.add_argument("--lightgbm-histogram-pool-mb", type=float, default=128.0)
+    parser.add_argument("--n-jobs", type=int, default=2)
+    parser.add_argument("--early-stopping-rounds", type=int, default=50)
+    parser.add_argument("--eval-metric", choices=["binary_logloss", "auc"], default="binary_logloss")
+    parser.add_argument("--log-evaluation-period", type=int, default=50)
     parser.add_argument("--internal-estimators", type=int, default=24)
     parser.add_argument("--internal-learning-rate", type=float, default=0.08)
     parser.add_argument("--internal-bins", type=int, default=12)
     parser.add_argument("--internal-l2", type=float, default=2.0)
     parser.add_argument("--feature-storage", choices=["auto", "memmap32", "memmap64", "matrix32", "matrix64", "float32", "float64", "list"], default="auto")
     parser.add_argument("--memmap-dir", default="")
+    parser.add_argument("--cache-dir", default="")
+    parser.add_argument("--rebuild-cache", action="store_true")
+    parser.add_argument("--disable-cache", action="store_true")
+    parser.add_argument("--max-train-rows", type=int, default=2000000)
+    parser.add_argument("--max-validation-rows", type=int, default=1000000)
+    parser.add_argument("--max-final-train-rows", type=int, default=2000000)
+    parser.add_argument("--train-sample-mode", choices=["stratified", "balanced", "chronological"], default="stratified")
+    parser.add_argument("--max-positive-sample-fraction", type=float, default=0.33)
+    parser.add_argument("--prediction-batch-rows", type=int, default=200000)
+    parser.add_argument("--adaptive-threshold-sample-rows", type=int, default=1000000)
+    parser.add_argument("--auc-sample-rows", type=int, default=1000000)
+    parser.add_argument("--skip-full-validation-retune", action="store_true")
     parser.add_argument("--walk-forward", action="store_true")
     parser.add_argument("--walk-train-months", type=int, default=6)
+    parser.add_argument("--prediction-output-mode", choices=["all", "trades", "none"], default="trades")
     parser.add_argument("--predictions-out", default="kline_growth_predictions_gbdt.csv")
     parser.add_argument("--metrics-out", default="kline_growth_metrics_gbdt.csv")
     parser.add_argument("--walkforward-metrics-out", default="kline_growth_walkforward_metrics.csv")
     parser.add_argument("--walk-predictions-out", default="kline_growth_predictions_gbdt_walkforward.csv")
     parser.add_argument("--feature-importance-out", default="kline_growth_feature_importance.csv")
     parser.add_argument("--logistic-metrics-in", default="kline_growth_metrics_logistic.csv")
+    parser.add_argument("--run-summary-out", default="kline_growth_run_summary.json")
+    parser.add_argument("--experiment-summary-out", default="kline_growth_experiment_summary.csv")
+    parser.add_argument("--cooldown-minutes", type=int, default=0, help=argparse.SUPPRESS)
+    parser.add_argument("--max-trades-per-symbol-month", type=int, default=0, help=argparse.SUPPRESS)
     return parser
 
 
 def main(argv):
+    global AUC_SAMPLE_ROWS
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.cooldown_minutes < 0:
-        raise ValueError("--cooldown-minutes cannot be negative")
     if args.min_validation_trades < 0:
         raise ValueError("--min-validation-trades cannot be negative")
     if args.max_validation_trades < 0:
@@ -1793,42 +2752,104 @@ def main(argv):
         raise ValueError("--min-validation-precision must be between 0 and 1")
     if not 0.0 <= args.min_selected_threshold <= 1.01:
         raise ValueError("--min-selected-threshold must be between 0 and 1.01")
-    if args.max_trades_per_symbol_month < 0:
-        raise ValueError("--max-trades-per-symbol-month cannot be negative")
+    if args.initial_capital <= 0.0:
+        raise ValueError("--initial-capital must be positive")
+    if not 0.0 < args.max_position_fraction <= 1.0:
+        raise ValueError("--max-position-fraction must be between 0 and 1")
+    if not 0.0 < args.max_volume_fraction <= 1.0:
+        raise ValueError("--max-volume-fraction must be between 0 and 1")
+    if args.max_trades_per_period <= 0:
+        raise ValueError("--max-trades-per-period must be positive")
+    if args.trade_period_minutes <= 0:
+        raise ValueError("--trade-period-minutes must be positive")
+    if args.holding_period_minutes <= 0:
+        raise ValueError("--holding-period-minutes must be positive")
     if args.max_bin < 2:
         raise ValueError("--max-bin must be at least 2")
     if args.subsample_for_bin <= 0:
         raise ValueError("--subsample-for-bin must be positive")
     if args.lightgbm_histogram_pool_mb <= 0.0:
         raise ValueError("--lightgbm-histogram-pool-mb must be positive")
+    if args.max_train_rows < 0:
+        raise ValueError("--max-train-rows cannot be negative")
+    if args.max_validation_rows < 0:
+        raise ValueError("--max-validation-rows cannot be negative")
+    if args.max_final_train_rows < 0:
+        raise ValueError("--max-final-train-rows cannot be negative")
+    if not 0.0 < args.max_positive_sample_fraction < 1.0:
+        raise ValueError("--max-positive-sample-fraction must be between 0 and 1")
+    if args.prediction_batch_rows <= 0:
+        raise ValueError("--prediction-batch-rows must be positive")
+    if args.adaptive_threshold_sample_rows < 2:
+        raise ValueError("--adaptive-threshold-sample-rows must be at least 2")
+    if args.auc_sample_rows < 0:
+        raise ValueError("--auc-sample-rows cannot be negative")
+    if args.early_stopping_rounds < 0:
+        raise ValueError("--early-stopping-rounds cannot be negative")
+    if args.log_evaluation_period < 0:
+        raise ValueError("--log-evaluation-period cannot be negative")
+    if args.cooldown_minutes < 0:
+        raise ValueError("--cooldown-minutes cannot be negative")
+    if args.max_trades_per_symbol_month < 0:
+        raise ValueError("--max-trades-per-symbol-month cannot be negative")
     if args.train_ratio <= 0.0 or args.validation_ratio <= 0.0 or args.test_ratio <= 0.0:
         raise ValueError("--train-ratio, --validation-ratio, and --test-ratio must be positive")
     if abs((args.train_ratio + args.validation_ratio + args.test_ratio) - 1.0) > 0.001:
         raise ValueError("--train-ratio + --validation-ratio + --test-ratio must equal 1.0")
+    if args.disable_cache and args.rebuild_cache:
+        raise ValueError("--disable-cache and --rebuild-cache cannot be used together")
+    if args.cooldown_minutes:
+        print("Warning: --cooldown-minutes is retained as a compatibility alias and is ignored; portfolio entry limits replace cooldown.", file=sys.stderr, flush=True)
+    if args.max_trades_per_symbol_month:
+        print("Warning: --max-trades-per-symbol-month is retained as a compatibility alias and is ignored; use --max-trades-per-period.", file=sys.stderr, flush=True)
+    if args.prediction_output_mode == "all":
+        print("Warning: --prediction-output-mode all can create very large CSV files.", file=sys.stderr, flush=True)
     args.thresholds = parse_threshold_grid(args.threshold_grid)
+    AUC_SAMPLE_ROWS = args.auc_sample_rows
     kind = choose_model_kind(args.model)
     if args.feature_storage == "auto":
         args.feature_storage = "memmap32" if np is not None else "float32"
-    rows, feature_names, has_returns = load_rows(args.input, args.feature_storage, args.memmap_dir or None)
-    if not has_returns and args.threshold_objective in ("profit", "avg_profit"):
-        print("forward return columns are missing; falling back from profit objective to f1", file=sys.stderr)
-        args.threshold_objective = "f1"
+    rows = None
+    try:
+        rows, feature_names, has_returns = load_rows(
+            args.input,
+            args.feature_storage,
+            args.memmap_dir or None,
+            args.cache_dir or None,
+            args.rebuild_cache,
+            args.disable_cache,
+        )
+        log_memory("CSV/cache load complete")
+        if not has_returns and args.threshold_objective in ("profit", "avg_profit"):
+            print("forward return columns are missing; falling back from profit objective to f1", file=sys.stderr, flush=True)
+            args.threshold_objective = "f1"
 
-    model_name = "gbdt_{}".format(kind)
-    print("Loaded {} rows with {} features from {} using {} feature storage".format(
-        len(rows), len(feature_names), args.input, args.feature_storage))
-    print("Using {} model path".format(model_name))
+        model_name = "gbdt_{}".format(kind)
+        print("Loaded {} rows with {} features from {} using {} feature storage".format(
+            len(rows), len(feature_names), args.input, args.feature_storage), flush=True)
+        print("Using {} model path".format(model_name), flush=True)
 
-    fixed_record, fixed_selected = run_fixed_split(rows, feature_names, args, kind, model_name)
-    write_metrics(args.metrics_out, [fixed_record])
-    del fixed_selected
-    gc.collect()
-    walk_records = []
-    if args.walk_forward:
-        walk_records = run_walk_forward(rows, feature_names, args, kind, model_name)
-    print_comparison(fixed_record, walk_records, args)
-    if is_compact_rows(rows):
-        rows.cleanup()
+        fixed_record, fixed_selected = run_fixed_split(rows, feature_names, args, kind, model_name)
+        write_metrics(args.metrics_out, [fixed_record])
+        gc.collect()
+        walk_records = []
+        if args.walk_forward:
+            walk_records = run_walk_forward(rows, feature_names, args, kind, model_name)
+        write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_record, walk_records)
+        print_comparison(fixed_record, walk_records, args)
+        del fixed_selected
+        gc.collect()
+    finally:
+        if rows is not None and is_compact_rows(rows):
+            rows.cleanup()
+        for path in list(TEMP_PREDICTION_PATHS):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            TEMP_PREDICTION_PATHS.discard(path)
+        gc.collect()
+        log_memory("Cleanup complete")
     return 0
 
 
