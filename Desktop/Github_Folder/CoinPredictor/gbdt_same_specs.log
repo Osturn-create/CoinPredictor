@@ -1,0 +1,2067 @@
+[progress     15.3s] Loaded compatible binary cache
+[progress     15.3s] CSV/cache load complete
+Loaded 54369386 rows with 30 features from kline_growth_training.csv using memmap32 feature storage
+Using gbdt_lightgbm model path
+[progress     17.4s] Fixed split created: train=38,228,126 validation=8,138,310 test=8,002,950
+Fitting on sampled rows: train 1500000/38228126 positives=13743 validation 750000/8138310
+[progress     17.6s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.0154264
+[progress     73.8s] LightGBM candidate fit complete
+[progress     73.9s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.015371
+[100]	valid_0's binary_logloss: 0.0144923
+[progress     86.4s] LightGBM candidate fit complete
+[progress     87.8s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.0133831
+[progress     96.0s] LightGBM candidate fit complete
+[progress     96.1s] Sampled validation prediction complete
+[progress     98.4s] full validation retune prediction progress: 1,000,000/8,138,310 rows
+[progress    100.4s] full validation retune prediction progress: 2,000,000/8,138,310 rows
+[progress    103.2s] full validation retune prediction progress: 3,000,000/8,138,310 rows
+[progress    105.0s] full validation retune prediction progress: 4,000,000/8,138,310 rows
+[progress    106.8s] full validation retune prediction progress: 5,000,000/8,138,310 rows
+[progress    108.6s] full validation retune prediction progress: 6,000,000/8,138,310 rows
+[progress    110.4s] full validation retune prediction progress: 7,000,000/8,138,310 rows
+[progress    111.9s] full validation retune prediction progress: 8,000,000/8,138,310 rows
+[progress    112.0s] full validation retune prediction complete: 8,138,310 rows
+[progress    112.5s] Full validation threshold retune complete
+[progress    115.8s] fixed test prediction progress: 1,000,000/8,002,950 rows
+[progress    118.4s] fixed test prediction progress: 2,000,000/8,002,950 rows
+[progress    120.8s] fixed test prediction progress: 3,000,000/8,002,950 rows
+[progress    123.2s] fixed test prediction progress: 4,000,000/8,002,950 rows
+[progress    125.8s] fixed test prediction progress: 5,000,000/8,002,950 rows
+[progress    128.4s] fixed test prediction progress: 6,000,000/8,002,950 rows
+[progress    130.9s] fixed test prediction progress: 7,000,000/8,002,950 rows
+[progress    132.8s] fixed test prediction progress: 8,000,000/8,002,950 rows
+[progress    132.9s] fixed test prediction complete: 8,002,950 rows
+[progress    136.7s] Prediction CSV output complete: kline_growth_predictions_gbdt.csv
+[progress    136.9s] Metrics CSV output complete: kline_growth_metrics_gbdt.csv
+[progress    137.0s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress    137.2s] Walk-forward fold 1 split created: train=2,960,373 validation=654,795 test=637,142
+Fitting on sampled rows: train 1500000/2960373 positives=3027 validation 654795/654795
+[progress    137.3s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.0171412
+[100]	valid_0's binary_logloss: 0.016336
+[150]	valid_0's binary_logloss: 0.0159251
+[200]	valid_0's binary_logloss: 0.0155997
+[progress    157.8s] LightGBM candidate fit complete
+[progress    159.6s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.0390619
+[progress    166.5s] LightGBM candidate fit complete
+[progress    166.5s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.0150795
+[100]	valid_0's binary_logloss: 0.0141604
+[150]	valid_0's binary_logloss: 0.0133068
+[200]	valid_0's binary_logloss: 0.0126651
+[250]	valid_0's binary_logloss: 0.0120329
+[300]	valid_0's binary_logloss: 0.0115134
+[progress    206.0s] LightGBM candidate fit complete
+[progress    210.5s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3615168
+[progress    226.8s] Walk-forward final fit complete
+[progress    228.9s] walk-forward test prediction complete: 637,142 rows
+[progress    230.7s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress    230.8s] Walk-forward fold 1 cleanup complete
+[progress    231.0s] Walk-forward fold 2 split created: train=3,262,769 validation=637,142 test=656,895
+Fitting on sampled rows: train 1500000/3262769 positives=2929 validation 637142/637142
+[progress    231.1s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.0120745
+[progress    238.7s] LightGBM candidate fit complete
+[progress    238.7s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.0227034
+[progress    244.8s] LightGBM candidate fit complete
+[progress    244.9s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.0098084
+[100]	valid_0's binary_logloss: 0.00939054
+[150]	valid_0's binary_logloss: 0.00889579
+[200]	valid_0's binary_logloss: 0.00842505
+[250]	valid_0's binary_logloss: 0.00808997
+[300]	valid_0's binary_logloss: 0.00774671
+[progress    281.0s] LightGBM candidate fit complete
+[progress    285.3s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3899911
+[progress    286.9s] Walk-forward final fit complete
+[progress    287.4s] walk-forward test prediction complete: 656,895 rows
+[progress    287.5s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress    287.5s] Walk-forward fold 2 cleanup complete
+[progress    287.7s] Walk-forward fold 3 split created: train=3,249,532 validation=656,895 test=655,652
+Fitting on sampled rows: train 1500000/3249532 positives=2595 validation 656895/656895
+[progress    287.8s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.0119214
+[progress    294.1s] LightGBM candidate fit complete
+[progress    294.1s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.0120903
+[100]	valid_0's binary_logloss: 0.0115079
+[progress    307.0s] LightGBM candidate fit complete
+[progress    308.1s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.0103757
+[100]	valid_0's binary_logloss: 0.0101301
+[150]	valid_0's binary_logloss: 0.00967984
+[200]	valid_0's binary_logloss: 0.00924845
+[250]	valid_0's binary_logloss: 0.00882184
+[300]	valid_0's binary_logloss: 0.00845452
+[progress    343.8s] LightGBM candidate fit complete
+[progress    348.3s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3906427
+[progress    379.3s] Walk-forward final fit complete
+[progress    384.2s] walk-forward test prediction complete: 655,652 rows
+[progress    385.9s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress    385.9s] Walk-forward fold 3 cleanup complete
+[progress    386.3s] Walk-forward fold 4 split created: train=3,252,521 validation=655,652 test=658,395
+Fitting on sampled rows: train 1500000/3252521 positives=2447 validation 655652/655652
+[progress    386.3s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.0132054
+[progress    392.1s] LightGBM candidate fit complete
+[progress    392.2s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.01729
+[progress    399.8s] LightGBM candidate fit complete
+[progress    399.9s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00894361
+[100]	valid_0's binary_logloss: 0.00856295
+[150]	valid_0's binary_logloss: 0.00808319
+[200]	valid_0's binary_logloss: 0.00768088
+[250]	valid_0's binary_logloss: 0.00729899
+[300]	valid_0's binary_logloss: 0.00692166
+[progress    435.8s] LightGBM candidate fit complete
+[progress    439.9s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3908173
+[progress    441.4s] Walk-forward final fit complete
+[progress    441.8s] walk-forward test prediction complete: 658,395 rows
+[progress    442.0s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress    442.0s] Walk-forward fold 4 cleanup complete
+[progress    442.3s] Walk-forward fold 5 split created: train=3,253,995 validation=658,395 test=652,612
+Fitting on sampled rows: train 1500000/3253995 positives=2420 validation 658395/658395
+[progress    442.3s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.0156642
+[progress    448.6s] LightGBM candidate fit complete
+[progress    448.6s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.0329536
+[progress    455.1s] LightGBM candidate fit complete
+[progress    455.2s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00961933
+[100]	valid_0's binary_logloss: 0.00893635
+[150]	valid_0's binary_logloss: 0.00827443
+[200]	valid_0's binary_logloss: 0.0077486
+[250]	valid_0's binary_logloss: 0.00721974
+[300]	valid_0's binary_logloss: 0.00676332
+[progress    491.0s] LightGBM candidate fit complete
+[progress    495.4s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3912390
+[progress    526.4s] Walk-forward final fit complete
+[progress    531.2s] walk-forward test prediction complete: 652,612 rows
+[progress    533.2s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress    533.3s] Walk-forward fold 5 cleanup complete
+[progress    533.5s] Walk-forward fold 6 split created: train=3,262,879 validation=652,612 test=657,241
+Fitting on sampled rows: train 1500000/3262879 positives=2166 validation 652612/652612
+[progress    533.6s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00923215
+[100]	valid_0's binary_logloss: 0.00898989
+[150]	valid_0's binary_logloss: 0.00881001
+[200]	valid_0's binary_logloss: 0.0087078
+[progress    555.1s] LightGBM candidate fit complete
+[progress    556.8s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.0115702
+[100]	valid_0's binary_logloss: 0.0112673
+[progress    568.1s] LightGBM candidate fit complete
+[progress    569.2s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00643313
+[progress    579.6s] LightGBM candidate fit complete
+[progress    579.8s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3915491
+[progress    597.0s] Walk-forward final fit complete
+[progress    598.9s] walk-forward test prediction complete: 657,241 rows
+[progress    600.6s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress    600.7s] Walk-forward fold 6 cleanup complete
+[progress    601.0s] Walk-forward fold 7 split created: train=3,260,696 validation=657,241 test=661,185
+Fitting on sampled rows: train 1500000/3260696 positives=1897 validation 657241/657241
+[progress    601.0s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00856365
+[progress    607.5s] LightGBM candidate fit complete
+[progress    607.5s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00775985
+[100]	valid_0's binary_logloss: 0.00703068
+[progress    620.0s] LightGBM candidate fit complete
+[progress    621.1s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00579483
+[progress    629.2s] LightGBM candidate fit complete
+[progress    629.2s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3917937
+[progress    631.2s] Walk-forward final fit complete
+[progress    631.7s] walk-forward test prediction complete: 661,185 rows
+[progress    631.8s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress    631.9s] Walk-forward fold 7 cleanup complete
+[progress    632.2s] Walk-forward fold 8 split created: train=3,280,795 validation=661,185 test=652,909
+Fitting on sampled rows: train 1500000/3280795 positives=1773 validation 661185/661185
+[progress    632.2s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00894003
+[100]	valid_0's binary_logloss: 0.00853393
+[150]	valid_0's binary_logloss: 0.00831704
+[200]	valid_0's binary_logloss: 0.00814491
+[progress    651.5s] LightGBM candidate fit complete
+[progress    653.3s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.0149573
+[progress    660.6s] LightGBM candidate fit complete
+[progress    660.7s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00908763
+[progress    668.5s] LightGBM candidate fit complete
+[progress    668.6s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3941980
+[progress    684.7s] Walk-forward final fit complete
+[progress    686.8s] walk-forward test prediction complete: 652,909 rows
+[progress    688.8s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress    688.9s] Walk-forward fold 8 cleanup complete
+[progress    689.2s] Walk-forward fold 9 split created: train=3,285,085 validation=652,909 test=657,936
+Fitting on sampled rows: train 1500000/3285085 positives=1518 validation 652909/652909
+[progress    689.2s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00595203
+[100]	valid_0's binary_logloss: 0.00575762
+[150]	valid_0's binary_logloss: 0.005553
+[200]	valid_0's binary_logloss: 0.00544417
+[progress    710.5s] LightGBM candidate fit complete
+[progress    712.5s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.0125892
+[100]	valid_0's binary_logloss: 0.0107821
+[progress    724.1s] LightGBM candidate fit complete
+[progress    725.1s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00587598
+[progress    733.0s] LightGBM candidate fit complete
+[progress    733.1s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3937994
+[progress    750.1s] Walk-forward final fit complete
+[progress    752.4s] walk-forward test prediction complete: 657,936 rows
+[progress    754.3s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress    754.4s] Walk-forward fold 9 cleanup complete
+[progress    754.6s] Walk-forward fold 10 split created: train=3,282,342 validation=657,936 test=655,275
+Fitting on sampled rows: train 1500000/3282342 positives=1273 validation 657936/657936
+[progress    754.7s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.0121009
+[progress    761.4s] LightGBM candidate fit complete
+[progress    761.5s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.0338281
+[100]	valid_0's binary_logloss: 0.0286676
+[progress    773.5s] LightGBM candidate fit complete
+[progress    774.8s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.020027
+[progress    783.6s] LightGBM candidate fit complete
+[progress    783.8s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3940278
+[progress    785.8s] Walk-forward final fit complete
+[progress    786.3s] walk-forward test prediction complete: 655,275 rows
+[progress    786.5s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress    786.5s] Walk-forward fold 10 cleanup complete
+[progress    786.7s] Walk-forward fold 11 split created: train=3,281,883 validation=655,275 test=650,445
+Fitting on sampled rows: train 1500000/3281883 positives=1711 validation 655275/655275
+[progress    786.7s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00584133
+[100]	valid_0's binary_logloss: 0.00565589
+[150]	valid_0's binary_logloss: 0.00546901
+[200]	valid_0's binary_logloss: 0.00529259
+[progress    806.8s] LightGBM candidate fit complete
+[progress    808.5s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00941158
+[progress    815.7s] LightGBM candidate fit complete
+[progress    815.8s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00414806
+[progress    825.1s] LightGBM candidate fit complete
+[progress    825.3s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3937158
+[progress    841.7s] Walk-forward final fit complete
+[progress    843.9s] walk-forward test prediction complete: 650,445 rows
+[progress    845.7s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress    845.8s] Walk-forward fold 11 cleanup complete
+[progress    846.0s] Walk-forward fold 12 split created: train=3,284,546 validation=650,445 test=654,564
+Fitting on sampled rows: train 1500000/3284546 positives=1491 validation 650445/650445
+[progress    846.0s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00928058
+[100]	valid_0's binary_logloss: 0.00817637
+[150]	valid_0's binary_logloss: 0.0077729
+[200]	valid_0's binary_logloss: 0.00751539
+[progress    865.7s] LightGBM candidate fit complete
+[progress    867.5s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.011285
+[100]	valid_0's binary_logloss: 0.0100094
+[progress    879.2s] LightGBM candidate fit complete
+[progress    880.3s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.0124481
+[progress    888.3s] LightGBM candidate fit complete
+[progress    888.4s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3934991
+[progress    905.3s] Walk-forward final fit complete
+[progress    907.6s] walk-forward test prediction complete: 654,564 rows
+[progress    909.4s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress    909.4s] Walk-forward fold 12 cleanup complete
+[progress    909.7s] Walk-forward fold 13 split created: train=3,277,750 validation=654,564 test=643,141
+Fitting on sampled rows: train 1500000/3277750 positives=1590 validation 654564/654564
+[progress    909.7s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00809442
+[progress    916.1s] LightGBM candidate fit complete
+[progress    916.2s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00783054
+[progress    923.6s] LightGBM candidate fit complete
+[progress    923.7s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00622081
+[progress    931.7s] LightGBM candidate fit complete
+[progress    931.8s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3932314
+[progress    933.4s] Walk-forward final fit complete
+[progress    934.0s] walk-forward test prediction complete: 643,141 rows
+[progress    934.1s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress    934.1s] Walk-forward fold 13 cleanup complete
+[progress    934.4s] Walk-forward fold 14 split created: train=3,271,129 validation=643,141 test=657,422
+Fitting on sampled rows: train 1500000/3271129 positives=1452 validation 643141/643141
+[progress    934.4s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.0367922
+[100]	valid_0's binary_logloss: 0.0284488
+[150]	valid_0's binary_logloss: 0.0200425
+[200]	valid_0's binary_logloss: 0.0175028
+[progress    953.3s] LightGBM candidate fit complete
+[progress    955.0s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.0559287
+[100]	valid_0's binary_logloss: 0.0444527
+[progress    967.1s] LightGBM candidate fit complete
+[progress    968.3s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.0249513
+[100]	valid_0's binary_logloss: 0.022103
+[150]	valid_0's binary_logloss: 0.0205671
+[200]	valid_0's binary_logloss: 0.0197895
+[250]	valid_0's binary_logloss: 0.019564
+[300]	valid_0's binary_logloss: 0.0195402
+[progress   1007.3s] LightGBM candidate fit complete
+[progress   1011.9s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3914270
+[progress   1028.3s] Walk-forward final fit complete
+[progress   1030.5s] walk-forward test prediction complete: 657,422 rows
+[progress   1032.5s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   1032.5s] Walk-forward fold 14 cleanup complete
+[progress   1032.8s] Walk-forward fold 15 split created: train=3,261,361 validation=657,422 test=656,535
+Fitting on sampled rows: train 1500000/3261361 positives=2423 validation 657422/657422
+[progress   1032.9s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.0645315
+[progress   1039.2s] LightGBM candidate fit complete
+[progress   1039.3s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.157677
+[progress   1046.1s] LightGBM candidate fit complete
+[progress   1046.2s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.0258353
+[progress   1054.2s] LightGBM candidate fit complete
+[progress   1054.3s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3918783
+[progress   1055.9s] Walk-forward final fit complete
+[progress   1056.5s] walk-forward test prediction complete: 656,535 rows
+[progress   1056.6s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   1056.6s] Walk-forward fold 15 cleanup complete
+[progress   1056.9s] Walk-forward fold 16 split created: train=3,260,847 validation=656,535 test=657,457
+Fitting on sampled rows: train 1500000/3260847 positives=2179 validation 656535/656535
+[progress   1056.9s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00836056
+[100]	valid_0's binary_logloss: 0.00785087
+[150]	valid_0's binary_logloss: 0.00770913
+[200]	valid_0's binary_logloss: 0.00750412
+[progress   1077.9s] LightGBM candidate fit complete
+[progress   1080.0s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.0154823
+[100]	valid_0's binary_logloss: 0.0142738
+[progress   1093.1s] LightGBM candidate fit complete
+[progress   1094.4s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.0162846
+[progress   1102.9s] LightGBM candidate fit complete
+[progress   1103.0s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3917382
+[progress   1119.1s] Walk-forward final fit complete
+[progress   1121.2s] walk-forward test prediction complete: 657,457 rows
+[progress   1123.0s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   1123.0s] Walk-forward fold 16 cleanup complete
+[progress   1123.3s] Walk-forward fold 17 split created: train=3,262,107 validation=657,457 test=656,381
+Fitting on sampled rows: train 1500000/3262107 positives=2286 validation 657457/657457
+[progress   1123.3s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.0584334
+[progress   1129.2s] LightGBM candidate fit complete
+[progress   1129.3s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.0739243
+[progress   1136.4s] LightGBM candidate fit complete
+[progress   1136.5s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.0206505
+[progress   1144.7s] LightGBM candidate fit complete
+[progress   1144.7s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3919564
+[progress   1146.4s] Walk-forward final fit complete
+[progress   1147.1s] walk-forward test prediction complete: 656,381 rows
+[progress   1147.2s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   1147.2s] Walk-forward fold 17 cleanup complete
+[progress   1147.5s] Walk-forward fold 18 split created: train=3,269,119 validation=656,381 test=659,153
+Fitting on sampled rows: train 1500000/3269119 positives=2450 validation 656381/656381
+[progress   1147.6s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.0139686
+[progress   1154.2s] LightGBM candidate fit complete
+[progress   1154.3s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.0368198
+[100]	valid_0's binary_logloss: 0.0344018
+[progress   1166.5s] LightGBM candidate fit complete
+[progress   1167.6s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00858305
+[progress   1176.0s] LightGBM candidate fit complete
+[progress   1176.1s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3925500
+[progress   1177.9s] Walk-forward final fit complete
+[progress   1178.5s] walk-forward test prediction complete: 659,153 rows
+[progress   1178.6s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   1178.6s] Walk-forward fold 18 cleanup complete
+[progress   1178.9s] Walk-forward fold 19 split created: train=3,270,936 validation=659,153 test=661,492
+Fitting on sampled rows: train 1500000/3270936 positives=2697 validation 659153/659153
+[progress   1178.9s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00805502
+[100]	valid_0's binary_logloss: 0.00728266
+[150]	valid_0's binary_logloss: 0.00695634
+[200]	valid_0's binary_logloss: 0.00674263
+[progress   1199.2s] LightGBM candidate fit complete
+[progress   1201.1s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.0128053
+[progress   1208.3s] LightGBM candidate fit complete
+[progress   1208.5s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00439834
+[100]	valid_0's binary_logloss: 0.00386156
+[150]	valid_0's binary_logloss: 0.00351781
+[200]	valid_0's binary_logloss: 0.00323351
+[250]	valid_0's binary_logloss: 0.0030017
+[300]	valid_0's binary_logloss: 0.00280912
+[progress   1247.7s] LightGBM candidate fit complete
+[progress   1252.7s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3930089
+[progress   1286.0s] Walk-forward final fit complete
+[progress   1291.8s] walk-forward test prediction complete: 661,492 rows
+[progress   1293.6s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   1293.7s] Walk-forward fold 19 cleanup complete
+[progress   1293.9s] Walk-forward fold 20 split created: train=3,286,948 validation=661,492 test=652,226
+Fitting on sampled rows: train 1500000/3286948 positives=1749 validation 661492/661492
+[progress   1294.0s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00342682
+[100]	valid_0's binary_logloss: 0.00310784
+[150]	valid_0's binary_logloss: 0.00295745
+[200]	valid_0's binary_logloss: 0.00285713
+[progress   1314.4s] LightGBM candidate fit complete
+[progress   1316.3s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00480202
+[100]	valid_0's binary_logloss: 0.00418933
+[progress   1328.8s] LightGBM candidate fit complete
+[progress   1329.9s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00349769
+[progress   1337.5s] LightGBM candidate fit complete
+[progress   1337.6s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3948440
+[progress   1354.5s] Walk-forward final fit complete
+[progress   1356.9s] walk-forward test prediction complete: 652,226 rows
+[progress   1358.8s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   1358.8s] Walk-forward fold 20 cleanup complete
+[progress   1359.1s] Walk-forward fold 21 split created: train=3,291,018 validation=652,226 test=659,151
+Fitting on sampled rows: train 1500000/3291018 positives=1239 validation 652226/652226
+[progress   1359.1s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00513403
+[progress   1365.4s] LightGBM candidate fit complete
+[progress   1365.4s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00914911
+[100]	valid_0's binary_logloss: 0.00797367
+[progress   1377.7s] LightGBM candidate fit complete
+[progress   1378.9s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00469859
+[progress   1386.7s] LightGBM candidate fit complete
+[progress   1386.8s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3943244
+[progress   1388.5s] Walk-forward final fit complete
+[progress   1389.1s] walk-forward test prediction complete: 659,151 rows
+[progress   1389.2s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   1389.2s] Walk-forward fold 21 cleanup complete
+[progress   1389.5s] Walk-forward fold 22 split created: train=3,286,709 validation=659,151 test=657,043
+Fitting on sampled rows: train 1500000/3286709 positives=1134 validation 659151/659151
+[progress   1389.5s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00282003
+[progress   1395.9s] LightGBM candidate fit complete
+[progress   1396.0s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00362243
+[100]	valid_0's binary_logloss: 0.00313809
+[progress   1408.7s] LightGBM candidate fit complete
+[progress   1410.0s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00256191
+[progress   1418.2s] LightGBM candidate fit complete
+[progress   1418.3s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3945860
+[progress   1420.0s] Walk-forward final fit complete
+[progress   1420.6s] walk-forward test prediction complete: 657,043 rows
+[progress   1420.7s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   1420.7s] Walk-forward fold 22 cleanup complete
+[progress   1421.0s] Walk-forward fold 23 split created: train=3,288,403 validation=657,043 test=651,067
+Fitting on sampled rows: train 1500000/3288403 positives=707 validation 657043/657043
+[progress   1421.0s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00712198
+[progress   1429.3s] LightGBM candidate fit complete
+[progress   1429.5s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.0188291
+[100]	valid_0's binary_logloss: 0.0168568
+[progress   1443.3s] LightGBM candidate fit complete
+[progress   1444.7s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00746297
+[100]	valid_0's binary_logloss: 0.00523319
+[150]	valid_0's binary_logloss: 0.00448771
+[200]	valid_0's binary_logloss: 0.00406842
+[250]	valid_0's binary_logloss: 0.00379665
+[300]	valid_0's binary_logloss: 0.00362324
+[progress   1489.4s] LightGBM candidate fit complete
+[progress   1495.3s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3945446
+[progress   1498.3s] Walk-forward final fit complete
+[progress   1499.1s] walk-forward test prediction complete: 651,067 rows
+[progress   1499.5s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   1499.5s] Walk-forward fold 23 cleanup complete
+[progress   1499.7s] Walk-forward fold 24 split created: train=3,289,065 validation=651,067 test=656,715
+Fitting on sampled rows: train 1500000/3289065 positives=681 validation 651067/651067
+[progress   1499.7s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00966249
+[progress   1506.1s] LightGBM candidate fit complete
+[progress   1506.1s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00940454
+[100]	valid_0's binary_logloss: 0.00853776
+[progress   1518.7s] LightGBM candidate fit complete
+[progress   1520.0s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00764474
+[100]	valid_0's binary_logloss: 0.00486103
+[150]	valid_0's binary_logloss: 0.00336943
+[200]	valid_0's binary_logloss: 0.00289071
+[250]	valid_0's binary_logloss: 0.00258793
+[300]	valid_0's binary_logloss: 0.00237645
+[progress   1562.7s] LightGBM candidate fit complete
+[progress   1568.4s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3940132
+[progress   1570.1s] Walk-forward final fit complete
+[progress   1570.8s] walk-forward test prediction complete: 656,715 rows
+[progress   1570.9s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   1571.0s] Walk-forward fold 24 cleanup complete
+[progress   1571.3s] Walk-forward fold 25 split created: train=3,280,979 validation=656,715 test=645,846
+Fitting on sampled rows: train 1500000/3280979 positives=769 validation 656715/656715
+[progress   1571.3s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00456837
+[progress   1578.3s] LightGBM candidate fit complete
+[progress   1578.4s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00335373
+[progress   1586.1s] LightGBM candidate fit complete
+[progress   1586.2s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00296618
+[progress   1594.5s] LightGBM candidate fit complete
+[progress   1594.5s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3937694
+[progress   1596.5s] Walk-forward final fit complete
+[progress   1597.1s] walk-forward test prediction complete: 645,846 rows
+[progress   1597.2s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   1597.2s] Walk-forward fold 25 cleanup complete
+[progress   1597.5s] Walk-forward fold 26 split created: train=3,276,202 validation=645,846 test=657,298
+Fitting on sampled rows: train 1500000/3276202 positives=827 validation 645846/645846
+[progress   1597.5s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00839483
+[progress   1604.5s] LightGBM candidate fit complete
+[progress   1604.6s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.0092207
+[progress   1611.9s] LightGBM candidate fit complete
+[progress   1612.0s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.0120564
+[progress   1620.0s] LightGBM candidate fit complete
+[progress   1620.0s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3922048
+[progress   1621.7s] Walk-forward final fit complete
+[progress   1622.4s] walk-forward test prediction complete: 657,298 rows
+[progress   1622.5s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   1622.5s] Walk-forward fold 26 cleanup complete
+[progress   1622.8s] Walk-forward fold 27 split created: train=3,269,822 validation=657,298 test=656,394
+Fitting on sampled rows: train 1500000/3269822 positives=857 validation 657298/657298
+[progress   1622.8s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.0117061
+[progress   1629.1s] LightGBM candidate fit complete
+[progress   1629.2s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.0221265
+[progress   1636.4s] LightGBM candidate fit complete
+[progress   1636.5s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00724695
+[progress   1649.8s] LightGBM candidate fit complete
+[progress   1650.3s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3927120
+[progress   1652.0s] Walk-forward final fit complete
+[progress   1652.6s] walk-forward test prediction complete: 656,394 rows
+[progress   1652.7s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   1652.8s] Walk-forward fold 27 cleanup complete
+[progress   1653.0s] Walk-forward fold 28 split created: train=3,267,969 validation=656,394 test=658,466
+Fitting on sampled rows: train 1500000/3267969 positives=1122 validation 656394/656394
+[progress   1653.0s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00470617
+[progress   1659.9s] LightGBM candidate fit complete
+[progress   1660.0s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00894408
+[100]	valid_0's binary_logloss: 0.0081473
+[progress   1673.2s] LightGBM candidate fit complete
+[progress   1674.7s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00620145
+[100]	valid_0's binary_logloss: 0.00478031
+[150]	valid_0's binary_logloss: 0.00415546
+[200]	valid_0's binary_logloss: 0.00375068
+[250]	valid_0's binary_logloss: 0.00340291
+[300]	valid_0's binary_logloss: 0.00309342
+[progress   1715.9s] LightGBM candidate fit complete
+[progress   1721.3s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3924363
+[progress   1723.0s] Walk-forward final fit complete
+[progress   1723.8s] walk-forward test prediction complete: 658,466 rows
+[progress   1723.9s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   1723.9s] Walk-forward fold 28 cleanup complete
+[progress   1724.2s] Walk-forward fold 29 split created: train=3,267,320 validation=658,466 test=655,076
+Fitting on sampled rows: train 1500000/3267320 positives=926 validation 658466/658466
+[progress   1724.2s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.012762
+[progress   1730.7s] LightGBM candidate fit complete
+[progress   1730.8s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.0126977
+[100]	valid_0's binary_logloss: 0.0110522
+[progress   1743.6s] LightGBM candidate fit complete
+[progress   1744.9s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00584853
+[progress   1753.2s] LightGBM candidate fit complete
+[progress   1753.3s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3925786
+[progress   1755.1s] Walk-forward final fit complete
+[progress   1755.9s] walk-forward test prediction complete: 655,076 rows
+[progress   1756.0s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   1756.0s] Walk-forward fold 29 cleanup complete
+[progress   1756.2s] Walk-forward fold 30 split created: train=3,274,719 validation=655,076 test=659,402
+Fitting on sampled rows: train 1500000/3274719 positives=865 validation 655076/655076
+[progress   1756.3s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00848579
+[progress   1762.7s] LightGBM candidate fit complete
+[progress   1762.8s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.015098
+[progress   1770.3s] LightGBM candidate fit complete
+[progress   1770.4s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00697321
+[progress   1778.7s] LightGBM candidate fit complete
+[progress   1778.7s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3929795
+[progress   1780.5s] Walk-forward final fit complete
+[progress   1781.3s] walk-forward test prediction complete: 659,402 rows
+[progress   1781.4s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   1781.4s] Walk-forward fold 30 cleanup complete
+[progress   1781.7s] Walk-forward fold 31 split created: train=3,273,080 validation=659,402 test=662,080
+Fitting on sampled rows: train 1500000/3273080 positives=915 validation 659402/659402
+[progress   1781.8s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.0117498
+[progress   1788.3s] LightGBM candidate fit complete
+[progress   1788.4s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00919032
+[progress   1795.7s] LightGBM candidate fit complete
+[progress   1795.7s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00540277
+[progress   1803.9s] LightGBM candidate fit complete
+[progress   1804.0s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3932482
+[progress   1805.7s] Walk-forward final fit complete
+[progress   1806.6s] walk-forward test prediction complete: 662,080 rows
+[progress   1806.7s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   1806.7s] Walk-forward fold 31 cleanup complete
+[progress   1807.0s] Walk-forward fold 32 split created: train=3,286,636 validation=662,080 test=652,494
+Fitting on sampled rows: train 1500000/3286636 positives=927 validation 662080/662080
+[progress   1807.0s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00961807
+[progress   1813.8s] LightGBM candidate fit complete
+[progress   1813.9s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.0186839
+[progress   1821.3s] LightGBM candidate fit complete
+[progress   1821.4s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00793844
+[progress   1829.5s] LightGBM candidate fit complete
+[progress   1829.6s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3948716
+[progress   1831.2s] Walk-forward final fit complete
+[progress   1832.2s] walk-forward test prediction complete: 652,494 rows
+[progress   1832.3s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   1832.3s] Walk-forward fold 32 cleanup complete
+[progress   1832.6s] Walk-forward fold 33 split created: train=3,291,418 validation=652,494 test=658,466
+Fitting on sampled rows: train 1500000/3291418 positives=755 validation 652494/652494
+[progress   1832.6s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00682796
+[100]	valid_0's binary_logloss: 0.00620354
+[150]	valid_0's binary_logloss: 0.00589271
+[200]	valid_0's binary_logloss: 0.00554721
+[progress   1853.0s] LightGBM candidate fit complete
+[progress   1855.1s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00975035
+[100]	valid_0's binary_logloss: 0.00782321
+[progress   1867.6s] LightGBM candidate fit complete
+[progress   1868.9s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00436453
+[100]	valid_0's binary_logloss: 0.00366809
+[150]	valid_0's binary_logloss: 0.00307431
+[200]	valid_0's binary_logloss: 0.00269285
+[250]	valid_0's binary_logloss: 0.00242397
+[300]	valid_0's binary_logloss: 0.00221553
+[progress   1913.5s] LightGBM candidate fit complete
+[progress   1920.3s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3943912
+[progress   1937.1s] Walk-forward final fit complete
+[progress   1939.6s] walk-forward test prediction complete: 658,466 rows
+[progress   1941.4s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   1941.5s] Walk-forward fold 33 cleanup complete
+[progress   1941.7s] Walk-forward fold 34 split created: train=3,287,518 validation=658,466 test=656,546
+Fitting on sampled rows: train 1500000/3287518 positives=764 validation 658466/658466
+[progress   1941.8s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00550476
+[progress   1948.2s] LightGBM candidate fit complete
+[progress   1948.2s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00366615
+[progress   1955.5s] LightGBM candidate fit complete
+[progress   1955.6s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00212076
+[progress   1964.3s] LightGBM candidate fit complete
+[progress   1964.4s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3945984
+[progress   1966.2s] Walk-forward final fit complete
+[progress   1966.9s] walk-forward test prediction complete: 656,546 rows
+[progress   1967.2s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   1967.3s] Walk-forward fold 34 cleanup complete
+[progress   1967.6s] Walk-forward fold 35 split created: train=3,287,518 validation=656,546 test=654,171
+Fitting on sampled rows: train 1500000/3287518 positives=663 validation 656546/656546
+[progress   1967.6s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00731718
+[progress   1974.0s] LightGBM candidate fit complete
+[progress   1974.1s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00856965
+[progress   1981.5s] LightGBM candidate fit complete
+[progress   1981.6s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00435447
+[progress   1990.5s] LightGBM candidate fit complete
+[progress   1990.5s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3944064
+[progress   1992.3s] Walk-forward final fit complete
+[progress   1993.0s] walk-forward test prediction complete: 654,171 rows
+[progress   1993.1s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   1993.2s] Walk-forward fold 35 cleanup complete
+[progress   1993.4s] Walk-forward fold 36 split created: train=3,288,988 validation=654,171 test=656,551
+Fitting on sampled rows: train 1500000/3288988 positives=632 validation 654171/654171
+[progress   1993.5s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00481329
+[progress   2002.1s] LightGBM candidate fit complete
+[progress   2002.2s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.014146
+[progress   2009.4s] LightGBM candidate fit complete
+[progress   2009.5s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.0052834
+[progress   2017.9s] LightGBM candidate fit complete
+[progress   2017.9s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3943159
+[progress   2020.4s] Walk-forward final fit complete
+[progress   2021.1s] walk-forward test prediction complete: 656,551 rows
+[progress   2021.3s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   2021.3s] Walk-forward fold 36 cleanup complete
+[progress   2021.5s] Walk-forward fold 37 split created: train=3,283,757 validation=656,551 test=646,867
+Fitting on sampled rows: train 1500000/3283757 positives=607 validation 656551/656551
+[progress   2021.5s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00656196
+[progress   2027.9s] LightGBM candidate fit complete
+[progress   2027.9s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00889131
+[progress   2035.1s] LightGBM candidate fit complete
+[progress   2035.2s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00624505
+[progress   2044.0s] LightGBM candidate fit complete
+[progress   2044.0s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3940308
+[progress   2045.8s] Walk-forward final fit complete
+[progress   2046.6s] walk-forward test prediction complete: 646,867 rows
+[progress   2046.7s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   2046.7s] Walk-forward fold 37 cleanup complete
+[progress   2047.0s] Walk-forward fold 38 split created: train=3,278,228 validation=646,867 test=658,365
+Fitting on sampled rows: train 1500000/3278228 positives=581 validation 646867/646867
+[progress   2047.0s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00555336
+[progress   2053.8s] LightGBM candidate fit complete
+[progress   2053.9s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00726562
+[progress   2061.3s] LightGBM candidate fit complete
+[progress   2061.4s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00340966
+[progress   2069.5s] LightGBM candidate fit complete
+[progress   2069.6s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3925095
+[progress   2071.4s] Walk-forward final fit complete
+[progress   2072.1s] walk-forward test prediction complete: 658,365 rows
+[progress   2072.2s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   2072.2s] Walk-forward fold 38 cleanup complete
+[progress   2072.5s] Walk-forward fold 39 split created: train=3,272,601 validation=658,365 test=655,887
+Fitting on sampled rows: train 1500000/3272601 positives=538 validation 658365/658365
+[progress   2072.5s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00175019
+[progress   2079.1s] LightGBM candidate fit complete
+[progress   2079.2s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00289213
+[progress   2086.1s] LightGBM candidate fit complete
+[progress   2086.2s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00168892
+[progress   2094.4s] LightGBM candidate fit complete
+[progress   2094.5s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3930966
+[progress   2096.2s] Walk-forward final fit complete
+[progress   2097.0s] walk-forward test prediction complete: 655,887 rows
+[progress   2097.1s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   2097.1s] Walk-forward fold 39 cleanup complete
+[progress   2097.4s] Walk-forward fold 40 split created: train=3,272,500 validation=655,887 test=658,155
+Fitting on sampled rows: train 1500000/3272500 positives=525 validation 655887/655887
+[progress   2097.4s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00377329
+[progress   2104.3s] LightGBM candidate fit complete
+[progress   2104.4s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00387297
+[progress   2111.8s] LightGBM candidate fit complete
+[progress   2111.9s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00198851
+[100]	valid_0's binary_logloss: 0.00195595
+[150]	valid_0's binary_logloss: 0.00187637
+[200]	valid_0's binary_logloss: 0.00179434
+[250]	valid_0's binary_logloss: 0.00172677
+[300]	valid_0's binary_logloss: 0.00168106
+[progress   2157.8s] LightGBM candidate fit complete
+[progress   2164.2s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3928387
+[progress   2165.9s] Walk-forward final fit complete
+[progress   2166.7s] walk-forward test prediction complete: 658,155 rows
+[progress   2166.8s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   2166.9s] Walk-forward fold 40 cleanup complete
+[progress   2167.2s] Walk-forward fold 41 split created: train=3,271,841 validation=658,155 test=655,545
+Fitting on sampled rows: train 1500000/3271841 positives=495 validation 658155/658155
+[progress   2167.2s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00310285
+[100]	valid_0's binary_logloss: 0.00286875
+[150]	valid_0's binary_logloss: 0.00271408
+[200]	valid_0's binary_logloss: 0.00255757
+[progress   2188.4s] LightGBM candidate fit complete
+[progress   2190.7s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00536587
+[progress   2198.2s] LightGBM candidate fit complete
+[progress   2198.3s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.0031484
+[100]	valid_0's binary_logloss: 0.00274732
+[150]	valid_0's binary_logloss: 0.00257169
+[200]	valid_0's binary_logloss: 0.00247803
+[250]	valid_0's binary_logloss: 0.00243315
+[300]	valid_0's binary_logloss: 0.00240515
+[progress   2244.2s] LightGBM candidate fit complete
+[progress   2250.3s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3929996
+[progress   2268.2s] Walk-forward final fit complete
+[progress   2270.9s] walk-forward test prediction complete: 655,545 rows
+[progress   2272.8s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   2272.8s] Walk-forward fold 41 cleanup complete
+[progress   2273.1s] Walk-forward fold 42 split created: train=3,275,825 validation=655,545 test=659,985
+Fitting on sampled rows: train 1500000/3275825 positives=527 validation 655545/655545
+[progress   2273.1s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.0030751
+[progress   2280.1s] LightGBM candidate fit complete
+[progress   2280.2s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.0071612
+[progress   2287.6s] LightGBM candidate fit complete
+[progress   2287.7s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00510562
+[progress   2296.0s] LightGBM candidate fit complete
+[progress   2296.1s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3931370
+[progress   2297.8s] Walk-forward final fit complete
+[progress   2298.6s] walk-forward test prediction complete: 659,985 rows
+[progress   2298.7s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   2298.8s] Walk-forward fold 42 cleanup complete
+[progress   2299.0s] Walk-forward fold 43 split created: train=3,274,819 validation=659,985 test=662,325
+Fitting on sampled rows: train 1500000/3274819 positives=443 validation 659985/659985
+[progress   2299.1s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00124691
+[progress   2305.8s] LightGBM candidate fit complete
+[progress   2305.9s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00140382
+[progress   2313.4s] LightGBM candidate fit complete
+[progress   2313.5s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00116504
+[progress   2321.6s] LightGBM candidate fit complete
+[progress   2321.7s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3934804
+[progress   2323.5s] Walk-forward final fit complete
+[progress   2324.2s] walk-forward test prediction complete: 662,325 rows
+[progress   2324.3s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   2324.4s] Walk-forward fold 43 cleanup complete
+[progress   2324.6s] Walk-forward fold 44 split created: train=3,287,937 validation=662,325 test=652,545
+Fitting on sampled rows: train 1500000/3287937 positives=359 validation 662325/662325
+[progress   2324.7s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00206063
+[progress   2331.5s] LightGBM candidate fit complete
+[progress   2331.5s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00488043
+[progress   2339.4s] LightGBM candidate fit complete
+[progress   2339.4s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00143275
+[100]	valid_0's binary_logloss: 0.00101603
+[150]	valid_0's binary_logloss: 0.000836104
+[200]	valid_0's binary_logloss: 0.000761002
+[250]	valid_0's binary_logloss: 0.000722196
+[300]	valid_0's binary_logloss: 0.000707828
+[progress   2386.0s] LightGBM candidate fit complete
+[progress   2392.8s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3950262
+[progress   2433.9s] Walk-forward final fit complete
+[progress   2441.8s] walk-forward test prediction complete: 652,545 rows
+[progress   2443.6s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   2443.7s] Walk-forward fold 44 cleanup complete
+[progress   2443.9s] Walk-forward fold 45 split created: train=3,291,897 validation=652,545 test=658,465
+Fitting on sampled rows: train 1500000/3291897 positives=385 validation 652545/652545
+[progress   2444.0s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00228855
+[progress   2452.4s] LightGBM candidate fit complete
+[progress   2452.5s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.0043032
+[progress   2459.9s] LightGBM candidate fit complete
+[progress   2459.9s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00147493
+[100]	valid_0's binary_logloss: 0.00124316
+[150]	valid_0's binary_logloss: 0.00109263
+[200]	valid_0's binary_logloss: 0.00100461
+[250]	valid_0's binary_logloss: 0.000953792
+[300]	valid_0's binary_logloss: 0.000923306
+[progress   2510.8s] LightGBM candidate fit complete
+[progress   2518.2s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3944442
+[progress   2558.8s] Walk-forward final fit complete
+[progress   2566.5s] walk-forward test prediction complete: 658,465 rows
+[progress   2568.3s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   2568.3s] Walk-forward fold 45 cleanup complete
+[progress   2568.6s] Walk-forward fold 46 split created: train=3,288,555 validation=658,465 test=657,105
+Fitting on sampled rows: train 1500000/3288555 positives=371 validation 658465/658465
+[progress   2568.7s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00229077
+[progress   2575.9s] LightGBM candidate fit complete
+[progress   2576.0s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00330481
+[progress   2584.0s] LightGBM candidate fit complete
+[progress   2584.1s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00218759
+[progress   2592.8s] LightGBM candidate fit complete
+[progress   2592.8s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3947020
+[progress   2594.6s] Walk-forward final fit complete
+[progress   2595.3s] walk-forward test prediction complete: 657,105 rows
+[progress   2595.5s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   2595.5s] Walk-forward fold 46 cleanup complete
+[progress   2595.8s] Walk-forward fold 47 split created: train=3,288,865 validation=657,105 test=651,345
+Fitting on sampled rows: train 1500000/3288865 positives=292 validation 657105/657105
+[progress   2595.8s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00171568
+[100]	valid_0's binary_logloss: 0.00122631
+[150]	valid_0's binary_logloss: 0.00107617
+[200]	valid_0's binary_logloss: 0.000970409
+[progress   2617.6s] LightGBM candidate fit complete
+[progress   2619.7s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.0041506
+[progress   2627.2s] LightGBM candidate fit complete
+[progress   2627.3s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00173645
+[100]	valid_0's binary_logloss: 0.000778021
+[150]	valid_0's binary_logloss: 0.000526993
+[200]	valid_0's binary_logloss: 0.000433268
+[250]	valid_0's binary_logloss: 0.000386909
+[300]	valid_0's binary_logloss: 0.000365125
+[progress   2673.9s] LightGBM candidate fit complete
+[progress   2680.5s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3945970
+[progress   2698.7s] Walk-forward final fit complete
+[progress   2701.4s] walk-forward test prediction complete: 651,345 rows
+[progress   2703.5s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   2703.5s] Walk-forward fold 47 cleanup complete
+[progress   2703.9s] Walk-forward fold 48 split created: train=3,290,425 validation=651,345 test=655,665
+Fitting on sampled rows: train 1500000/3290425 positives=272 validation 651345/651345
+[progress   2703.9s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00256893
+[100]	valid_0's binary_logloss: 0.00177687
+[150]	valid_0's binary_logloss: 0.00159823
+[200]	valid_0's binary_logloss: 0.00145506
+[progress   2726.1s] LightGBM candidate fit complete
+[progress   2728.4s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00726246
+[progress   2736.0s] LightGBM candidate fit complete
+[progress   2736.1s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00205319
+[100]	valid_0's binary_logloss: 0.00107635
+[150]	valid_0's binary_logloss: 0.000790818
+[200]	valid_0's binary_logloss: 0.000676408
+[250]	valid_0's binary_logloss: 0.000620665
+[300]	valid_0's binary_logloss: 0.000590584
+[progress   2782.4s] LightGBM candidate fit complete
+[progress   2788.8s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3941770
+[progress   2829.4s] Walk-forward final fit complete
+[progress   2837.5s] walk-forward test prediction complete: 655,665 rows
+[progress   2839.4s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   2839.5s] Walk-forward fold 48 cleanup complete
+[progress   2839.7s] Walk-forward fold 49 split created: train=3,281,785 validation=655,665 test=644,145
+Fitting on sampled rows: train 1500000/3281785 positives=292 validation 655665/655665
+[progress   2839.8s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00153181
+[progress   2847.2s] LightGBM candidate fit complete
+[progress   2847.3s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00951614
+[progress   2855.4s] LightGBM candidate fit complete
+[progress   2855.5s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00152207
+[100]	valid_0's binary_logloss: 0.00101731
+[150]	valid_0's binary_logloss: 0.000851408
+[200]	valid_0's binary_logloss: 0.000781029
+[250]	valid_0's binary_logloss: 0.000753783
+[300]	valid_0's binary_logloss: 0.000741545
+[progress   2903.2s] LightGBM candidate fit complete
+[progress   2909.5s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3937450
+[progress   2911.3s] Walk-forward final fit complete
+[progress   2912.1s] walk-forward test prediction complete: 644,145 rows
+[progress   2912.2s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   2912.2s] Walk-forward fold 49 cleanup complete
+[progress   2912.5s] Walk-forward fold 50 split created: train=3,275,125 validation=644,145 test=659,985
+Fitting on sampled rows: train 1500000/3275125 positives=284 validation 644145/644145
+[progress   2912.5s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00177831
+[100]	valid_0's binary_logloss: 0.00126432
+[150]	valid_0's binary_logloss: 0.00111806
+[200]	valid_0's binary_logloss: 0.00102748
+[progress   2934.8s] LightGBM candidate fit complete
+[progress   2937.0s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00482442
+[progress   2944.1s] LightGBM candidate fit complete
+[progress   2944.2s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00214507
+[100]	valid_0's binary_logloss: 0.000960525
+[150]	valid_0's binary_logloss: 0.000655982
+[200]	valid_0's binary_logloss: 0.0005472
+[250]	valid_0's binary_logloss: 0.000495683
+[300]	valid_0's binary_logloss: 0.000471488
+[progress   2988.7s] LightGBM candidate fit complete
+[progress   2994.6s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3919270
+[progress   3033.9s] Walk-forward final fit complete
+[progress   3040.6s] walk-forward test prediction complete: 659,985 rows
+[progress   3042.4s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   3042.4s] Walk-forward fold 50 cleanup complete
+[progress   3042.7s] Walk-forward fold 51 split created: train=3,266,725 validation=659,985 test=648,465
+Fitting on sampled rows: train 1500000/3266725 positives=248 validation 659985/659985
+[progress   3042.8s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.0033259
+[100]	valid_0's binary_logloss: 0.0027984
+[150]	valid_0's binary_logloss: 0.00266395
+[200]	valid_0's binary_logloss: 0.00252308
+[progress   3064.7s] LightGBM candidate fit complete
+[progress   3067.1s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00778797
+[progress   3074.9s] LightGBM candidate fit complete
+[progress   3074.9s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00320164
+[100]	valid_0's binary_logloss: 0.00212126
+[150]	valid_0's binary_logloss: 0.00179212
+[200]	valid_0's binary_logloss: 0.00167891
+[250]	valid_0's binary_logloss: 0.00165115
+[300]	valid_0's binary_logloss: 0.00165139
+[progress   3120.4s] LightGBM candidate fit complete
+[progress   3125.6s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3926710
+[progress   3144.0s] Walk-forward final fit complete
+[progress   3146.8s] walk-forward test prediction complete: 648,465 rows
+[progress   3148.7s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   3148.8s] Walk-forward fold 51 cleanup complete
+[progress   3149.1s] Walk-forward fold 52 split created: train=3,268,245 validation=648,465 test=615,410
+Fitting on sampled rows: train 1500000/3268245 positives=333 validation 648465/648465
+[progress   3149.1s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00528181
+[progress   3156.3s] LightGBM candidate fit complete
+[progress   3156.4s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.0087051
+[progress   3164.4s] LightGBM candidate fit complete
+[progress   3164.5s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.0059368
+[progress   3172.8s] LightGBM candidate fit complete
+[progress   3172.9s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3916710
+[progress   3174.7s] Walk-forward final fit complete
+[progress   3175.5s] walk-forward test prediction complete: 615,410 rows
+[progress   3175.6s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   3175.6s] Walk-forward fold 52 cleanup complete
+[progress   3175.9s] Walk-forward fold 53 split created: train=3,259,605 validation=615,410 test=611,010
+Fitting on sampled rows: train 1500000/3259605 positives=481 validation 615410/615410
+[progress   3175.9s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00131567
+[progress   3182.4s] LightGBM candidate fit complete
+[progress   3182.4s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00309073
+[progress   3189.6s] LightGBM candidate fit complete
+[progress   3189.7s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000890771
+[progress   3197.6s] LightGBM candidate fit complete
+[progress   3197.7s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3875015
+[progress   3199.6s] Walk-forward final fit complete
+[progress   3200.5s] walk-forward test prediction complete: 611,010 rows
+[progress   3200.6s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   3200.6s] Walk-forward fold 53 cleanup complete
+[progress   3200.9s] Walk-forward fold 54 split created: train=3,223,670 validation=611,010 test=615,330
+Fitting on sampled rows: train 1500000/3223670 positives=451 validation 611010/611010
+[progress   3200.9s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00126491
+[progress   3207.5s] LightGBM candidate fit complete
+[progress   3207.6s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00213244
+[progress   3214.9s] LightGBM candidate fit complete
+[progress   3214.9s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00088466
+[progress   3222.7s] LightGBM candidate fit complete
+[progress   3222.7s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3834680
+[progress   3224.5s] Walk-forward final fit complete
+[progress   3225.4s] walk-forward test prediction complete: 615,330 rows
+[progress   3225.5s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   3225.5s] Walk-forward fold 54 cleanup complete
+[progress   3225.8s] Walk-forward fold 55 split created: train=3,179,015 validation=615,330 test=619,730
+Fitting on sampled rows: train 1500000/3179015 positives=414 validation 615330/615330
+[progress   3225.8s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.000899006
+[100]	valid_0's binary_logloss: 0.000754769
+[150]	valid_0's binary_logloss: 0.000720149
+[200]	valid_0's binary_logloss: 0.00069106
+[progress   3247.7s] LightGBM candidate fit complete
+[progress   3249.8s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000830604
+[100]	valid_0's binary_logloss: 0.00074864
+[progress   3263.5s] LightGBM candidate fit complete
+[progress   3264.9s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000710039
+[100]	valid_0's binary_logloss: 0.000624926
+[150]	valid_0's binary_logloss: 0.000591481
+[200]	valid_0's binary_logloss: 0.000577099
+[250]	valid_0's binary_logloss: 0.000576949
+[progress   3302.4s] LightGBM candidate fit complete
+[progress   3306.2s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3794345
+[progress   3324.9s] Walk-forward final fit complete
+[progress   3327.7s] walk-forward test prediction complete: 619,730 rows
+[progress   3329.5s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   3329.6s] Walk-forward fold 55 cleanup complete
+[progress   3329.9s] Walk-forward fold 56 split created: train=3,150,200 validation=619,730 test=609,650
+Fitting on sampled rows: train 1500000/3150200 positives=411 validation 619730/619730
+[progress   3329.9s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00271123
+[100]	valid_0's binary_logloss: 0.0023354
+[150]	valid_0's binary_logloss: 0.00229146
+[200]	valid_0's binary_logloss: 0.00226467
+[progress   3352.5s] LightGBM candidate fit complete
+[progress   3354.7s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00377308
+[progress   3362.4s] LightGBM candidate fit complete
+[progress   3362.5s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00138396
+[100]	valid_0's binary_logloss: 0.00132209
+[150]	valid_0's binary_logloss: 0.00131598
+[progress   3387.3s] LightGBM candidate fit complete
+[progress   3388.7s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3769930
+[progress   3406.3s] Walk-forward final fit complete
+[progress   3408.8s] walk-forward test prediction complete: 609,650 rows
+[progress   3410.5s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   3410.6s] Walk-forward fold 56 cleanup complete
+[progress   3410.9s] Walk-forward fold 57 split created: train=3,109,945 validation=609,650 test=615,410
+Fitting on sampled rows: train 1500000/3109945 positives=390 validation 609650/609650
+[progress   3410.9s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00275298
+[progress   3417.7s] LightGBM candidate fit complete
+[progress   3417.8s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00313105
+[progress   3425.4s] LightGBM candidate fit complete
+[progress   3425.4s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00150065
+[100]	valid_0's binary_logloss: 0.00107207
+[150]	valid_0's binary_logloss: 0.000906396
+[200]	valid_0's binary_logloss: 0.000823781
+[250]	valid_0's binary_logloss: 0.000783602
+[300]	valid_0's binary_logloss: 0.000770207
+[progress   3468.2s] LightGBM candidate fit complete
+[progress   3473.8s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3719595
+[progress   3475.6s] Walk-forward final fit complete
+[progress   3476.4s] walk-forward test prediction complete: 615,410 rows
+[progress   3476.5s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   3476.5s] Walk-forward fold 57 cleanup complete
+[progress   3476.7s] Walk-forward fold 58 split created: train=3,071,130 validation=615,410 test=612,450
+Fitting on sampled rows: train 1500000/3071130 positives=270 validation 615410/615410
+[progress   3476.8s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00119953
+[progress   3483.7s] LightGBM candidate fit complete
+[progress   3483.8s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00186541
+[100]	valid_0's binary_logloss: 0.00163981
+[progress   3497.3s] LightGBM candidate fit complete
+[progress   3498.7s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00102055
+[100]	valid_0's binary_logloss: 0.000926945
+[150]	valid_0's binary_logloss: 0.000895707
+[200]	valid_0's binary_logloss: 0.000901721
+[progress   3530.8s] LightGBM candidate fit complete
+[progress   3533.6s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3686540
+[progress   3535.4s] Walk-forward final fit complete
+[progress   3536.2s] walk-forward test prediction complete: 612,450 rows
+[progress   3536.3s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   3536.4s] Walk-forward fold 58 cleanup complete
+[progress   3536.7s] Walk-forward fold 59 split created: train=3,071,130 validation=612,450 test=606,690
+Fitting on sampled rows: train 1500000/3071130 positives=364 validation 612450/612450
+[progress   3536.7s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00224042
+[progress   3543.8s] LightGBM candidate fit complete
+[progress   3543.9s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00749481
+[progress   3551.2s] LightGBM candidate fit complete
+[progress   3551.3s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00267182
+[progress   3559.7s] LightGBM candidate fit complete
+[progress   3559.8s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3683580
+[progress   3561.7s] Walk-forward final fit complete
+[progress   3562.4s] walk-forward test prediction complete: 606,690 rows
+[progress   3562.5s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   3562.6s] Walk-forward fold 59 cleanup complete
+[progress   3562.8s] Walk-forward fold 60 split created: train=3,072,570 validation=606,690 test=615,410
+Fitting on sampled rows: train 1500000/3072570 positives=374 validation 606690/606690
+[progress   3562.8s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00855085
+[progress   3569.7s] LightGBM candidate fit complete
+[progress   3569.7s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.0128463
+[progress   3577.3s] LightGBM candidate fit complete
+[progress   3577.4s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00466838
+[progress   3585.5s] LightGBM candidate fit complete
+[progress   3585.6s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3679260
+[progress   3587.5s] Walk-forward final fit complete
+[progress   3588.3s] walk-forward test prediction complete: 615,410 rows
+[progress   3588.4s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   3588.4s] Walk-forward fold 60 cleanup complete
+[progress   3588.8s] Walk-forward fold 61 split created: train=3,063,930 validation=615,410 test=599,570
+Fitting on sampled rows: train 1500000/3063930 positives=378 validation 615410/615410
+[progress   3588.8s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00130762
+[progress   3595.5s] LightGBM candidate fit complete
+[progress   3595.6s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.0023401
+[progress   3602.9s] LightGBM candidate fit complete
+[progress   3602.9s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00134898
+[progress   3611.9s] LightGBM candidate fit complete
+[progress   3612.0s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3679340
+[progress   3613.9s] Walk-forward final fit complete
+[progress   3614.6s] walk-forward test prediction complete: 599,570 rows
+[progress   3614.7s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   3614.7s] Walk-forward fold 61 cleanup complete
+[progress   3615.0s] Walk-forward fold 62 split created: train=3,059,610 validation=599,570 test=589,330
+Fitting on sampled rows: train 1500000/3059610 positives=253 validation 599570/599570
+[progress   3615.0s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00156994
+[100]	valid_0's binary_logloss: 0.00108038
+[150]	valid_0's binary_logloss: 0.000930984
+[200]	valid_0's binary_logloss: 0.000840457
+[progress   3637.4s] LightGBM candidate fit complete
+[progress   3639.7s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00175652
+[progress   3646.9s] LightGBM candidate fit complete
+[progress   3647.0s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00117624
+[100]	valid_0's binary_logloss: 0.000723254
+[150]	valid_0's binary_logloss: 0.000588419
+[200]	valid_0's binary_logloss: 0.000531216
+[250]	valid_0's binary_logloss: 0.000503638
+[300]	valid_0's binary_logloss: 0.000492859
+[progress   3692.7s] LightGBM candidate fit complete
+[progress   3698.4s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3659180
+[progress   3717.4s] Walk-forward final fit complete
+[progress   3720.4s] walk-forward test prediction complete: 589,330 rows
+[progress   3722.1s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   3722.1s] Walk-forward fold 62 cleanup complete
+[progress   3722.4s] Walk-forward fold 63 split created: train=3,049,530 validation=589,330 test=474,485
+Fitting on sampled rows: train 1500000/3049530 positives=224 validation 589330/589330
+[progress   3722.5s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00167228
+[100]	valid_0's binary_logloss: 0.00108834
+[150]	valid_0's binary_logloss: 0.000922309
+[200]	valid_0's binary_logloss: 0.000814049
+[progress   3745.0s] LightGBM candidate fit complete
+[progress   3747.7s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00163189
+[progress   3755.6s] LightGBM candidate fit complete
+[progress   3755.7s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00139673
+[100]	valid_0's binary_logloss: 0.000628464
+[150]	valid_0's binary_logloss: 0.0004103
+[200]	valid_0's binary_logloss: 0.000330062
+[250]	valid_0's binary_logloss: 0.000290928
+[300]	valid_0's binary_logloss: 0.000268632
+[progress   3800.6s] LightGBM candidate fit complete
+[progress   3806.5s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3638860
+[progress   3825.4s] Walk-forward final fit complete
+[progress   3827.6s] walk-forward test prediction complete: 474,485 rows
+[progress   3829.0s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   3829.0s] Walk-forward fold 63 cleanup complete
+[progress   3829.3s] Walk-forward fold 64 split created: train=3,023,450 validation=474,485 test=422,710
+Fitting on sampled rows: train 1500000/3023450 positives=125 validation 474485/474485
+[progress   3829.3s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.000480697
+[progress   3836.5s] LightGBM candidate fit complete
+[progress   3836.6s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000449972
+[100]	valid_0's binary_logloss: 0.000230331
+[progress   3850.0s] LightGBM candidate fit complete
+[progress   3851.1s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000245754
+[100]	valid_0's binary_logloss: 0.000186009
+[150]	valid_0's binary_logloss: 0.000160048
+[200]	valid_0's binary_logloss: 0.00014763
+[250]	valid_0's binary_logloss: 0.000142186
+[300]	valid_0's binary_logloss: 0.000139701
+[progress   3896.5s] LightGBM candidate fit complete
+[progress   3901.3s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3497935
+[progress   3903.1s] Walk-forward final fit complete
+[progress   3903.7s] walk-forward test prediction complete: 422,710 rows
+[progress   3903.8s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   3903.9s] Walk-forward fold 64 cleanup complete
+[progress   3904.1s] Walk-forward fold 65 split created: train=2,885,485 validation=422,710 test=347,960
+Fitting on sampled rows: train 1500000/2885485 positives=103 validation 422710/422710
+[progress   3904.1s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.000413291
+[progress   3910.8s] LightGBM candidate fit complete
+[progress   3910.8s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000377822
+[100]	valid_0's binary_logloss: 0.000281798
+[progress   3924.1s] LightGBM candidate fit complete
+[progress   3925.2s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000265112
+[100]	valid_0's binary_logloss: 0.000247109
+[150]	valid_0's binary_logloss: 0.000243322
+[200]	valid_0's binary_logloss: 0.00024369
+[progress   3957.9s] LightGBM candidate fit complete
+[progress   3960.1s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3308195
+[progress   3961.7s] Walk-forward final fit complete
+[progress   3962.2s] walk-forward test prediction complete: 347,960 rows
+[progress   3962.2s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   3962.3s] Walk-forward fold 65 cleanup complete
+[progress   3962.5s] Walk-forward fold 66 split created: train=2,701,505 validation=347,960 test=352,280
+Fitting on sampled rows: train 1500000/2701505 positives=70 validation 347960/347960
+[progress   3962.5s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.000321673
+[progress   3969.2s] LightGBM candidate fit complete
+[progress   3969.2s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000194168
+[100]	valid_0's binary_logloss: 0.000103936
+[progress   3982.6s] LightGBM candidate fit complete
+[progress   3983.5s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000122086
+[progress   3991.0s] LightGBM candidate fit complete
+[progress   3991.1s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/3049465
+[progress   3992.7s] Walk-forward final fit complete
+[progress   3993.2s] walk-forward test prediction complete: 352,280 rows
+[progress   3993.3s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   3993.3s] Walk-forward fold 66 cleanup complete
+[progress   3993.6s] Walk-forward fold 67 split created: train=2,434,055 validation=352,280 test=353,720
+Fitting on sampled rows: train 1500000/2434055 positives=61 validation 352280/352280
+[progress   3993.6s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.000284878
+[progress   4000.6s] LightGBM candidate fit complete
+[progress   4000.6s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000177531
+[100]	valid_0's binary_logloss: 0.000116349
+[progress   4013.9s] LightGBM candidate fit complete
+[progress   4014.8s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00014545
+[100]	valid_0's binary_logloss: 0.000117733
+[150]	valid_0's binary_logloss: 0.000101707
+[200]	valid_0's binary_logloss: 9.55255e-05
+[250]	valid_0's binary_logloss: 9.38361e-05
+[300]	valid_0's binary_logloss: 9.27618e-05
+[progress   4054.0s] LightGBM candidate fit complete
+[progress   4057.1s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/2786335
+[progress   4058.9s] Walk-forward final fit complete
+[progress   4059.4s] walk-forward test prediction complete: 353,720 rows
+[progress   4059.5s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   4059.5s] Walk-forward fold 67 cleanup complete
+[progress   4059.8s] Walk-forward fold 68 split created: train=2,186,765 validation=353,720 test=347,960
+Fitting on sampled rows: train 1500000/2186765 positives=41 validation 353720/353720
+[progress   4059.8s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.000431717
+[progress   4066.5s] LightGBM candidate fit complete
+[progress   4066.5s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000427466
+[progress   4073.6s] LightGBM candidate fit complete
+[progress   4073.6s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000429058
+[progress   4080.7s] LightGBM candidate fit complete
+[progress   4080.7s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/2540485
+[progress   4082.3s] Walk-forward final fit complete
+[progress   4082.8s] walk-forward test prediction complete: 347,960 rows
+[progress   4082.9s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   4082.9s] Walk-forward fold 68 cleanup complete
+[progress   4083.1s] Walk-forward fold 69 split created: train=1,951,155 validation=347,960 test=350,840
+Fitting on sampled rows: train 1500000/1951155 positives=41 validation 347960/347960
+[progress   4083.2s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.000179127
+[progress   4089.9s] LightGBM candidate fit complete
+[progress   4090.0s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000168066
+[100]	valid_0's binary_logloss: 0.000147374
+[progress   4102.2s] LightGBM candidate fit complete
+[progress   4102.9s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000147692
+[100]	valid_0's binary_logloss: 0.000142532
+[150]	valid_0's binary_logloss: 0.00014028
+[200]	valid_0's binary_logloss: 0.000139553
+[progress   4130.6s] LightGBM candidate fit complete
+[progress   4132.0s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/2299115
+[progress   4133.9s] Walk-forward final fit complete
+[progress   4134.5s] walk-forward test prediction complete: 350,840 rows
+[progress   4134.6s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   4134.7s] Walk-forward fold 69 cleanup complete
+[progress   4135.0s] Walk-forward fold 70 split created: train=1,824,630 validation=350,840 test=349,400
+Fitting on sampled rows: train 1500000/1824630 positives=42 validation 350840/350840
+[progress   4135.0s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.000478823
+[progress   4142.2s] LightGBM candidate fit complete
+[progress   4142.3s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000532939
+[progress   4148.9s] LightGBM candidate fit complete
+[progress   4148.9s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000531909
+[progress   4156.2s] LightGBM candidate fit complete
+[progress   4156.2s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/2175470
+[progress   4158.6s] Walk-forward final fit complete
+[progress   4159.0s] walk-forward test prediction complete: 349,400 rows
+[progress   4159.1s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   4159.1s] Walk-forward fold 70 cleanup complete
+[progress   4159.3s] Walk-forward fold 71 split created: train=1,752,760 validation=349,400 test=352,280
+Fitting on sampled rows: train 1500000/1752760 positives=52 validation 349400/349400
+[progress   4159.4s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00108892
+[progress   4166.4s] LightGBM candidate fit complete
+[progress   4166.5s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.0012256
+[progress   4175.1s] LightGBM candidate fit complete
+[progress   4175.2s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00123048
+[progress   4181.5s] LightGBM candidate fit complete
+[progress   4181.5s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/2102160
+[progress   4183.9s] Walk-forward final fit complete
+[progress   4184.4s] walk-forward test prediction complete: 352,280 rows
+[progress   4184.4s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   4184.5s] Walk-forward fold 71 cleanup complete
+[progress   4184.7s] Walk-forward fold 72 split created: train=1,754,200 validation=352,280 test=352,280
+Fitting on sampled rows: train 1500000/1754200 positives=101 validation 352280/352280
+[progress   4184.7s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00032253
+[100]	valid_0's binary_logloss: 0.000281413
+[150]	valid_0's binary_logloss: 0.000234778
+[200]	valid_0's binary_logloss: 0.000199807
+[progress   4206.2s] LightGBM candidate fit complete
+[progress   4207.6s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000342319
+[100]	valid_0's binary_logloss: 0.000170627
+[progress   4219.1s] LightGBM candidate fit complete
+[progress   4219.7s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000201071
+[100]	valid_0's binary_logloss: 0.00013757
+[150]	valid_0's binary_logloss: 0.000113669
+[200]	valid_0's binary_logloss: 0.000100315
+[250]	valid_0's binary_logloss: 9.34379e-05
+[300]	valid_0's binary_logloss: 8.9574e-05
+[progress   4256.9s] LightGBM candidate fit complete
+[progress   4259.8s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/2106480
+[progress   4279.3s] Walk-forward final fit complete
+[progress   4281.0s] walk-forward test prediction complete: 352,280 rows
+[progress   4281.0s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   4281.0s] Walk-forward fold 72 cleanup complete
+[progress   4281.3s] Walk-forward fold 73 split created: train=1,754,200 validation=352,280 test=347,960
+Fitting on sampled rows: train 1500000/1754200 positives=95 validation 352280/352280
+[progress   4281.3s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00014514
+[progress   4287.6s] LightGBM candidate fit complete
+[progress   4287.6s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000118365
+[100]	valid_0's binary_logloss: 3.68361e-05
+[progress   4299.4s] LightGBM candidate fit complete
+[progress   4299.9s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 7.26171e-05
+[100]	valid_0's binary_logloss: 3.63915e-05
+[150]	valid_0's binary_logloss: 2.25354e-05
+[200]	valid_0's binary_logloss: 1.44958e-05
+[250]	valid_0's binary_logloss: 1.07799e-05
+[300]	valid_0's binary_logloss: 8.41302e-06
+[progress   4337.8s] LightGBM candidate fit complete
+[progress   4340.7s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/2106480
+[progress   4342.3s] Walk-forward final fit complete
+[progress   4342.7s] walk-forward test prediction complete: 347,960 rows
+[progress   4342.7s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   4342.8s] Walk-forward fold 73 cleanup complete
+[progress   4343.0s] Walk-forward fold 74 split created: train=1,752,760 validation=347,960 test=349,400
+Fitting on sampled rows: train 1500000/1752760 positives=82 validation 347960/347960
+[progress   4343.0s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00121174
+[progress   4349.0s] LightGBM candidate fit complete
+[progress   4349.1s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.0015355
+[100]	valid_0's binary_logloss: 0.000506676
+[progress   4360.2s] LightGBM candidate fit complete
+[progress   4360.9s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000776271
+[100]	valid_0's binary_logloss: 0.000498076
+[150]	valid_0's binary_logloss: 0.000361342
+[200]	valid_0's binary_logloss: 0.000276432
+[250]	valid_0's binary_logloss: 0.000226289
+[300]	valid_0's binary_logloss: 0.00019783
+[progress   4395.2s] LightGBM candidate fit complete
+[progress   4397.7s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/2100720
+[progress   4399.3s] Walk-forward final fit complete
+[progress   4399.7s] walk-forward test prediction complete: 349,400 rows
+[progress   4399.7s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   4399.8s] Walk-forward fold 74 cleanup complete
+[progress   4400.0s] Walk-forward fold 75 split created: train=1,752,760 validation=349,400 test=352,280
+Fitting on sampled rows: train 1500000/1752760 positives=74 validation 349400/349400
+[progress   4400.1s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.0012716
+[progress   4406.1s] LightGBM candidate fit complete
+[progress   4406.1s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00147786
+[100]	valid_0's binary_logloss: 0.000749815
+[progress   4417.1s] LightGBM candidate fit complete
+[progress   4417.7s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000896131
+[progress   4423.9s] LightGBM candidate fit complete
+[progress   4423.9s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/2102160
+[progress   4425.5s] Walk-forward final fit complete
+[progress   4426.0s] walk-forward test prediction complete: 352,280 rows
+[progress   4426.1s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   4426.1s] Walk-forward fold 75 cleanup complete
+[progress   4426.3s] Walk-forward fold 76 split created: train=1,751,320 validation=352,280 test=349,400
+Fitting on sampled rows: train 1500000/1751320 positives=76 validation 352280/352280
+[progress   4426.4s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.000318565
+[progress   4432.7s] LightGBM candidate fit complete
+[progress   4432.7s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000342593
+[100]	valid_0's binary_logloss: 0.000229752
+[progress   4444.7s] LightGBM candidate fit complete
+[progress   4445.4s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000241101
+[100]	valid_0's binary_logloss: 0.000224918
+[150]	valid_0's binary_logloss: 0.00022003
+[200]	valid_0's binary_logloss: 0.000218972
+[progress   4472.8s] LightGBM candidate fit complete
+[progress   4474.2s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/2103600
+[progress   4476.0s] Walk-forward final fit complete
+[progress   4476.4s] walk-forward test prediction complete: 349,400 rows
+[progress   4476.5s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   4476.5s] Walk-forward fold 76 cleanup complete
+[progress   4476.8s] Walk-forward fold 77 split created: train=1,754,200 validation=349,400 test=337,880
+Fitting on sampled rows: train 1500000/1754200 positives=35 validation 349400/349400
+[progress   4476.9s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00139662
+[progress   4483.5s] LightGBM candidate fit complete
+[progress   4483.5s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00143531
+[progress   4491.0s] LightGBM candidate fit complete
+[progress   4491.0s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00135367
+[progress   4497.1s] LightGBM candidate fit complete
+[progress   4497.2s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/2103600
+[progress   4499.2s] Walk-forward final fit complete
+[progress   4499.6s] walk-forward test prediction complete: 337,880 rows
+[progress   4499.7s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   4499.7s] Walk-forward fold 77 cleanup complete
+[progress   4500.0s] Walk-forward fold 78 split created: train=1,751,320 validation=337,880 test=309,145
+Fitting on sampled rows: train 1500000/1751320 positives=81 validation 337880/337880
+[progress   4500.1s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.000812736
+[progress   4507.7s] LightGBM candidate fit complete
+[progress   4507.8s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000902282
+[100]	valid_0's binary_logloss: 0.000951803
+[progress   4519.9s] LightGBM candidate fit complete
+[progress   4520.2s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00078812
+[progress   4528.4s] LightGBM candidate fit complete
+[progress   4528.5s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/2089200
+[progress   4531.3s] Walk-forward final fit complete
+[progress   4531.7s] walk-forward test prediction complete: 309,145 rows
+[progress   4531.9s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   4531.9s] Walk-forward fold 78 cleanup complete
+[progress   4532.1s] Walk-forward fold 79 split created: train=1,736,920 validation=309,145 test=309,145
+Fitting on sampled rows: train 1500000/1736920 positives=117 validation 309145/309145
+[progress   4532.2s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00123716
+[100]	valid_0's binary_logloss: 0.00118682
+[150]	valid_0's binary_logloss: 0.00117736
+[200]	valid_0's binary_logloss: 0.00117828
+[progress   4552.9s] LightGBM candidate fit complete
+[progress   4553.9s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00153863
+[100]	valid_0's binary_logloss: 0.0015368
+[progress   4565.9s] LightGBM candidate fit complete
+[progress   4566.3s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00142002
+[100]	valid_0's binary_logloss: 0.00141259
+[progress   4580.3s] LightGBM candidate fit complete
+[progress   4580.6s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/2046065
+[progress   4597.3s] Walk-forward final fit complete
+[progress   4598.6s] walk-forward test prediction complete: 309,145 rows
+[progress   4599.6s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   4599.6s] Walk-forward fold 79 cleanup complete
+[progress   4599.9s] Walk-forward fold 80 split created: train=1,698,105 validation=309,145 test=303,385
+Fitting on sampled rows: train 1500000/1698105 positives=178 validation 309145/309145
+[progress   4599.9s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.000434294
+[100]	valid_0's binary_logloss: 0.000351322
+[150]	valid_0's binary_logloss: 0.000303645
+[200]	valid_0's binary_logloss: 0.000266537
+[progress   4620.3s] LightGBM candidate fit complete
+[progress   4621.5s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00189276
+[progress   4628.1s] LightGBM candidate fit complete
+[progress   4628.1s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000326588
+[100]	valid_0's binary_logloss: 0.000199211
+[150]	valid_0's binary_logloss: 0.000171589
+[200]	valid_0's binary_logloss: 0.000163906
+[250]	valid_0's binary_logloss: 0.000160916
+[300]	valid_0's binary_logloss: 0.000162259
+[progress   4667.1s] LightGBM candidate fit complete
+[progress   4669.4s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/2007250
+[progress   4688.6s] Walk-forward final fit complete
+[progress   4690.1s] walk-forward test prediction complete: 303,385 rows
+[progress   4690.9s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   4691.0s] Walk-forward fold 80 cleanup complete
+[progress   4691.2s] Walk-forward fold 81 split created: train=1,657,850 validation=303,385 test=306,265
+Fitting on sampled rows: train 1500000/1657850 positives=165 validation 303385/303385
+[progress   4691.2s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.000385738
+[100]	valid_0's binary_logloss: 0.000293507
+[150]	valid_0's binary_logloss: 0.000243869
+[200]	valid_0's binary_logloss: 0.000213066
+[progress   4711.7s] LightGBM candidate fit complete
+[progress   4712.9s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000299419
+[progress   4719.8s] LightGBM candidate fit complete
+[progress   4719.9s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000188141
+[100]	valid_0's binary_logloss: 0.000135669
+[150]	valid_0's binary_logloss: 0.000118899
+[200]	valid_0's binary_logloss: 0.000114909
+[250]	valid_0's binary_logloss: 0.000114117
+[300]	valid_0's binary_logloss: 0.000114424
+[progress   4759.3s] LightGBM candidate fit complete
+[progress   4761.9s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/1961235
+[progress   4780.9s] Walk-forward final fit complete
+[progress   4782.5s] walk-forward test prediction complete: 306,265 rows
+[progress   4783.4s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   4783.4s] Walk-forward fold 81 cleanup complete
+[progress   4783.6s] Walk-forward fold 82 split created: train=1,608,955 validation=306,265 test=303,385
+Fitting on sampled rows: train 1500000/1608955 positives=158 validation 306265/306265
+[progress   4783.7s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.000732933
+[100]	valid_0's binary_logloss: 0.000523239
+[150]	valid_0's binary_logloss: 0.000434705
+[200]	valid_0's binary_logloss: 0.000372542
+[progress   4805.2s] LightGBM candidate fit complete
+[progress   4806.4s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000550029
+[progress   4813.1s] LightGBM candidate fit complete
+[progress   4813.1s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000558494
+[100]	valid_0's binary_logloss: 0.000325609
+[150]	valid_0's binary_logloss: 0.000255466
+[200]	valid_0's binary_logloss: 0.000231975
+[250]	valid_0's binary_logloss: 0.000222608
+[300]	valid_0's binary_logloss: 0.000218612
+[progress   4850.6s] LightGBM candidate fit complete
+[progress   4853.3s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/1915220
+[progress   4872.9s] Walk-forward final fit complete
+[progress   4874.6s] walk-forward test prediction complete: 303,385 rows
+[progress   4875.5s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   4875.5s] Walk-forward fold 82 cleanup complete
+[progress   4875.7s] Walk-forward fold 83 split created: train=1,565,820 validation=303,385 test=300,505
+Fitting on sampled rows: train 1500000/1565820 positives=116 validation 303385/303385
+[progress   4875.8s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.000283849
+[100]	valid_0's binary_logloss: 0.000238911
+[150]	valid_0's binary_logloss: 0.000199737
+[200]	valid_0's binary_logloss: 0.000177791
+[progress   4897.2s] LightGBM candidate fit complete
+[progress   4898.5s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000201333
+[progress   4905.2s] LightGBM candidate fit complete
+[progress   4905.2s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000188046
+[100]	valid_0's binary_logloss: 0.000144592
+[150]	valid_0's binary_logloss: 0.000128234
+[200]	valid_0's binary_logloss: 0.000121117
+[250]	valid_0's binary_logloss: 0.000118031
+[300]	valid_0's binary_logloss: 0.000116533
+[progress   4943.8s] LightGBM candidate fit complete
+[progress   4946.4s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/1869205
+[progress   4965.7s] Walk-forward final fit complete
+[progress   4967.3s] walk-forward test prediction complete: 300,505 rows
+[progress   4968.2s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   4968.2s] Walk-forward fold 83 cleanup complete
+[progress   4968.4s] Walk-forward fold 84 split created: train=1,531,325 validation=300,505 test=264,570
+Fitting on sampled rows: train 1500000/1531325 positives=84 validation 300505/300505
+[progress   4968.5s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.000294619
+[progress   4974.6s] LightGBM candidate fit complete
+[progress   4974.6s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000324363
+[100]	valid_0's binary_logloss: 0.000273962
+[progress   4986.6s] LightGBM candidate fit complete
+[progress   4987.2s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000233859
+[100]	valid_0's binary_logloss: 0.000233066
+[progress   5001.9s] LightGBM candidate fit complete
+[progress   5002.3s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/1831830
+[progress   5003.9s] Walk-forward final fit complete
+[progress   5004.3s] walk-forward test prediction complete: 264,570 rows
+[progress   5004.3s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   5004.4s] Walk-forward fold 84 cleanup complete
+[progress   5004.6s] Walk-forward fold 85 split created: train=1,522,685 validation=264,570 test=255,930
+Fitting on sampled rows: train 1500000/1522685 positives=26 validation 264570/264570
+[progress   5004.6s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.000759918
+[progress   5012.5s] LightGBM candidate fit complete
+[progress   5012.6s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000963472
+[progress   5020.8s] LightGBM candidate fit complete
+[progress   5020.9s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000873738
+[progress   5029.8s] LightGBM candidate fit complete
+[progress   5029.9s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/1787255
+[progress   5033.3s] Walk-forward final fit complete
+[progress   5033.7s] walk-forward test prediction complete: 255,930 rows
+[progress   5033.9s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   5034.0s] Walk-forward fold 85 cleanup complete
+[progress   5034.2s] Walk-forward fold 86 split created: train=1,478,110 validation=255,930 test=264,570
+[progress   5034.2s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.000363908
+[100]	valid_0's binary_logloss: 0.0003079
+[150]	valid_0's binary_logloss: 0.000291641
+[200]	valid_0's binary_logloss: 0.000295933
+[progress   5054.6s] LightGBM candidate fit complete
+[progress   5055.6s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000259425
+[100]	valid_0's binary_logloss: 0.000279852
+[progress   5067.5s] LightGBM candidate fit complete
+[progress   5067.8s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000456791
+[100]	valid_0's binary_logloss: 0.000438306
+[150]	valid_0's binary_logloss: 0.000435832
+[progress   5086.4s] LightGBM candidate fit complete
+[progress   5087.0s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/1734040
+[progress   5105.2s] Walk-forward final fit complete
+[progress   5106.4s] walk-forward test prediction complete: 264,570 rows
+[progress   5107.2s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   5107.2s] Walk-forward fold 86 cleanup complete
+[progress   5107.4s] Walk-forward fold 87 split created: train=1,430,655 validation=264,570 test=264,570
+[progress   5107.4s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.00034235
+[100]	valid_0's binary_logloss: 0.000344221
+[progress   5118.6s] LightGBM candidate fit complete
+[progress   5118.8s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00045839
+[100]	valid_0's binary_logloss: 0.000462588
+[progress   5130.4s] LightGBM candidate fit complete
+[progress   5130.7s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000326262
+[100]	valid_0's binary_logloss: 0.000333186
+[progress   5142.4s] LightGBM candidate fit complete
+[progress   5142.6s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/1695225
+[progress   5149.2s] Walk-forward final fit complete
+[progress   5149.8s] walk-forward test prediction complete: 264,570 rows
+[progress   5150.5s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   5150.5s] Walk-forward fold 87 cleanup complete
+[progress   5150.7s] Walk-forward fold 88 split created: train=1,388,960 validation=264,570 test=261,690
+[progress   5150.7s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.000151016
+[progress   5156.3s] LightGBM candidate fit complete
+[progress   5156.3s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000166802
+[100]	valid_0's binary_logloss: 9.44858e-05
+[progress   5166.5s] LightGBM candidate fit complete
+[progress   5167.1s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000123233
+[100]	valid_0's binary_logloss: 8.89172e-05
+[150]	valid_0's binary_logloss: 7.46769e-05
+[200]	valid_0's binary_logloss: 6.91896e-05
+[250]	valid_0's binary_logloss: 6.52735e-05
+[300]	valid_0's binary_logloss: 6.33159e-05
+[progress   5198.3s] LightGBM candidate fit complete
+[progress   5200.3s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/1653530
+[progress   5202.0s] Walk-forward final fit complete
+[progress   5202.4s] walk-forward test prediction complete: 261,690 rows
+[progress   5202.4s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   5202.4s] Walk-forward fold 88 cleanup complete
+[progress   5202.6s] Walk-forward fold 89 split created: train=1,350,145 validation=261,690 test=258,810
+[progress   5202.6s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.000406122
+[progress   5207.5s] LightGBM candidate fit complete
+[progress   5207.6s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000402336
+[100]	valid_0's binary_logloss: 0.00021837
+[progress   5217.9s] LightGBM candidate fit complete
+[progress   5218.5s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000275428
+[progress   5224.0s] LightGBM candidate fit complete
+[progress   5224.0s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/1611835
+[progress   5225.7s] Walk-forward final fit complete
+[progress   5226.2s] walk-forward test prediction complete: 258,810 rows
+[progress   5226.2s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   5226.3s] Walk-forward fold 89 cleanup complete
+[progress   5226.5s] Walk-forward fold 90 split created: train=1,311,330 validation=258,810 test=264,570
+[progress   5226.5s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.000588093
+[progress   5234.3s] LightGBM candidate fit complete
+[progress   5234.4s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000745456
+[progress   5241.6s] LightGBM candidate fit complete
+[progress   5241.7s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000673645
+[progress   5248.6s] LightGBM candidate fit complete
+[progress   5248.7s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/1570140
+[progress   5253.3s] Walk-forward final fit complete
+[progress   5253.7s] walk-forward test prediction complete: 264,570 rows
+[progress   5253.8s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   5253.9s] Walk-forward fold 90 cleanup complete
+[progress   5254.1s] Walk-forward fold 91 split created: train=1,305,570 validation=264,570 test=255,930
+[progress   5254.1s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.000594762
+[progress   5260.7s] LightGBM candidate fit complete
+[progress   5260.8s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000714518
+[100]	valid_0's binary_logloss: 0.000733423
+[progress   5269.0s] LightGBM candidate fit complete
+[progress   5269.2s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000618024
+[progress   5276.6s] LightGBM candidate fit complete
+[progress   5276.7s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/1570140
+[progress   5284.3s] Walk-forward final fit complete
+[progress   5285.0s] walk-forward test prediction complete: 255,930 rows
+[progress   5285.1s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   5285.1s] Walk-forward fold 91 cleanup complete
+[progress   5285.3s] Walk-forward fold 92 split created: train=1,314,210 validation=255,930 test=211,355
+[progress   5285.3s] Row sampling complete
+[50]	valid_0's binary_logloss: 7.81868e-05
+[progress   5290.9s] LightGBM candidate fit complete
+[progress   5290.9s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 5.77e-05
+[100]	valid_0's binary_logloss: 2.12113e-05
+[progress   5301.7s] LightGBM candidate fit complete
+[progress   5302.2s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 4.09518e-05
+[100]	valid_0's binary_logloss: 2.6063e-05
+[150]	valid_0's binary_logloss: 1.71241e-05
+[200]	valid_0's binary_logloss: 1.22167e-05
+[250]	valid_0's binary_logloss: 9.29435e-06
+[300]	valid_0's binary_logloss: 7.6453e-06
+[progress   5333.1s] LightGBM candidate fit complete
+[progress   5335.0s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/1570140
+[progress   5336.6s] Walk-forward final fit complete
+[progress   5337.1s] walk-forward test prediction complete: 211,355 rows
+[progress   5337.1s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   5337.1s] Walk-forward fold 92 cleanup complete
+[progress   5337.3s] Walk-forward fold 93 split created: train=1,305,570 validation=211,355 test=173,980
+[progress   5337.3s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.000107218
+[progress   5342.9s] LightGBM candidate fit complete
+[progress   5342.9s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 8.45335e-05
+[100]	valid_0's binary_logloss: 7.27034e-05
+[progress   5354.2s] LightGBM candidate fit complete
+[progress   5354.7s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 6.36812e-05
+[100]	valid_0's binary_logloss: 6.75439e-05
+[progress   5365.7s] LightGBM candidate fit complete
+[progress   5365.9s] Sampled validation prediction complete
+Walk-forward final fit sample: train 1500000/1516925
+[progress   5367.8s] Walk-forward final fit complete
+[progress   5368.2s] walk-forward test prediction complete: 173,980 rows
+[progress   5368.2s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   5368.3s] Walk-forward fold 93 cleanup complete
+[progress   5368.5s] Walk-forward fold 94 split created: train=1,252,355 validation=173,980 test=171,100
+[progress   5368.5s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.000650687
+[progress   5374.8s] LightGBM candidate fit complete
+[progress   5374.8s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000834733
+[progress   5381.5s] LightGBM candidate fit complete
+[progress   5381.5s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000663052
+[progress   5389.8s] LightGBM candidate fit complete
+[progress   5389.9s] Sampled validation prediction complete
+[progress   5392.2s] Walk-forward final fit complete
+[progress   5392.5s] walk-forward test prediction complete: 171,100 rows
+[progress   5392.5s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   5392.5s] Walk-forward fold 94 cleanup complete
+[progress   5392.8s] Walk-forward fold 95 split created: train=1,164,645 validation=171,100 test=176,860
+[progress   5392.8s] Row sampling complete
+[50]	valid_0's binary_logloss: 9.49515e-05
+[progress   5397.9s] LightGBM candidate fit complete
+[progress   5398.0s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 4.69756e-05
+[100]	valid_0's binary_logloss: 1.85136e-05
+[progress   5408.5s] LightGBM candidate fit complete
+[progress   5408.9s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 5.73219e-05
+[100]	valid_0's binary_logloss: 3.5949e-05
+[150]	valid_0's binary_logloss: 2.33903e-05
+[200]	valid_0's binary_logloss: 1.64668e-05
+[250]	valid_0's binary_logloss: 1.26156e-05
+[300]	valid_0's binary_logloss: 1.04563e-05
+[progress   5437.8s] LightGBM candidate fit complete
+[progress   5439.3s] Sampled validation prediction complete
+[progress   5441.1s] Walk-forward final fit complete
+[progress   5441.4s] walk-forward test prediction complete: 176,860 rows
+[progress   5441.4s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   5441.4s] Walk-forward fold 95 cleanup complete
+[progress   5441.7s] Walk-forward fold 96 split created: train=1,076,935 validation=176,860 test=168,220
+[progress   5441.7s] Row sampling complete
+[50]	valid_0's binary_logloss: 2.34776e-05
+[100]	valid_0's binary_logloss: 1.16519e-05
+[150]	valid_0's binary_logloss: 6.9686e-06
+[200]	valid_0's binary_logloss: 4.40408e-06
+[progress   5458.8s] LightGBM candidate fit complete
+[progress   5459.5s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 1.13733e-05
+[100]	valid_0's binary_logloss: 4.12768e-06
+[progress   5469.5s] LightGBM candidate fit complete
+[progress   5470.0s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 1.61666e-05
+[100]	valid_0's binary_logloss: 7.57438e-06
+[150]	valid_0's binary_logloss: 4.24261e-06
+[200]	valid_0's binary_logloss: 2.64122e-06
+[250]	valid_0's binary_logloss: 1.86991e-06
+[300]	valid_0's binary_logloss: 1.40121e-06
+[progress   5496.3s] LightGBM candidate fit complete
+[progress   5497.5s] Sampled validation prediction complete
+[progress   5516.3s] Walk-forward final fit complete
+[progress   5517.3s] walk-forward test prediction complete: 168,220 rows
+[progress   5517.9s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   5517.9s] Walk-forward fold 96 cleanup complete
+[progress   5518.2s] Walk-forward fold 97 split created: train=989,225 validation=168,220 test=116,445
+[progress   5518.2s] Row sampling complete
+[50]	valid_0's binary_logloss: 5.60047e-05
+[100]	valid_0's binary_logloss: 4.42497e-05
+[150]	valid_0's binary_logloss: 3.67828e-05
+[200]	valid_0's binary_logloss: 3.30741e-05
+[progress   5531.2s] LightGBM candidate fit complete
+[progress   5531.7s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 4.06775e-05
+[100]	valid_0's binary_logloss: 3.44858e-05
+[progress   5538.5s] LightGBM candidate fit complete
+[progress   5538.7s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 4.38221e-05
+[100]	valid_0's binary_logloss: 3.59093e-05
+[150]	valid_0's binary_logloss: 3.24257e-05
+[200]	valid_0's binary_logloss: 3.04529e-05
+[250]	valid_0's binary_logloss: 2.91828e-05
+[300]	valid_0's binary_logloss: 2.84502e-05
+[progress   5557.5s] LightGBM candidate fit complete
+[progress   5558.1s] Sampled validation prediction complete
+[progress   5571.8s] Walk-forward final fit complete
+[progress   5572.3s] walk-forward test prediction complete: 116,445 rows
+[progress   5572.3s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   5572.4s] Walk-forward fold 97 cleanup complete
+[progress   5572.6s] Walk-forward fold 98 split created: train=901,515 validation=116,445 test=89,150
+[progress   5572.6s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.000235162
+[progress   5576.2s] LightGBM candidate fit complete
+[progress   5576.3s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000172004
+[progress   5579.7s] LightGBM candidate fit complete
+[progress   5579.7s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000180935
+[progress   5582.9s] LightGBM candidate fit complete
+[progress   5582.9s] Sampled validation prediction complete
+[progress   5584.4s] Walk-forward final fit complete
+[progress   5584.5s] walk-forward test prediction complete: 89,150 rows
+[progress   5584.6s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   5584.6s] Walk-forward fold 98 cleanup complete
+[progress   5584.8s] Walk-forward fold 99 split created: train=806,605 validation=89,150 test=86,270
+[progress   5584.8s] Row sampling complete
+[50]	valid_0's binary_logloss: 0.000429059
+[progress   5587.8s] LightGBM candidate fit complete
+[progress   5587.8s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.000455838
+[progress   5590.7s] LightGBM candidate fit complete
+[progress   5590.7s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 0.00041852
+[progress   5593.6s] LightGBM candidate fit complete
+[progress   5593.6s] Sampled validation prediction complete
+[progress   5594.9s] Walk-forward final fit complete
+[progress   5595.0s] walk-forward test prediction complete: 86,270 rows
+[progress   5595.0s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   5595.1s] Walk-forward fold 99 cleanup complete
+[progress   5595.3s] Walk-forward fold 100 split created: train=721,775 validation=86,270 test=71,870
+[progress   5595.3s] Row sampling complete
+[50]	valid_0's binary_logloss: 8.44599e-06
+[progress   5598.3s] LightGBM candidate fit complete
+[progress   5598.4s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 5.19131e-06
+[100]	valid_0's binary_logloss: 2.13799e-06
+[progress   5603.1s] LightGBM candidate fit complete
+[progress   5603.2s] Sampled validation prediction complete
+[50]	valid_0's binary_logloss: 6.47684e-06
+[progress   5606.8s] LightGBM candidate fit complete
+[progress   5606.8s] Sampled validation prediction complete
+[progress   5608.1s] Walk-forward final fit complete
+[progress   5608.3s] walk-forward test prediction complete: 71,870 rows
+[progress   5608.3s] Prediction CSV output complete: kline_growth_predictions_gbdt_walkforward.csv
+[progress   5608.4s] Walk-forward fold 100 cleanup complete
+[progress   5608.4s] Metrics CSV output complete: kline_growth_walkforward_metrics.csv
+[progress   5608.6s] Run summaries written
+
+Comparison report
+Logistic: threshold=1 precision=0.0000 recall=0.0000 net_fee_slippage=-0.264169
+GBDT: model=gbdt_lightgbm threshold=0.9811 precision=0.1772 recall=0.0144 portfolio_profit=-4031.91 portfolio_return=-40.3191% safety=explore
+GBDT validation: trades=76 precision=0.2632 recall=0.0484 portfolio_profit=1340.80 portfolio_return=13.4080%
+Walk-forward average: folds=100 precision=0.0087 recall=0.0073 portfolio_profit=-17.55 portfolio_return=-0.1755%
+Logistic comparison is legacy until the C++ baseline is regenerated with portfolio sizing.
+[progress   5609.4s] Cleanup complete

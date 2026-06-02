@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <deque>
 #include <fstream>
 #include <iomanip>
@@ -45,11 +46,13 @@ const std::string kDataVisionBucket = "https://s3-ap-northeast-1.amazonaws.com/d
 const std::string kPrimarySymbolCsv = "qualified_crypto_risk.csv";
 const std::string kFallbackSymbolCsv = "binance_buy_sell_ratio.csv";
 const std::string kTrainingCsv = "kline_growth_training.csv";
+const std::string kTrainingManifest = "kline_growth_training.meta.json";
 const std::string kModelCsv = "kline_growth_model.csv";
 const std::string kMetricsCsv = "kline_growth_metrics.csv";
 const std::string kLogisticMetricsCsv = "kline_growth_metrics_logistic.csv";
 const std::string kPredictionsCsv = "kline_growth_month7_predictions.csv";
 const std::string kLogisticPredictionsCsv = "kline_growth_predictions_logistic.csv";
+const int kTrainingManifestVersion = 1;
 const int kDefaultTrainingMonths = 6;
 const int kDefaultValidationMonths = 1;
 const int kDefaultTestMonths = 1;
@@ -109,6 +112,7 @@ struct ScraperOptions {
           downsideStop(kDefaultDownsideStop),
           minNetReturn(kDefaultMinNetReturn),
           labelMode("target_stop"),
+          targetExitMode("fixed_target"),
           tiePolicy("stop_first"),
           epochs(kDefaultEpochs),
           learningRate(kDefaultLearningRate),
@@ -167,6 +171,7 @@ struct ScraperOptions {
     double downsideStop;
     double minNetReturn;
     std::string labelMode;
+    std::string targetExitMode;
     std::string tiePolicy;
     int epochs;
     double learningRate;
@@ -414,6 +419,77 @@ std::string csvEscape(const std::string &value) {
     return escaped;
 }
 
+std::string jsonEscape(const std::string &value) {
+    std::ostringstream out;
+    for (size_t i = 0; i < value.size(); ++i) {
+        const unsigned char ch = static_cast<unsigned char>(value[i]);
+        switch (ch) {
+        case '\\':
+            out << "\\\\";
+            break;
+        case '"':
+            out << "\\\"";
+            break;
+        case '\b':
+            out << "\\b";
+            break;
+        case '\f':
+            out << "\\f";
+            break;
+        case '\n':
+            out << "\\n";
+            break;
+        case '\r':
+            out << "\\r";
+            break;
+        case '\t':
+            out << "\\t";
+            break;
+        default:
+            if (ch < 0x20) {
+                out << "\\u"
+                    << std::hex << std::setw(4) << std::setfill('0')
+                    << static_cast<int>(ch)
+                    << std::dec << std::setfill(' ');
+            } else {
+                out << value[i];
+            }
+            break;
+        }
+    }
+    return out.str();
+}
+
+std::string utcTimestampNow() {
+    const std::time_t now = std::time(NULL);
+    std::tm utc;
+#ifdef _WIN32
+    gmtime_s(&utc, &now);
+#else
+    const std::tm *utcPtr = std::gmtime(&now);
+    if (!utcPtr) {
+        return "";
+    }
+    utc = *utcPtr;
+#endif
+    char buffer[32];
+    if (std::strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%SZ", &utc) == 0) {
+        return "";
+    }
+    return buffer;
+}
+
+void writeJsonStringArray(std::ostream &out, const std::vector<std::string> &values) {
+    out << '[';
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i) {
+            out << ',';
+        }
+        out << '"' << jsonEscape(values[i]) << '"';
+    }
+    out << ']';
+}
+
 std::string parseTagValue(const std::string &text, const std::string &tag) {
     const std::string startTag = "<" + tag + ">";
     const std::string endTag = "</" + tag + ">";
@@ -601,6 +677,7 @@ void printUsage() {
         << "  --prediction-window N      Forward prediction window in minutes (default 5).\n"
         << "  --growth-threshold X       Original future-high label threshold, e.g. 0.05.\n"
         << "  --label-mode MODE          future_high or target_stop (default target_stop).\n"
+        << "  --target-exit-mode MODE    fixed_target or first_decline after target hit (default fixed_target).\n"
         << "  --upside-target X          Target-stop upside target percent (default 0.05).\n"
         << "  --downside-stop X          Target-stop downside stop percent (default 0.02).\n"
         << "  --tie-policy MODE          Same-candle target/stop behavior: stop_first, target_first, or skip.\n"
@@ -610,10 +687,10 @@ void printUsage() {
         << "  --l2 X                     Logistic L2 regularization strength (default 0.001).\n"
         << "  --positive-weight-cap X    Max positive class weight (default 50).\n"
         << "  --initial-capital X        Starting portfolio capital used by backtest sizing (default 10000).\n"
-        << "  --max-position-fraction X  Max starting-capital fraction per trade (default 0.10).\n"
+        << "  --max-position-fraction X  Max total-account-equity fraction per trade (default 0.10).\n"
         << "  --max-volume-fraction X    Max candle quote-volume fraction per trade (default 0.01).\n"
-        << "  --max-trades-per-period N  Max entries across all symbols per trading period (default 10).\n"
-        << "  --trade-period-minutes N   Trading-period length for the entry cap (default 60).\n"
+        << "  --max-trades-per-period N  Max entries across all symbols per trading period; 0 disables the cap (default 10).\n"
+        << "  --trade-period-minutes N   Trading-period length for the optional entry cap (default 60).\n"
         << "  --holding-period-minutes N Cash lock duration after entry (default prediction window).\n"
         << "  --min-validation-trades N  Minimum validation trades required for a threshold (default 5).\n"
         << "  --threshold-objective NAME profit, precision, recall, or f1 (default profit).\n"
@@ -666,6 +743,8 @@ bool parseArguments(
             options.upsideTarget = options.growthThreshold;
         } else if (arg == "--label-mode" || startsWith(arg, "--label-mode=")) {
             options.labelMode = optionValue(args, i, "--label-mode", arg);
+        } else if (arg == "--target-exit-mode" || startsWith(arg, "--target-exit-mode=")) {
+            options.targetExitMode = optionValue(args, i, "--target-exit-mode", arg);
         } else if (arg == "--upside-target" || startsWith(arg, "--upside-target=")) {
             options.upsideTarget = parseDoubleOption("--upside-target", optionValue(args, i, "--upside-target", arg));
         } else if (arg == "--downside-stop" || startsWith(arg, "--downside-stop=")) {
@@ -756,14 +835,20 @@ bool parseArguments(
     if (options.maxVolumeFraction <= 0.0 || options.maxVolumeFraction > 1.0) {
         throw std::runtime_error("--max-volume-fraction must be between 0 and 1");
     }
-    if (options.maxTradesPerPeriod <= 0 || options.tradePeriodMinutes <= 0 || options.holdingPeriodMinutes <= 0) {
-        throw std::runtime_error("Portfolio period, trade cap, and holding period must be positive");
+    if (options.maxTradesPerPeriod < 0) {
+        throw std::runtime_error("--max-trades-per-period cannot be negative");
+    }
+    if ((options.maxTradesPerPeriod > 0 && options.tradePeriodMinutes <= 0) || options.holdingPeriodMinutes <= 0) {
+        throw std::runtime_error("Holding period must be positive, and trade period must be positive when an entry cap is enabled");
     }
     if (options.minValidationTrades < 0) {
         throw std::runtime_error("--min-validation-trades cannot be negative");
     }
     if (options.labelMode != "future_high" && options.labelMode != "target_stop") {
         throw std::runtime_error("--label-mode must be future_high or target_stop");
+    }
+    if (options.targetExitMode != "fixed_target" && options.targetExitMode != "first_decline") {
+        throw std::runtime_error("--target-exit-mode must be fixed_target or first_decline");
     }
     if (options.tiePolicy != "stop_first" && options.tiePolicy != "target_first" && options.tiePolicy != "skip") {
         throw std::runtime_error("--tie-policy must be stop_first, target_first, or skip");
@@ -1259,6 +1344,24 @@ FeatureContext buildFeatureContext(const std::vector<Candle> &candles) {
     return context;
 }
 
+double firstDeclineExitReturn(
+    const std::vector<Candle> &candles,
+    size_t entryIndex,
+    int targetForward,
+    const ScraperOptions &options) {
+    const double entryPrice = candles[entryIndex].close;
+    const double targetPrice = entryPrice * (1.0 + options.upsideTarget);
+    double previousClose = std::max(targetPrice, candles[entryIndex + targetForward].close);
+    for (int forward = targetForward + 1; forward <= options.predictionWindowMinutes; ++forward) {
+        const double currentClose = candles[entryIndex + forward].close;
+        if (currentClose < previousClose) {
+            return safeRatio(previousClose, entryPrice) - 1.0;
+        }
+        previousClose = std::max(targetPrice, currentClose);
+    }
+    return safeRatio(previousClose, entryPrice) - 1.0;
+}
+
 std::vector<Sample> makeSamples(
     const std::string &symbol,
     const std::string &month,
@@ -1308,7 +1411,9 @@ std::vector<Sample> makeSamples(
                     }
                     if (options.tiePolicy == "target_first") {
                         sample.label = 1;
-                        sample.tradeReturn = options.upsideTarget;
+                        sample.tradeReturn = options.targetExitMode == "first_decline"
+                            ? firstDeclineExitReturn(candles, i, forward, options)
+                            : options.upsideTarget;
                         break;
                     }
                 }
@@ -1319,7 +1424,9 @@ std::vector<Sample> makeSamples(
                 }
                 if (hitTarget) {
                     sample.label = 1;
-                    sample.tradeReturn = options.upsideTarget;
+                    sample.tradeReturn = options.targetExitMode == "first_decline"
+                        ? firstDeclineExitReturn(candles, i, forward, options)
+                        : options.upsideTarget;
                     break;
                 }
             }
@@ -1472,6 +1579,22 @@ void runSelfTests() {
         throw std::runtime_error("self-test failed: target_first tie policy");
     }
 
+    options.tiePolicy = "stop_first";
+    options.targetExitMode = "first_decline";
+    options.upsideTarget = 0.02;
+    std::vector<Candle> trailing = base;
+    trailing[61].high = 103.0;
+    trailing[61].close = 102.5;
+    trailing[62].high = 104.0;
+    trailing[62].close = 103.5;
+    trailing[63].high = 103.2;
+    trailing[63].close = 102.8;
+    const std::vector<Sample> trailingSamples = makeSamples("TEST", "2020-01", 0, trailing, options);
+    const Sample *trailingSample = sampleAtTime(trailingSamples, 60LL * 60000LL);
+    if (!trailingSample || trailingSample->label != 1 || std::fabs(trailingSample->tradeReturn - 0.035) > 1e-12) {
+        throw std::runtime_error("self-test failed: first_decline target exit");
+    }
+
     std::cout << "C++ offline self-tests passed.\n";
 }
 
@@ -1527,6 +1650,59 @@ private:
     std::ofstream out_;
     size_t rowsWritten_;
 };
+
+void writeTrainingManifest(
+    const ScraperOptions &options,
+    const std::vector<std::string> &symbols,
+    size_t rowsWritten) {
+    const std::string tempPath = kTrainingManifest + ".tmp";
+    std::ofstream out(tempPath.c_str());
+    if (!out) {
+        throw std::runtime_error("Unable to open training manifest for writing");
+    }
+
+    const std::vector<std::string> names = featureNames();
+    out << "{\n";
+    out << "  \"version\": " << kTrainingManifestVersion << ",\n";
+    out << "  \"generated_at_utc\": \"" << jsonEscape(utcTimestampNow()) << "\",\n";
+    out << "  \"generator_build\": \"" << jsonEscape(std::string(__DATE__) + " " + std::string(__TIME__)) << "\",\n";
+    out << "  \"training_csv\": \"" << jsonEscape(kTrainingCsv) << "\",\n";
+    out << "  \"row_count\": " << rowsWritten << ",\n";
+    out << "  \"feature_count\": " << names.size() << ",\n";
+    out << "  \"feature_names\": ";
+    writeJsonStringArray(out, names);
+    out << ",\n";
+    out << "  \"label_mode\": \"" << jsonEscape(options.labelMode) << "\",\n";
+    out << "  \"target_exit_mode\": \"" << jsonEscape(options.targetExitMode) << "\",\n";
+    out << "  \"prediction_window_minutes\": " << options.predictionWindowMinutes << ",\n";
+    out << "  \"growth_threshold\": " << options.growthThreshold << ",\n";
+    out << "  \"upside_target\": " << options.upsideTarget << ",\n";
+    out << "  \"downside_stop\": " << options.downsideStop << ",\n";
+    out << "  \"tie_policy\": \"" << jsonEscape(options.tiePolicy) << "\",\n";
+    out << "  \"fee\": " << options.fee << ",\n";
+    out << "  \"slippage\": " << options.slippage << ",\n";
+    out << "  \"min_net_return\": " << options.minNetReturn << ",\n";
+    out << "  \"split_mode\": \"" << jsonEscape(options.splitMode) << "\",\n";
+    out << "  \"train_ratio\": " << options.trainRatio << ",\n";
+    out << "  \"validation_ratio\": " << options.validationRatio << ",\n";
+    out << "  \"test_ratio\": " << options.testRatio << ",\n";
+    out << "  \"training_months\": " << options.trainingMonths << ",\n";
+    out << "  \"validation_months\": " << options.validationMonths << ",\n";
+    out << "  \"test_months\": " << options.testMonths << ",\n";
+    out << "  \"requested_symbols\": ";
+    writeJsonStringArray(out, symbols);
+    out << "\n}\n";
+    out.close();
+    if (!out) {
+        throw std::runtime_error("Unable to finish writing training manifest");
+    }
+
+    std::remove(kTrainingManifest.c_str());
+    if (std::rename(tempPath.c_str(), kTrainingManifest.c_str()) != 0) {
+        std::remove(tempPath.c_str());
+        throw std::runtime_error("Unable to move training manifest into place");
+    }
+}
 
 void writeTrainingCsv(const std::vector<Sample> &samples) {
     TrainingCsvWriter writer;
@@ -1722,7 +1898,6 @@ PortfolioExecution simulatePortfolio(
     std::vector<double> positionSizes;
     std::vector<double> positionProfits;
 
-    const double fixedPositionCap = options.initialCapital * options.maxPositionFraction;
     const double feeAndSlippage = options.fee + options.slippage;
     const auto releasePositions = [&](long long untilMinute, double &releaseCash, double &releaseInvested,
                                       double &releasePeak, double &releaseDrawdown) {
@@ -1741,15 +1916,18 @@ PortfolioExecution simulatePortfolio(
         const size_t index = signals[order];
         const long long minute = minuteBucketForTimestamp(samples[index].timeOrder);
         releasePositions(minute, cash, invested, peakEquity, result.maxCapitalDrawdown);
-        while (!recentEntryMinutes.empty()
-                && recentEntryMinutes.front() <= minute - options.tradePeriodMinutes) {
-            recentEntryMinutes.pop_front();
-        }
-        if (recentEntryMinutes.size() >= static_cast<size_t>(options.maxTradesPerPeriod)) {
-            continue;
+        if (options.maxTradesPerPeriod > 0) {
+            while (!recentEntryMinutes.empty()
+                    && recentEntryMinutes.front() <= minute - options.tradePeriodMinutes) {
+                recentEntryMinutes.pop_front();
+            }
+            if (recentEntryMinutes.size() >= static_cast<size_t>(options.maxTradesPerPeriod)) {
+                continue;
+            }
         }
         const double volumeCap = samples[index].quoteVolume * options.maxVolumeFraction;
-        const double positionSize = std::min(fixedPositionCap, std::min(volumeCap, cash));
+        const double equityPositionCap = (cash + invested) * options.maxPositionFraction;
+        const double positionSize = std::min(equityPositionCap, std::min(volumeCap, cash));
         if (positionSize <= 0.0) {
             continue;
         }
@@ -1762,7 +1940,9 @@ PortfolioExecution simulatePortfolio(
         openPositions.push(position);
         cash -= positionSize;
         invested += positionSize;
-        recentEntryMinutes.push_back(minute);
+        if (options.maxTradesPerPeriod > 0) {
+            recentEntryMinutes.push_back(minute);
+        }
         result.positions[index] = positionSize;
         positionSizeSum += positionSize;
         positionSizes.push_back(positionSize);
@@ -2373,8 +2553,11 @@ void scrapeHistoricalCoinData(const std::vector<std::string> &symbolOverrides) {
             }
         }
 
+        writeTrainingManifest(options, symbols, trainingWriter.rowsWritten());
+
         if (options.generateOnly) {
             std::cout << "Wrote " << kTrainingCsv
+                      << " and " << kTrainingManifest
                       << ". Skipped C++ logistic baseline because --generate-only was set.\n";
             return;
         }
@@ -2385,7 +2568,8 @@ void scrapeHistoricalCoinData(const std::vector<std::string> &symbolOverrides) {
         writeModel(result, validationMetrics, testMetrics, options);
         const MonthSevenEvaluation evaluation = evaluateMonthSevenPredictions(kPredictionsCsv);
 
-        std::cout << "Wrote " << kTrainingCsv << ", " << kLogisticPredictionsCsv << ", "
+        std::cout << "Wrote " << kTrainingCsv << ", " << kTrainingManifest << ", "
+                  << kLogisticPredictionsCsv << ", "
                   << kModelCsv << ", and " << kLogisticMetricsCsv << ".\n"
                   << "Train AUC: " << std::fixed << std::setprecision(4) << result.trainAuc
                   << " | Validation threshold: " << result.selectedThreshold
