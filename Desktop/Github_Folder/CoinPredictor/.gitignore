@@ -2,8 +2,9 @@
 .gbdt_cache/
 __pycache__/
 kline_growth*.csv
+kline_growth_training.meta.json
 kline_growth_run_summary.json
-gbdt_run.log
+gbdt*.log
 coin_predictor
 coin_predictor_cpp*
 data_scraper

@@ -1,0 +1,13 @@
+
+# CoinPredictor generated data/cache/results
+Desktop/Github_Folder/CoinPredictor/.gbdt_cache*/
+Desktop/Github_Folder/CoinPredictor/shard_dataset*/
+Desktop/Github_Folder/CoinPredictor/old_runs/
+Desktop/Github_Folder/CoinPredictor/results*/
+Desktop/Github_Folder/CoinPredictor/kline_growth_training*.csv
+Desktop/Github_Folder/CoinPredictor/kline_growth_predictions*.csv
+Desktop/Github_Folder/CoinPredictor/kline_growth_*metrics*.csv
+Desktop/Github_Folder/CoinPredictor/kline_growth_*diagnostics*.csv
+Desktop/Github_Folder/CoinPredictor/kline_growth_run_summary*.json
+Desktop/Github_Folder/CoinPredictor/*.tar.gz
+Desktop/Github_Folder/CoinPredictor/*.log

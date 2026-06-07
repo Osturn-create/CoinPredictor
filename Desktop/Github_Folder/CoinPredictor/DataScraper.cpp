@@ -24,6 +24,8 @@
 #include <limits>
 #include <climits>
 #include <map>
+#include <cerrno>
+#include <memory>
 #include <queue>
 #include <set>
 #include <sstream>
@@ -32,7 +34,12 @@
 #include <utility>
 #include <vector>
 
-#include "MonthSevenTester.h"
+#ifdef _WIN32
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#include <sys/types.h>
+#endif
 
 #ifdef _WIN32
 #define popen _popen
@@ -47,12 +54,13 @@ const std::string kPrimarySymbolCsv = "qualified_crypto_risk.csv";
 const std::string kFallbackSymbolCsv = "binance_buy_sell_ratio.csv";
 const std::string kTrainingCsv = "kline_growth_training.csv";
 const std::string kTrainingManifest = "kline_growth_training.meta.json";
+const std::string kShardedDatasetManifest = "kline_growth_dataset.meta.json";
 const std::string kModelCsv = "kline_growth_model.csv";
-const std::string kMetricsCsv = "kline_growth_metrics.csv";
 const std::string kLogisticMetricsCsv = "kline_growth_metrics_logistic.csv";
-const std::string kPredictionsCsv = "kline_growth_month7_predictions.csv";
 const std::string kLogisticPredictionsCsv = "kline_growth_predictions_logistic.csv";
 const int kTrainingManifestVersion = 1;
+const int kShardedDatasetManifestVersion = 1;
+const int kShardManifestVersion = 1;
 const int kDefaultTrainingMonths = 6;
 const int kDefaultValidationMonths = 1;
 const int kDefaultTestMonths = 1;
@@ -67,6 +75,7 @@ const double kDefaultPositiveWeightCap = 50.0;
 const double kDefaultFee = 0.001;
 const double kDefaultSlippage = 0.0005;
 const int kDefaultMinValidationTrades = 5;
+const int kDefaultMarketBreadthMinSymbols = 5;
 const double kDefaultInitialCapital = 10000.0;
 const double kDefaultMaxPositionFraction = 0.10;
 const double kDefaultMaxVolumeFraction = 0.01;
@@ -133,6 +142,11 @@ struct ScraperOptions {
           trainRatio(0.70),
           validationRatio(0.15),
           testRatio(0.15),
+          marketRegimeFeatures(false),
+          marketBreadthFeatures(false),
+          marketBreadthMinSymbols(kDefaultMarketBreadthMinSymbols),
+          shardOutputDir(""),
+          skipCombinedOutput(false),
           generateOnly(false),
           selfTest(false) {
         thresholds.push_back(0.001);
@@ -192,6 +206,11 @@ struct ScraperOptions {
     double trainRatio;
     double validationRatio;
     double testRatio;
+    bool marketRegimeFeatures;
+    bool marketBreadthFeatures;
+    int marketBreadthMinSymbols;
+    std::string shardOutputDir;
+    bool skipCombinedOutput;
     bool generateOnly;
     bool selfTest;
     std::vector<double> thresholds;
@@ -490,6 +509,55 @@ void writeJsonStringArray(std::ostream &out, const std::vector<std::string> &val
     out << ']';
 }
 
+std::string pathJoin(const std::string &left, const std::string &right) {
+    if (left.empty()) {
+        return right;
+    }
+    if (right.empty()) {
+        return left;
+    }
+    if (left[left.size() - 1] == '/' || left[left.size() - 1] == '\\') {
+        return left + right;
+    }
+    return left + "/" + right;
+}
+
+bool createDirectorySingle(const std::string &path) {
+    if (path.empty()) {
+        return true;
+    }
+#ifdef _WIN32
+    const int result = _mkdir(path.c_str());
+#else
+    const int result = mkdir(path.c_str(), 0755);
+#endif
+    return result == 0 || errno == EEXIST;
+}
+
+void ensureDirectoryRecursive(const std::string &path) {
+    if (path.empty()) {
+        return;
+    }
+    std::string current;
+    for (size_t i = 0; i < path.size(); ++i) {
+        const char ch = path[i];
+        current.push_back(ch);
+        const bool isSeparator = ch == '/' || ch == '\\';
+        if (!isSeparator) {
+            continue;
+        }
+        if (current.size() == 1) {
+            continue;
+        }
+        if (!createDirectorySingle(current.substr(0, current.size() - 1))) {
+            throw std::runtime_error("Unable to create directory " + current);
+        }
+    }
+    if (!createDirectorySingle(path)) {
+        throw std::runtime_error("Unable to create directory " + path);
+    }
+}
+
 std::string parseTagValue(const std::string &text, const std::string &tag) {
     const std::string startTag = "<" + tag + ">";
     const std::string endTag = "</" + tag + ">";
@@ -670,6 +738,8 @@ void printUsage() {
         << "  --validation-ratio X       Ratio split validation fraction (default 0.15).\n"
         << "  --test-ratio X             Ratio split test fraction (default 0.15).\n"
         << "  --generate-only            Write kline_growth_training.csv and skip in-memory C++ logistic training.\n"
+        << "  --shard-output-dir DIR     Also write symbol/month shard CSVs and manifests under DIR.\n"
+        << "  --skip-combined-output     Skip rewriting kline_growth_training.csv when using shard output.\n"
         << "  --self-test                Run fast offline label sanity checks and exit.\n"
         << "  --train-months N           Training months for C++ logistic split (default 6).\n"
         << "  --validation-months N      Validation months for threshold tuning (default 1).\n"
@@ -680,6 +750,9 @@ void printUsage() {
         << "  --target-exit-mode MODE    fixed_target or first_decline after target hit (default fixed_target).\n"
         << "  --upside-target X          Target-stop upside target percent (default 0.05).\n"
         << "  --downside-stop X          Target-stop downside stop percent (default 0.02).\n"
+        << "  --market-regime-features   Add BTC/ETH regime and relative-strength features.\n"
+        << "  --market-breadth-features  Add optional leakage-safe market-breadth features.\n"
+        << "  --market-breadth-min-symbols N Minimum aligned symbols required for breadth features (default 5).\n"
         << "  --tie-policy MODE          Same-candle target/stop behavior: stop_first, target_first, or skip.\n"
         << "  --min-net-return X         Minimum target return after fee and slippage (default 0).\n"
         << "  --learning-rate X          Logistic learning rate (default 0.04).\n"
@@ -731,6 +804,10 @@ bool parseArguments(
             options.testRatio = parseDoubleOption("--test-ratio", optionValue(args, i, "--test-ratio", arg));
         } else if (arg == "--generate-only") {
             options.generateOnly = true;
+        } else if (arg == "--shard-output-dir" || startsWith(arg, "--shard-output-dir=")) {
+            options.shardOutputDir = optionValue(args, i, "--shard-output-dir", arg);
+        } else if (arg == "--skip-combined-output") {
+            options.skipCombinedOutput = true;
         } else if (arg == "--self-test") {
             options.selfTest = true;
         } else if (arg == "--prediction-window" || startsWith(arg, "--prediction-window=")) {
@@ -749,6 +826,12 @@ bool parseArguments(
             options.upsideTarget = parseDoubleOption("--upside-target", optionValue(args, i, "--upside-target", arg));
         } else if (arg == "--downside-stop" || startsWith(arg, "--downside-stop=")) {
             options.downsideStop = parseDoubleOption("--downside-stop", optionValue(args, i, "--downside-stop", arg));
+        } else if (arg == "--market-regime-features") {
+            options.marketRegimeFeatures = true;
+        } else if (arg == "--market-breadth-features") {
+            options.marketBreadthFeatures = true;
+        } else if (arg == "--market-breadth-min-symbols" || startsWith(arg, "--market-breadth-min-symbols=")) {
+            options.marketBreadthMinSymbols = parseIntOption("--market-breadth-min-symbols", optionValue(args, i, "--market-breadth-min-symbols", arg));
         } else if (arg == "--tie-policy" || startsWith(arg, "--tie-policy=")) {
             options.tiePolicy = optionValue(args, i, "--tie-policy", arg);
         } else if (arg == "--min-net-return" || startsWith(arg, "--min-net-return=")) {
@@ -844,6 +927,9 @@ bool parseArguments(
     if (options.minValidationTrades < 0) {
         throw std::runtime_error("--min-validation-trades cannot be negative");
     }
+    if (options.marketBreadthMinSymbols <= 0) {
+        throw std::runtime_error("--market-breadth-min-symbols must be positive");
+    }
     if (options.labelMode != "future_high" && options.labelMode != "target_stop") {
         throw std::runtime_error("--label-mode must be future_high or target_stop");
     }
@@ -861,6 +947,12 @@ bool parseArguments(
     }
     if (options.labelMode == "target_stop" && options.upsideTarget - options.fee - options.slippage < options.minNetReturn) {
         throw std::runtime_error("--upside-target minus fee and slippage must be at least --min-net-return");
+    }
+    if (options.marketBreadthFeatures && !options.marketRegimeFeatures) {
+        options.marketRegimeFeatures = true;
+    }
+    if (options.skipCombinedOutput && options.shardOutputDir.empty()) {
+        throw std::runtime_error("--skip-combined-output requires --shard-output-dir");
     }
     if (options.thresholdObjective == "success_rate") {
         options.thresholdObjective = "precision";
@@ -1137,7 +1229,9 @@ double clipped(double value, double lower, double upper) {
     return std::max(lower, std::min(upper, value));
 }
 
-std::vector<std::string> featureNames() {
+std::vector<std::string> featureNames(const ScraperOptions *options = NULL) {
+    const bool includeMarketRegime = options != NULL && options->marketRegimeFeatures;
+    const bool includeMarketBreadth = options != NULL && options->marketBreadthFeatures;
     std::vector<std::string> names;
     names.push_back("ret_1m");
     names.push_back("ret_3m");
@@ -1176,6 +1270,49 @@ std::vector<std::string> featureNames() {
     names.push_back("relative_quote_volume_previous_hour");
     names.push_back("taker_buy_ratio_mean_60m");
     names.push_back("taker_buy_ratio_zscore_60m");
+    if (includeMarketRegime) {
+        names.push_back("btc_return_5m");
+        names.push_back("btc_return_15m");
+        names.push_back("btc_return_60m");
+        names.push_back("btc_return_240m");
+        names.push_back("btc_return_1440m");
+        names.push_back("btc_volatility_60m");
+        names.push_back("btc_volatility_240m");
+        names.push_back("btc_volume_zscore_60m");
+        names.push_back("btc_volume_zscore_1440m");
+        names.push_back("eth_return_5m");
+        names.push_back("eth_return_15m");
+        names.push_back("eth_return_60m");
+        names.push_back("eth_return_240m");
+        names.push_back("eth_return_1440m");
+        names.push_back("eth_volatility_60m");
+        names.push_back("eth_volatility_240m");
+        names.push_back("eth_volume_zscore_60m");
+        names.push_back("eth_volume_zscore_1440m");
+        names.push_back("symbol_return_minus_btc_5m");
+        names.push_back("symbol_return_minus_btc_15m");
+        names.push_back("symbol_return_minus_btc_60m");
+        names.push_back("symbol_return_minus_eth_5m");
+        names.push_back("symbol_return_minus_eth_15m");
+        names.push_back("symbol_return_minus_eth_60m");
+        names.push_back("symbol_volume_zscore_minus_btc_volume_zscore_60m");
+        names.push_back("btc_regime_missing");
+        names.push_back("eth_regime_missing");
+    }
+    if (includeMarketBreadth) {
+        names.push_back("market_breadth_up_5m");
+        names.push_back("market_breadth_up_15m");
+        names.push_back("market_breadth_up_60m");
+        names.push_back("market_average_return_5m");
+        names.push_back("market_average_return_15m");
+        names.push_back("market_average_return_60m");
+        names.push_back("market_median_return_15m");
+        names.push_back("market_quote_volume_zscore_60m");
+        names.push_back("symbol_return_minus_market_5m");
+        names.push_back("symbol_return_minus_market_15m");
+        names.push_back("symbol_return_minus_market_60m");
+        names.push_back("market_breadth_missing");
+    }
     return names;
 }
 
@@ -1301,6 +1438,60 @@ struct FeatureContext {
     std::vector<double> low24h;
 };
 
+struct RegimeReferenceData {
+    RegimeReferenceData() : available(false) {}
+
+    bool available;
+    std::vector<Candle> candles;
+    std::map<long long, size_t> indexByOpenTime;
+    std::vector<double> volumeMean60;
+    std::vector<double> volumeStddev60;
+    std::vector<double> volumeMean1440;
+    std::vector<double> volumeStddev1440;
+    std::vector<double> volatility60;
+    std::vector<double> volatility240;
+};
+
+struct MarketRegimeContext {
+    MarketRegimeContext() : btc(NULL), eth(NULL) {}
+
+    const RegimeReferenceData *btc;
+    const RegimeReferenceData *eth;
+};
+
+struct MarketBreadthPoint {
+    MarketBreadthPoint()
+        : breadthUp5m(0.0),
+          breadthUp15m(0.0),
+          breadthUp60m(0.0),
+          averageReturn5m(0.0),
+          averageReturn15m(0.0),
+          averageReturn60m(0.0),
+          medianReturn15m(0.0),
+          quoteVolumeZscore60m(0.0),
+          missing(true) {}
+
+    double breadthUp5m;
+    double breadthUp15m;
+    double breadthUp60m;
+    double averageReturn5m;
+    double averageReturn15m;
+    double averageReturn60m;
+    double medianReturn15m;
+    double quoteVolumeZscore60m;
+    bool missing;
+};
+
+struct MarketBreadthData {
+    std::map<long long, MarketBreadthPoint> pointsByOpenTime;
+};
+
+RegimeReferenceData buildRegimeReferenceData(const std::vector<Candle> &candles);
+bool referenceIndexForTime(
+    const RegimeReferenceData *reference,
+    long long openTime,
+    size_t &index);
+
 FeatureContext buildFeatureContext(const std::vector<Candle> &candles) {
     FeatureContext context;
     const size_t count = candles.size();
@@ -1344,6 +1535,261 @@ FeatureContext buildFeatureContext(const std::vector<Candle> &candles) {
     return context;
 }
 
+RegimeReferenceData buildRegimeReferenceData(const std::vector<Candle> &candles) {
+    RegimeReferenceData data;
+    data.available = !candles.empty();
+    data.candles = candles;
+    const size_t count = candles.size();
+    data.volumeMean60.resize(count, 0.0);
+    data.volumeStddev60.resize(count, 1.0);
+    data.volumeMean1440.resize(count, 0.0);
+    data.volumeStddev1440.resize(count, 1.0);
+    data.volatility60.resize(count, 0.0);
+    data.volatility240.resize(count, 0.0);
+
+    RollingWindowStats volume60;
+    RollingWindowStats volume1440;
+    for (size_t i = 0; i < count; ++i) {
+        data.indexByOpenTime[candles[i].openTime] = i;
+        data.volumeMean60[i] = volume60.mean();
+        data.volumeStddev60[i] = volume60.stddev();
+        data.volumeMean1440[i] = volume1440.mean();
+        data.volumeStddev1440[i] = volume1440.stddev();
+        data.volatility60[i] = clipped(rollingReturnVolatility(candles, i, 60), 0.0, 1.0);
+        data.volatility240[i] = clipped(rollingReturnVolatility(candles, i, 240), 0.0, 1.0);
+        volume60.push(candles[i].volume, 60);
+        volume1440.push(candles[i].volume, 1440);
+    }
+    return data;
+}
+
+double medianOf(std::vector<double> values) {
+    if (values.empty()) {
+        return 0.0;
+    }
+    std::sort(values.begin(), values.end());
+    const size_t middle = values.size() / 2;
+    if (values.size() % 2 == 1) {
+        return values[middle];
+    }
+    return 0.5 * (values[middle - 1] + values[middle]);
+}
+
+MarketBreadthData buildMarketBreadthDataFromReferences(
+    const std::vector<const RegimeReferenceData *> &references,
+    int minimumBreadthSymbols) {
+    MarketBreadthData data;
+    if (references.size() < static_cast<size_t>(minimumBreadthSymbols)) {
+        return data;
+    }
+
+    std::map<long long, double> aggregateQuoteVolumeByTime;
+    std::set<long long> times;
+    for (size_t refIndex = 0; refIndex < references.size(); ++refIndex) {
+        const RegimeReferenceData *reference = references[refIndex];
+        if (reference == NULL || !reference->available) {
+            continue;
+        }
+        for (size_t i = 0; i < reference->candles.size(); ++i) {
+            const long long openTime = reference->candles[i].openTime;
+            times.insert(openTime);
+            aggregateQuoteVolumeByTime[openTime] += reference->candles[i].quoteVolume;
+        }
+    }
+
+    RollingWindowStats aggregateQuoteVolume;
+    for (std::set<long long>::const_iterator timeIt = times.begin(); timeIt != times.end(); ++timeIt) {
+        const long long openTime = *timeIt;
+        int count5m = 0;
+        int count15m = 0;
+        int count60m = 0;
+        int up5m = 0;
+        int up15m = 0;
+        int up60m = 0;
+        double sum5m = 0.0;
+        double sum15m = 0.0;
+        double sum60m = 0.0;
+        std::vector<double> returns15m;
+
+        for (size_t refIndex = 0; refIndex < references.size(); ++refIndex) {
+            const RegimeReferenceData *reference = references[refIndex];
+            size_t candleIndex = 0;
+            if (!referenceIndexForTime(reference, openTime, candleIndex)) {
+                continue;
+            }
+            if (candleIndex >= 5) {
+                const double ret5m = closeReturn(reference->candles, candleIndex, 5);
+                sum5m += ret5m;
+                up5m += ret5m > 0.0 ? 1 : 0;
+                ++count5m;
+            }
+            if (candleIndex >= 15) {
+                const double ret15m = closeReturn(reference->candles, candleIndex, 15);
+                sum15m += ret15m;
+                up15m += ret15m > 0.0 ? 1 : 0;
+                returns15m.push_back(ret15m);
+                ++count15m;
+            }
+            if (candleIndex >= 60) {
+                const double ret60m = closeReturn(reference->candles, candleIndex, 60);
+                sum60m += ret60m;
+                up60m += ret60m > 0.0 ? 1 : 0;
+                ++count60m;
+            }
+        }
+
+        MarketBreadthPoint point;
+        const bool enoughSymbols = count5m >= minimumBreadthSymbols
+            && count15m >= minimumBreadthSymbols
+            && count60m >= minimumBreadthSymbols;
+        if (enoughSymbols) {
+            point.missing = false;
+            point.breadthUp5m = safeRatio(up5m, count5m);
+            point.breadthUp15m = safeRatio(up15m, count15m);
+            point.breadthUp60m = safeRatio(up60m, count60m);
+            point.averageReturn5m = clipped(safeRatio(sum5m, count5m), -1.0, 1.0);
+            point.averageReturn15m = clipped(safeRatio(sum15m, count15m), -1.0, 1.0);
+            point.averageReturn60m = clipped(safeRatio(sum60m, count60m), -1.0, 1.0);
+            point.medianReturn15m = clipped(medianOf(returns15m), -1.0, 1.0);
+            point.quoteVolumeZscore60m = clipped(
+                (aggregateQuoteVolumeByTime[openTime] - aggregateQuoteVolume.mean()) / aggregateQuoteVolume.stddev(),
+                -20.0,
+                20.0);
+        }
+        data.pointsByOpenTime[openTime] = point;
+        aggregateQuoteVolume.push(aggregateQuoteVolumeByTime[openTime], kRollingLookbackMinutes);
+    }
+    return data;
+}
+
+class MarketReferenceCache {
+public:
+    const RegimeReferenceData *referenceForMonth(const std::string &symbol, const std::string &month) {
+        const std::string key = symbol + "|" + month;
+        std::map<std::string, RegimeReferenceData>::const_iterator found = cache_.find(key);
+        if (found != cache_.end()) {
+            return &found->second;
+        }
+
+        std::vector<std::string> &dates = datesBySymbol_[symbol];
+        if (dates.empty()) {
+            try {
+                dates = listKlineDates(symbol);
+            } catch (const std::exception &) {
+                cache_[key] = RegimeReferenceData();
+                return &cache_[key];
+            }
+        }
+
+        RegimeReferenceData data;
+        try {
+            data = buildRegimeReferenceData(downloadCandlesForMonth(symbol, month, dates));
+        } catch (const std::exception &) {
+            data = RegimeReferenceData();
+        }
+        cache_[key] = data;
+        return &cache_[key];
+    }
+
+private:
+    std::map<std::string, std::vector<std::string> > datesBySymbol_;
+    std::map<std::string, RegimeReferenceData> cache_;
+};
+
+class MarketBreadthCache {
+public:
+    explicit MarketBreadthCache(int minimumBreadthSymbols)
+        : minimumBreadthSymbols_(minimumBreadthSymbols) {}
+
+    const MarketBreadthData *breadthForMonth(
+        const std::vector<std::string> &symbols,
+        const std::string &month) {
+        const std::string key = month;
+        std::map<std::string, MarketBreadthData>::const_iterator found = cache_.find(key);
+        if (found != cache_.end()) {
+            return &found->second;
+        }
+
+        std::vector<const RegimeReferenceData *> references;
+        references.reserve(symbols.size());
+        for (size_t i = 0; i < symbols.size(); ++i) {
+            const RegimeReferenceData *reference = referenceForMonth(symbols[i], month);
+            if (reference != NULL && reference->available) {
+                references.push_back(reference);
+            }
+        }
+        cache_[key] = buildMarketBreadthDataFromReferences(references, minimumBreadthSymbols_);
+        return &cache_[key];
+    }
+
+private:
+    const RegimeReferenceData *referenceForMonth(const std::string &symbol, const std::string &month) {
+        const std::string key = symbol + "|" + month;
+        std::map<std::string, RegimeReferenceData>::const_iterator found = references_.find(key);
+        if (found != references_.end()) {
+            return &found->second;
+        }
+
+        std::vector<std::string> &dates = datesBySymbol_[symbol];
+        if (dates.empty()) {
+            try {
+                dates = listKlineDates(symbol);
+            } catch (const std::exception &) {
+                references_[key] = RegimeReferenceData();
+                return &references_[key];
+            }
+        }
+
+        RegimeReferenceData data;
+        try {
+            data = buildRegimeReferenceData(downloadCandlesForMonth(symbol, month, dates));
+        } catch (const std::exception &) {
+            data = RegimeReferenceData();
+        }
+        references_[key] = data;
+        return &references_[key];
+    }
+
+    std::map<std::string, std::vector<std::string> > datesBySymbol_;
+    std::map<std::string, RegimeReferenceData> references_;
+    std::map<std::string, MarketBreadthData> cache_;
+    int minimumBreadthSymbols_;
+};
+
+bool referenceIndexForTime(
+    const RegimeReferenceData *reference,
+    long long openTime,
+    size_t &index) {
+    if (reference == NULL || !reference->available) {
+        return false;
+    }
+    const std::map<long long, size_t>::const_iterator it = reference->indexByOpenTime.find(openTime);
+    if (it == reference->indexByOpenTime.end()) {
+        return false;
+    }
+    index = it->second;
+    return true;
+}
+
+double referenceVolumeZscore(
+    const RegimeReferenceData *reference,
+    size_t index,
+    int lookback) {
+    if (reference == NULL || !reference->available || index >= reference->candles.size()) {
+        return 0.0;
+    }
+    if (lookback >= 1440) {
+        return clipped(
+            (reference->candles[index].volume - reference->volumeMean1440[index]) / reference->volumeStddev1440[index],
+            -20.0,
+            20.0);
+    }
+    return clipped(
+        (reference->candles[index].volume - reference->volumeMean60[index]) / reference->volumeStddev60[index],
+        -20.0,
+        20.0);
+}
+
 double firstDeclineExitReturn(
     const std::vector<Candle> &candles,
     size_t entryIndex,
@@ -1367,7 +1813,9 @@ std::vector<Sample> makeSamples(
     const std::string &month,
     int monthIndex,
     const std::vector<Candle> &candles,
-    const ScraperOptions &options) {
+    const ScraperOptions &options,
+    const MarketRegimeContext *marketRegimeContext = NULL,
+    const MarketBreadthData *marketBreadthData = NULL) {
     std::vector<Sample> samples;
     const size_t historyStart = static_cast<size_t>(std::max(5, kRollingLookbackMinutes));
     if (candles.size() <= historyStart + static_cast<size_t>(options.predictionWindowMinutes)) {
@@ -1513,6 +1961,93 @@ std::vector<Sample> makeSamples(
             -20.0,
             20.0));
 
+        if (options.marketRegimeFeatures) {
+            size_t btcIndex = 0;
+            size_t ethIndex = 0;
+            const bool hasBtc = marketRegimeContext != NULL
+                && referenceIndexForTime(marketRegimeContext->btc, now.openTime, btcIndex);
+            const bool hasEth = marketRegimeContext != NULL
+                && referenceIndexForTime(marketRegimeContext->eth, now.openTime, ethIndex);
+
+            const double symbolReturn5m = closeReturn(candles, i, 5);
+            const double symbolReturn15m = closeReturn(candles, i, 15);
+            const double symbolReturn60m = closeReturn(candles, i, 60);
+            const double symbolVolumeZscore60m = clipped((now.volume - volumeMean) / volumeStddev, -20.0, 20.0);
+
+            const double btcReturn5m = hasBtc ? closeReturn(marketRegimeContext->btc->candles, btcIndex, 5) : 0.0;
+            const double btcReturn15m = hasBtc ? closeReturn(marketRegimeContext->btc->candles, btcIndex, 15) : 0.0;
+            const double btcReturn60m = hasBtc ? closeReturn(marketRegimeContext->btc->candles, btcIndex, 60) : 0.0;
+            const double btcReturn240m = hasBtc ? closeReturn(marketRegimeContext->btc->candles, btcIndex, 240) : 0.0;
+            const double btcReturn1440m = hasBtc ? closeReturn(marketRegimeContext->btc->candles, btcIndex, 1440) : 0.0;
+            const double btcVolatility60m = hasBtc ? marketRegimeContext->btc->volatility60[btcIndex] : 0.0;
+            const double btcVolatility240m = hasBtc ? marketRegimeContext->btc->volatility240[btcIndex] : 0.0;
+            const double btcVolumeZscore60m = hasBtc ? referenceVolumeZscore(marketRegimeContext->btc, btcIndex, 60) : 0.0;
+            const double btcVolumeZscore1440m = hasBtc ? referenceVolumeZscore(marketRegimeContext->btc, btcIndex, 1440) : 0.0;
+
+            const double ethReturn5m = hasEth ? closeReturn(marketRegimeContext->eth->candles, ethIndex, 5) : 0.0;
+            const double ethReturn15m = hasEth ? closeReturn(marketRegimeContext->eth->candles, ethIndex, 15) : 0.0;
+            const double ethReturn60m = hasEth ? closeReturn(marketRegimeContext->eth->candles, ethIndex, 60) : 0.0;
+            const double ethReturn240m = hasEth ? closeReturn(marketRegimeContext->eth->candles, ethIndex, 240) : 0.0;
+            const double ethReturn1440m = hasEth ? closeReturn(marketRegimeContext->eth->candles, ethIndex, 1440) : 0.0;
+            const double ethVolatility60m = hasEth ? marketRegimeContext->eth->volatility60[ethIndex] : 0.0;
+            const double ethVolatility240m = hasEth ? marketRegimeContext->eth->volatility240[ethIndex] : 0.0;
+            const double ethVolumeZscore60m = hasEth ? referenceVolumeZscore(marketRegimeContext->eth, ethIndex, 60) : 0.0;
+            const double ethVolumeZscore1440m = hasEth ? referenceVolumeZscore(marketRegimeContext->eth, ethIndex, 1440) : 0.0;
+
+            sample.features.push_back(btcReturn5m);
+            sample.features.push_back(btcReturn15m);
+            sample.features.push_back(btcReturn60m);
+            sample.features.push_back(btcReturn240m);
+            sample.features.push_back(btcReturn1440m);
+            sample.features.push_back(btcVolatility60m);
+            sample.features.push_back(btcVolatility240m);
+            sample.features.push_back(btcVolumeZscore60m);
+            sample.features.push_back(btcVolumeZscore1440m);
+            sample.features.push_back(ethReturn5m);
+            sample.features.push_back(ethReturn15m);
+            sample.features.push_back(ethReturn60m);
+            sample.features.push_back(ethReturn240m);
+            sample.features.push_back(ethReturn1440m);
+            sample.features.push_back(ethVolatility60m);
+            sample.features.push_back(ethVolatility240m);
+            sample.features.push_back(ethVolumeZscore60m);
+            sample.features.push_back(ethVolumeZscore1440m);
+            sample.features.push_back(clipped(symbolReturn5m - btcReturn5m, -1.0, 1.0));
+            sample.features.push_back(clipped(symbolReturn15m - btcReturn15m, -1.0, 1.0));
+            sample.features.push_back(clipped(symbolReturn60m - btcReturn60m, -1.0, 1.0));
+            sample.features.push_back(clipped(symbolReturn5m - ethReturn5m, -1.0, 1.0));
+            sample.features.push_back(clipped(symbolReturn15m - ethReturn15m, -1.0, 1.0));
+            sample.features.push_back(clipped(symbolReturn60m - ethReturn60m, -1.0, 1.0));
+            sample.features.push_back(clipped(symbolVolumeZscore60m - btcVolumeZscore60m, -20.0, 20.0));
+            sample.features.push_back(hasBtc ? 0.0 : 1.0);
+            sample.features.push_back(hasEth ? 0.0 : 1.0);
+        }
+        if (options.marketBreadthFeatures) {
+            MarketBreadthPoint breadth;
+            if (marketBreadthData != NULL) {
+                const std::map<long long, MarketBreadthPoint>::const_iterator breadthIt =
+                    marketBreadthData->pointsByOpenTime.find(now.openTime);
+                if (breadthIt != marketBreadthData->pointsByOpenTime.end()) {
+                    breadth = breadthIt->second;
+                }
+            }
+            const double symbolReturn5m = closeReturn(candles, i, 5);
+            const double symbolReturn15m = closeReturn(candles, i, 15);
+            const double symbolReturn60m = closeReturn(candles, i, 60);
+            sample.features.push_back(breadth.breadthUp5m);
+            sample.features.push_back(breadth.breadthUp15m);
+            sample.features.push_back(breadth.breadthUp60m);
+            sample.features.push_back(breadth.averageReturn5m);
+            sample.features.push_back(breadth.averageReturn15m);
+            sample.features.push_back(breadth.averageReturn60m);
+            sample.features.push_back(breadth.medianReturn15m);
+            sample.features.push_back(breadth.quoteVolumeZscore60m);
+            sample.features.push_back(clipped(symbolReturn5m - breadth.averageReturn5m, -1.0, 1.0));
+            sample.features.push_back(clipped(symbolReturn15m - breadth.averageReturn15m, -1.0, 1.0));
+            sample.features.push_back(clipped(symbolReturn60m - breadth.averageReturn60m, -1.0, 1.0));
+            sample.features.push_back(breadth.missing ? 1.0 : 0.0);
+        }
+
         samples.push_back(sample);
     }
 
@@ -1595,11 +2130,132 @@ void runSelfTests() {
         throw std::runtime_error("self-test failed: first_decline target exit");
     }
 
+    ScraperOptions regimeOptions = options;
+    regimeOptions.marketRegimeFeatures = true;
+    const MarketRegimeContext missingRegime;
+    const std::vector<Sample> regimeSamples = makeSamples("TEST", "2020-01", 0, base, regimeOptions, &missingRegime);
+    const Sample *regimeSample = sampleAtTime(regimeSamples, 60LL * 60000LL);
+    const std::vector<std::string> defaultNames = featureNames(&options);
+    const std::vector<std::string> regimeNames = featureNames(&regimeOptions);
+    if (!regimeSample || regimeSample->features.size() != regimeNames.size()) {
+        throw std::runtime_error("self-test failed: regime feature header mismatch");
+    }
+    if (std::find(defaultNames.begin(), defaultNames.end(), "btc_regime_missing") != defaultNames.end()) {
+        throw std::runtime_error("self-test failed: regime columns leaked into default feature header");
+    }
+    size_t btcMissingIndex = regimeNames.size();
+    size_t ethMissingIndex = regimeNames.size();
+    for (size_t i = 0; i < regimeNames.size(); ++i) {
+        if (regimeNames[i] == "btc_regime_missing") {
+            btcMissingIndex = i;
+        } else if (regimeNames[i] == "eth_regime_missing") {
+            ethMissingIndex = i;
+        }
+    }
+    if (btcMissingIndex >= regimeNames.size()
+            || ethMissingIndex >= regimeNames.size()
+            || std::fabs(regimeSample->features[btcMissingIndex] - 1.0) > 1e-12
+            || std::fabs(regimeSample->features[ethMissingIndex] - 1.0) > 1e-12) {
+        throw std::runtime_error("self-test failed: missing market regime indicators");
+    }
+
+    ScraperOptions breadthOptions = options;
+    breadthOptions.marketBreadthFeatures = true;
+    const std::vector<std::string> breadthNames = featureNames(&breadthOptions);
+    if (std::find(defaultNames.begin(), defaultNames.end(), "market_breadth_missing") != defaultNames.end()) {
+        throw std::runtime_error("self-test failed: breadth columns leaked into default feature header");
+    }
+
+    std::vector<RegimeReferenceData> breadthReferences;
+    std::vector<const RegimeReferenceData *> breadthPointers;
+    for (int symbolIndex = 0; symbolIndex < breadthOptions.marketBreadthMinSymbols; ++symbolIndex) {
+        std::vector<Candle> candles = base;
+        for (size_t i = 0; i < candles.size(); ++i) {
+            const double close = 100.0 + static_cast<double>(i) * 0.01 + static_cast<double>(symbolIndex) * 0.05;
+            candles[i].open = close;
+            candles[i].high = close + 0.1;
+            candles[i].low = close - 0.1;
+            candles[i].close = close;
+            candles[i].volume = 1000.0 + static_cast<double>(i);
+            candles[i].quoteVolume = 100000.0 + static_cast<double>(symbolIndex) * 100.0 + static_cast<double>(i) * 10.0;
+        }
+        breadthReferences.push_back(buildRegimeReferenceData(candles));
+    }
+    for (size_t i = 0; i < breadthReferences.size(); ++i) {
+        breadthPointers.push_back(&breadthReferences[i]);
+    }
+
+    const MarketBreadthData breadthData = buildMarketBreadthDataFromReferences(
+        breadthPointers,
+        breadthOptions.marketBreadthMinSymbols);
+    const std::vector<Sample> breadthSamples = makeSamples(
+        "TEST",
+        "2020-01",
+        0,
+        breadthReferences[0].candles,
+        breadthOptions,
+        NULL,
+        &breadthData);
+    const Sample *breadthSample = sampleAtTime(breadthSamples, 60LL * 60000LL);
+    size_t breadthUpIndex = breadthNames.size();
+    size_t breadthMissingIndex = breadthNames.size();
+    for (size_t i = 0; i < breadthNames.size(); ++i) {
+        if (breadthNames[i] == "market_breadth_up_5m") {
+            breadthUpIndex = i;
+        } else if (breadthNames[i] == "market_breadth_missing") {
+            breadthMissingIndex = i;
+        }
+    }
+    if (!breadthSample
+            || breadthSample->features.size() != breadthNames.size()
+            || breadthUpIndex >= breadthNames.size()
+            || breadthMissingIndex >= breadthNames.size()
+            || breadthSample->features[breadthUpIndex] <= 0.0
+            || std::fabs(breadthSample->features[breadthMissingIndex]) > 1e-12) {
+        throw std::runtime_error("self-test failed: market breadth features");
+    }
+
+    std::vector<const RegimeReferenceData *> insufficientBreadth;
+    insufficientBreadth.push_back(&breadthReferences[0]);
+    const MarketBreadthData missingBreadthData = buildMarketBreadthDataFromReferences(
+        insufficientBreadth,
+        breadthOptions.marketBreadthMinSymbols);
+    const std::vector<Sample> missingBreadthSamples = makeSamples(
+        "TEST",
+        "2020-01",
+        0,
+        breadthReferences[0].candles,
+        breadthOptions,
+        NULL,
+        &missingBreadthData);
+    const Sample *missingBreadthSample = sampleAtTime(missingBreadthSamples, 60LL * 60000LL);
+    if (!missingBreadthSample || std::fabs(missingBreadthSample->features[breadthMissingIndex] - 1.0) > 1e-12) {
+        throw std::runtime_error("self-test failed: insufficient market breadth missing flag");
+    }
+
+    std::vector<RegimeReferenceData> futureChangedReferences = breadthReferences;
+    futureChangedReferences[0].candles[65].close *= 10.0;
+    std::vector<const RegimeReferenceData *> futureChangedPointers;
+    for (size_t i = 0; i < futureChangedReferences.size(); ++i) {
+        futureChangedPointers.push_back(&futureChangedReferences[i]);
+    }
+    const MarketBreadthData futureChangedBreadth = buildMarketBreadthDataFromReferences(
+        futureChangedPointers,
+        breadthOptions.marketBreadthMinSymbols);
+    const long long testedOpenTime = 60LL * 60000LL;
+    if (breadthData.pointsByOpenTime.find(testedOpenTime) == breadthData.pointsByOpenTime.end()
+            || futureChangedBreadth.pointsByOpenTime.find(testedOpenTime) == futureChangedBreadth.pointsByOpenTime.end()
+            || std::fabs(
+                breadthData.pointsByOpenTime.find(testedOpenTime)->second.averageReturn5m
+                    - futureChangedBreadth.pointsByOpenTime.find(testedOpenTime)->second.averageReturn5m) > 1e-12) {
+        throw std::runtime_error("self-test failed: market breadth used future candles");
+    }
+
     std::cout << "C++ offline self-tests passed.\n";
 }
 
-void writeTrainingCsvHeader(std::ostream &out) {
-    const std::vector<std::string> names = featureNames();
+void writeTrainingCsvHeader(std::ostream &out, const ScraperOptions &options) {
+    const std::vector<std::string> names = featureNames(&options);
     out << "symbol,month,month_index,open_time,label,forward_return,trade_return,max_future_high_return,max_future_low_return,quote_volume";
     for (size_t i = 0; i < names.size(); ++i) {
         out << ',' << names[i];
@@ -1629,11 +2285,12 @@ void writeTrainingCsvRows(std::ostream &out, const std::vector<Sample> &samples)
 
 class TrainingCsvWriter {
 public:
-    TrainingCsvWriter() : out_(kTrainingCsv.c_str()), rowsWritten_(0) {
+    explicit TrainingCsvWriter(const ScraperOptions &options)
+        : out_(kTrainingCsv.c_str()), rowsWritten_(0) {
         if (!out_) {
             throw std::runtime_error("Unable to open training CSV for writing");
         }
-        writeTrainingCsvHeader(out_);
+        writeTrainingCsvHeader(out_, options);
     }
 
     void write(const std::vector<Sample> &samples) {
@@ -1651,23 +2308,30 @@ private:
     size_t rowsWritten_;
 };
 
-void writeTrainingManifest(
-    const ScraperOptions &options,
-    const std::vector<std::string> &symbols,
-    size_t rowsWritten) {
-    const std::string tempPath = kTrainingManifest + ".tmp";
-    std::ofstream out(tempPath.c_str());
-    if (!out) {
-        throw std::runtime_error("Unable to open training manifest for writing");
-    }
+std::string shardDatasetManifestPath(const std::string &baseDir) {
+    return pathJoin(baseDir, kShardedDatasetManifest);
+}
 
-    const std::vector<std::string> names = featureNames();
-    out << "{\n";
-    out << "  \"version\": " << kTrainingManifestVersion << ",\n";
-    out << "  \"generated_at_utc\": \"" << jsonEscape(utcTimestampNow()) << "\",\n";
-    out << "  \"generator_build\": \"" << jsonEscape(std::string(__DATE__) + " " + std::string(__TIME__)) << "\",\n";
-    out << "  \"training_csv\": \"" << jsonEscape(kTrainingCsv) << "\",\n";
-    out << "  \"row_count\": " << rowsWritten << ",\n";
+std::string shardRootDir(const std::string &baseDir) {
+    return pathJoin(baseDir, "shards");
+}
+
+std::string shardSymbolDir(const std::string &baseDir, const std::string &symbol) {
+    return pathJoin(shardRootDir(baseDir), symbol);
+}
+
+std::string shardCsvPath(const std::string &baseDir, const std::string &symbol, const std::string &month) {
+    return pathJoin(shardSymbolDir(baseDir, symbol), month + ".csv");
+}
+
+std::string shardManifestPath(const std::string &baseDir, const std::string &symbol, const std::string &month) {
+    return pathJoin(shardSymbolDir(baseDir, symbol), month + ".meta.json");
+}
+
+void writeCommonTrainingManifestFields(
+    std::ostream &out,
+    const ScraperOptions &options,
+    const std::vector<std::string> &names) {
     out << "  \"feature_count\": " << names.size() << ",\n";
     out << "  \"feature_names\": ";
     writeJsonStringArray(out, names);
@@ -1689,6 +2353,129 @@ void writeTrainingManifest(
     out << "  \"training_months\": " << options.trainingMonths << ",\n";
     out << "  \"validation_months\": " << options.validationMonths << ",\n";
     out << "  \"test_months\": " << options.testMonths << ",\n";
+    out << "  \"market_regime_features\": " << (options.marketRegimeFeatures ? "true" : "false") << ",\n";
+    out << "  \"market_breadth_features\": " << (options.marketBreadthFeatures ? "true" : "false") << ",\n";
+    out << "  \"market_breadth_min_symbols\": " << options.marketBreadthMinSymbols;
+}
+
+void writeShardManifestFile(
+    const std::string &path,
+    const ScraperOptions &options,
+    const std::string &symbol,
+    const std::string &month,
+    size_t rowsWritten) {
+    const std::string tempPath = path + ".tmp";
+    std::ofstream out(tempPath.c_str());
+    if (!out) {
+        throw std::runtime_error("Unable to open shard manifest for writing: " + path);
+    }
+    const std::vector<std::string> names = featureNames(&options);
+    out << "{\n";
+    out << "  \"version\": " << kShardManifestVersion << ",\n";
+    out << "  \"kind\": \"symbol_month_shard\",\n";
+    out << "  \"generated_at_utc\": \"" << jsonEscape(utcTimestampNow()) << "\",\n";
+    out << "  \"generator_build\": \"" << jsonEscape(std::string(__DATE__) + " " + std::string(__TIME__)) << "\",\n";
+    out << "  \"symbol\": \"" << jsonEscape(symbol) << "\",\n";
+    out << "  \"month\": \"" << jsonEscape(month) << "\",\n";
+    out << "  \"row_count\": " << rowsWritten << ",\n";
+    writeCommonTrainingManifestFields(out, options, names);
+    out << "\n}\n";
+    out.close();
+    if (!out) {
+        throw std::runtime_error("Unable to finish writing shard manifest: " + path);
+    }
+    std::remove(path.c_str());
+    if (std::rename(tempPath.c_str(), path.c_str()) != 0) {
+        std::remove(tempPath.c_str());
+        throw std::runtime_error("Unable to move shard manifest into place: " + path);
+    }
+}
+
+class ShardedDatasetWriter {
+public:
+    ShardedDatasetWriter(const ScraperOptions &options, const std::string &baseDir)
+        : options_(options), baseDir_(baseDir), rowsWritten_(0) {
+        ensureDirectoryRecursive(shardRootDir(baseDir_));
+    }
+
+    void write(const std::string &symbol, const std::string &month, const std::vector<Sample> &samples) {
+        const std::string symbolDir = shardSymbolDir(baseDir_, symbol);
+        ensureDirectoryRecursive(symbolDir);
+        const std::string csvPath = shardCsvPath(baseDir_, symbol, month);
+        std::ofstream out(csvPath.c_str());
+        if (!out) {
+            throw std::runtime_error("Unable to open shard CSV for writing: " + csvPath);
+        }
+        writeTrainingCsvHeader(out, options_);
+        writeTrainingCsvRows(out, samples);
+        out.close();
+        if (!out) {
+            throw std::runtime_error("Unable to finish writing shard CSV: " + csvPath);
+        }
+        writeShardManifestFile(shardManifestPath(baseDir_, symbol, month), options_, symbol, month, samples.size());
+        rowsWritten_ += samples.size();
+    }
+
+    void writeDatasetManifest(const std::vector<std::string> &symbols) const {
+        const std::string path = shardDatasetManifestPath(baseDir_);
+        const std::string tempPath = path + ".tmp";
+        std::ofstream out(tempPath.c_str());
+        if (!out) {
+            throw std::runtime_error("Unable to open sharded dataset manifest for writing");
+        }
+        const std::vector<std::string> names = featureNames(&options_);
+        out << "{\n";
+        out << "  \"version\": " << kShardedDatasetManifestVersion << ",\n";
+        out << "  \"kind\": \"symbol_month_shards\",\n";
+        out << "  \"generated_at_utc\": \"" << jsonEscape(utcTimestampNow()) << "\",\n";
+        out << "  \"generator_build\": \"" << jsonEscape(std::string(__DATE__) + " " + std::string(__TIME__)) << "\",\n";
+        out << "  \"dataset_dir\": \"" << jsonEscape(baseDir_) << "\",\n";
+        out << "  \"current_run_row_count\": " << rowsWritten_ << ",\n";
+        out << "  \"current_run_requested_symbols\": ";
+        writeJsonStringArray(out, symbols);
+        out << ",\n";
+        writeCommonTrainingManifestFields(out, options_, names);
+        out << "\n}\n";
+        out.close();
+        if (!out) {
+            throw std::runtime_error("Unable to finish writing sharded dataset manifest");
+        }
+        std::remove(path.c_str());
+        if (std::rename(tempPath.c_str(), path.c_str()) != 0) {
+            std::remove(tempPath.c_str());
+            throw std::runtime_error("Unable to move sharded dataset manifest into place");
+        }
+    }
+
+    size_t rowsWritten() const {
+        return rowsWritten_;
+    }
+
+private:
+    const ScraperOptions &options_;
+    std::string baseDir_;
+    size_t rowsWritten_;
+};
+
+void writeTrainingManifest(
+    const ScraperOptions &options,
+    const std::vector<std::string> &symbols,
+    size_t rowsWritten) {
+    const std::string tempPath = kTrainingManifest + ".tmp";
+    std::ofstream out(tempPath.c_str());
+    if (!out) {
+        throw std::runtime_error("Unable to open training manifest for writing");
+    }
+
+    const std::vector<std::string> names = featureNames(&options);
+    out << "{\n";
+    out << "  \"version\": " << kTrainingManifestVersion << ",\n";
+    out << "  \"generated_at_utc\": \"" << jsonEscape(utcTimestampNow()) << "\",\n";
+    out << "  \"generator_build\": \"" << jsonEscape(std::string(__DATE__) + " " + std::string(__TIME__)) << "\",\n";
+    out << "  \"training_csv\": \"" << jsonEscape(kTrainingCsv) << "\",\n";
+    out << "  \"row_count\": " << rowsWritten << ",\n";
+    writeCommonTrainingManifestFields(out, options, names);
+    out << ",\n";
     out << "  \"requested_symbols\": ";
     writeJsonStringArray(out, symbols);
     out << "\n}\n";
@@ -1705,7 +2492,8 @@ void writeTrainingManifest(
 }
 
 void writeTrainingCsv(const std::vector<Sample> &samples) {
-    TrainingCsvWriter writer;
+    ScraperOptions options;
+    TrainingCsvWriter writer(options);
     writer.write(samples);
 }
 
@@ -2360,7 +3148,6 @@ TrainingResult trainModel(
     testMetrics = evaluatePredictions(testSamples, testProbabilities, result.selectedThreshold, options);
 
     writePredictionsCsv(kLogisticPredictionsCsv, testSamples, testProbabilities, result.selectedThreshold, "logistic", options);
-    writePredictionsCsv(kPredictionsCsv, testSamples, testProbabilities, result.selectedThreshold, "logistic", options);
     return result;
 }
 
@@ -2445,7 +3232,7 @@ void writeModel(
     const EvaluationMetrics &validationMetrics,
     const EvaluationMetrics &testMetrics,
     const ScraperOptions &options) {
-    const std::vector<std::string> names = featureNames();
+    const std::vector<std::string> names = featureNames(&options);
     std::ofstream model(kModelCsv.c_str());
     if (!model) {
         throw std::runtime_error("Unable to open model CSV for writing");
@@ -2462,7 +3249,6 @@ void writeModel(
     }
 
     writeMetricsCsv(kLogisticMetricsCsv, result, validationMetrics, testMetrics, options);
-    writeMetricsCsv(kMetricsCsv, result, validationMetrics, testMetrics, options);
 }
 
 } // namespace
@@ -2482,7 +3268,17 @@ void scrapeHistoricalCoinData(const std::vector<std::string> &symbolOverrides) {
         std::vector<Sample> trainingSamples;
         std::vector<Sample> validationSamples;
         std::vector<Sample> testSamples;
-        TrainingCsvWriter trainingWriter;
+        const bool writeCombinedTrainingCsv = !options.skipCombinedOutput;
+        std::unique_ptr<TrainingCsvWriter> trainingWriter;
+        if (writeCombinedTrainingCsv) {
+            trainingWriter.reset(new TrainingCsvWriter(options));
+        }
+        std::unique_ptr<ShardedDatasetWriter> shardedWriter;
+        if (!options.shardOutputDir.empty()) {
+            shardedWriter.reset(new ShardedDatasetWriter(options, options.shardOutputDir));
+        }
+        MarketReferenceCache marketReferenceCache;
+        MarketBreadthCache marketBreadthCache(options.marketBreadthMinSymbols);
 
         for (size_t i = 0; i < symbols.size(); ++i) {
             try {
@@ -2505,18 +3301,34 @@ void scrapeHistoricalCoinData(const std::vector<std::string> &symbolOverrides) {
                         symbols[i],
                         months[monthIndex],
                         dates);
+                    MarketRegimeContext marketRegimeContext;
+                    if (options.marketRegimeFeatures) {
+                        marketRegimeContext.btc = marketReferenceCache.referenceForMonth("BTCUSDT", months[monthIndex]);
+                        marketRegimeContext.eth = marketReferenceCache.referenceForMonth("ETHUSDT", months[monthIndex]);
+                    }
+                    const MarketBreadthData *marketBreadthData = options.marketBreadthFeatures
+                        ? marketBreadthCache.breadthForMonth(symbols, months[monthIndex])
+                        : NULL;
                     const std::vector<Sample> monthSamples = makeSamples(
                         symbols[i],
                         months[monthIndex],
                         static_cast<int>(monthIndex),
                         candles,
-                        options);
-                    trainingWriter.write(monthSamples);
+                        options,
+                        options.marketRegimeFeatures ? &marketRegimeContext : NULL,
+                        marketBreadthData);
+                    if (trainingWriter.get() != NULL) {
+                        trainingWriter->write(monthSamples);
+                    }
+                    if (shardedWriter.get() != NULL) {
+                        shardedWriter->write(symbols[i], months[monthIndex], monthSamples);
+                    }
                     std::cout << "Generated symbol=" << symbols[i]
                               << " month=" << months[monthIndex]
                               << " candles_loaded=" << candles.size()
                               << " rows_written=" << monthSamples.size()
-                              << " cumulative_rows=" << trainingWriter.rowsWritten()
+                              << " cumulative_rows=" << (trainingWriter.get() != NULL ? trainingWriter->rowsWritten()
+                                                                                       : (shardedWriter.get() != NULL ? shardedWriter->rowsWritten() : 0))
                               << '\n' << std::flush;
 
                     if (static_cast<int>(monthIndex) < split.train) {
@@ -2553,12 +3365,26 @@ void scrapeHistoricalCoinData(const std::vector<std::string> &symbolOverrides) {
             }
         }
 
-        writeTrainingManifest(options, symbols, trainingWriter.rowsWritten());
+        if (trainingWriter.get() != NULL) {
+            writeTrainingManifest(options, symbols, trainingWriter->rowsWritten());
+        }
+        if (shardedWriter.get() != NULL) {
+            shardedWriter->writeDatasetManifest(symbols);
+        }
 
         if (options.generateOnly) {
-            std::cout << "Wrote " << kTrainingCsv
-                      << " and " << kTrainingManifest
-                      << ". Skipped C++ logistic baseline because --generate-only was set.\n";
+            std::cout << "Wrote ";
+            if (trainingWriter.get() != NULL) {
+                std::cout << kTrainingCsv << " and " << kTrainingManifest;
+                if (shardedWriter.get() != NULL) {
+                    std::cout << ", plus shard outputs under " << options.shardOutputDir;
+                }
+            } else if (shardedWriter.get() != NULL) {
+                std::cout << "shard outputs under " << options.shardOutputDir;
+            } else {
+                std::cout << "no training outputs";
+            }
+            std::cout << ". Skipped C++ logistic baseline because --generate-only was set.\n";
             return;
         }
 
@@ -2566,15 +3392,19 @@ void scrapeHistoricalCoinData(const std::vector<std::string> &symbolOverrides) {
         EvaluationMetrics testMetrics;
         const TrainingResult result = trainModel(trainingSamples, validationSamples, testSamples, options, validationMetrics, testMetrics);
         writeModel(result, validationMetrics, testMetrics, options);
-        const MonthSevenEvaluation evaluation = evaluateMonthSevenPredictions(kPredictionsCsv);
-
-        std::cout << "Wrote " << kTrainingCsv << ", " << kTrainingManifest << ", "
-                  << kLogisticPredictionsCsv << ", "
+        std::cout << "Wrote ";
+        if (trainingWriter.get() != NULL) {
+            std::cout << kTrainingCsv << ", " << kTrainingManifest << ", ";
+        }
+        if (shardedWriter.get() != NULL) {
+            std::cout << "shard outputs under " << options.shardOutputDir << ", ";
+        }
+        std::cout << kLogisticPredictionsCsv << ", "
                   << kModelCsv << ", and " << kLogisticMetricsCsv << ".\n"
                   << "Train AUC: " << std::fixed << std::setprecision(4) << result.trainAuc
                   << " | Validation threshold: " << result.selectedThreshold
                   << " | Test AUC: " << testMetrics.aucScore
-                  << " | Success rate: " << (evaluation.successRate * 100.0) << "%"
+                  << " | Precision: " << (testMetrics.precision * 100.0) << "%"
                   << " | Accuracy: " << (testMetrics.accuracy * 100.0) << "%"
                   << " | Recall: " << (testMetrics.recall * 100.0) << "%"
                   << " | Portfolio profit: " << testMetrics.portfolioProfit
