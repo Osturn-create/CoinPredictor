@@ -4,8 +4,8 @@ Build the C++ scraper/logistic baseline:
 
 ```bash
 cd Desktop/Github_Folder/CoinPredictor
-g++ -std=c++11 main.cpp DataScraper.cpp -o coin_predictor
-g++ -std=c++11 -DDATASCRAPER_STANDALONE DataScraper.cpp -o data_scraper
+g++ -std=c++11 main.cpp DataScraper.cpp -o coin_predictor -lz
+g++ -std=c++11 -DDATASCRAPER_STANDALONE DataScraper.cpp -o data_scraper -lz
 ```
 
 Generate Binance 1m kline samples and run the logistic baseline:
@@ -45,14 +45,19 @@ again, use shard output instead of one giant combined CSV:
   --market-breadth-features \
   --generate-only \
   --shard-output-dir shard_dataset \
+  --compress-shards gzip \
   --skip-combined-output
 ```
 
 That writes:
 
 - `shard_dataset/kline_growth_dataset.meta.json`
-- `shard_dataset/shards/SYMBOL/YYYY-MM.csv`
+- `shard_dataset/shards/SYMBOL/YYYY-MM.csv.gz`
 - `shard_dataset/shards/SYMBOL/YYYY-MM.meta.json`
+
+Each shard manifest now records `csv_path`, `compression`, `row_count`, and the
+shared `feature_names`, so the Python loader can read either `.csv` or
+`.csv.gz` shards transparently.
 
 Later, add only new coins to that same directory:
 
@@ -83,6 +88,9 @@ Then run the Python pipeline against the shard directory:
 Existing shard caches are reused when the shard CSV and shard settings did not
 change. The aggregate dataset cache refreshes when shard inventory changes, so
 new symbol-month shards can be added without rebuilding every old shard cache.
+Per-shard binary caches are now stored as split `.npy` metadata arrays plus a
+`shard_cache_manifest.json`, and aggregate caches reuse valid shard caches
+instead of reparsing unchanged shard CSVs.
 
 For future full-history rebuilds, the recommended generator path now enables
 BTC/ETH market-regime features:
@@ -203,7 +211,7 @@ guardrail for experiments.
 Build:
 
 ```powershell
-wsl bash -lc 'cd "/mnt/c/Users/alexa/OneDrive/Desktop/GitHub_Files/Desktop/Github_Folder/CoinPredictor" && g++ -std=c++11 main.cpp DataScraper.cpp -o coin_predictor && g++ -std=c++11 -DDATASCRAPER_STANDALONE DataScraper.cpp -o data_scraper'
+wsl bash -lc 'cd "/mnt/c/Users/alexa/OneDrive/Desktop/GitHub_Files/Desktop/Github_Folder/CoinPredictor" && g++ -std=c++11 main.cpp DataScraper.cpp -o coin_predictor -lz && g++ -std=c++11 -DDATASCRAPER_STANDALONE DataScraper.cpp -o data_scraper -lz'
 ```
 
 Generate a large CSV with all available months:
@@ -251,7 +259,7 @@ and to score trades by expected return as well as by binary classification.
 Build the scraper and generator:
 
 ```bash
-wsl bash -lc 'cd "/mnt/c/Users/alexa/OneDrive/Desktop/GitHub_Files/Desktop/Github_Folder/CoinPredictor" && g++ -std=c++11 main.cpp DataScraper.cpp -o coin_predictor && g++ -std=c++11 -DDATASCRAPER_STANDALONE DataScraper.cpp -o data_scraper'
+wsl bash -lc 'cd "/mnt/c/Users/alexa/OneDrive/Desktop/GitHub_Files/Desktop/Github_Folder/CoinPredictor" && g++ -std=c++11 main.cpp DataScraper.cpp -o coin_predictor -lz && g++ -std=c++11 -DDATASCRAPER_STANDALONE DataScraper.cpp -o data_scraper -lz'
 ```
 
 Generate a regime-aware dataset:
@@ -337,6 +345,13 @@ Inspect an existing cache without training:
 
 ```bash
 wsl bash -lc 'cd "/mnt/c/Users/alexa/OneDrive/Desktop/GitHub_Files/Desktop/Github_Folder/CoinPredictor" && .venv/bin/python -u gbdt_pipeline.py --cache-only --inspect-cache --feature-storage memmap32 --cache-dir .gbdt_cache'
+```
+
+Print a fuller cache inventory, including split metadata array files and
+per-shard cache readiness for sharded datasets:
+
+```bash
+wsl bash -lc 'cd "/mnt/c/Users/alexa/OneDrive/Desktop/GitHub_Files/Desktop/Github_Folder/CoinPredictor" && .venv/bin/python -u gbdt_pipeline.py --cache-report --feature-storage memmap32 --cache-dir .gbdt_cache'
 ```
 
 Review stale cache files without deleting them:
@@ -452,7 +467,7 @@ work.
 Recommended sharded 25-coin rebuild:
 
 ```powershell
-wsl bash -lc 'cd "/mnt/c/Users/alexa/OneDrive/Desktop/GitHub_Files/Desktop/Github_Folder/CoinPredictor" && ./coin_predictor train BTCUSDT ETHUSDT BNBUSDT SOLUSDT SUIUSDT DOGEUSDT XRPUSDT TONUSDT NEARUSDT ONDOUSDT TAOUSDT INJUSDT WLDUSDT AVAXUSDT LTCUSDT LINKUSDT AAVEUSDT ADAUSDT BCHUSDT TIAUSDT UNIUSDT HBARUSDT SEIUSDT FETUSDT DOTUSDT --months all --split-mode ratio --train-ratio 0.70 --validation-ratio 0.15 --test-ratio 0.15 --label-mode target_stop --target-exit-mode first_decline --upside-target 0.02 --downside-stop 0.02 --market-regime-features --market-breadth-features --market-breadth-min-symbols 5 --generate-only --shard-output-dir shard_dataset_25 --skip-combined-output'
+wsl bash -lc 'cd "/mnt/c/Users/alexa/OneDrive/Desktop/GitHub_Files/Desktop/Github_Folder/CoinPredictor" && ./coin_predictor train BTCUSDT ETHUSDT BNBUSDT SOLUSDT SUIUSDT DOGEUSDT XRPUSDT TONUSDT NEARUSDT ONDOUSDT TAOUSDT INJUSDT WLDUSDT AVAXUSDT LTCUSDT LINKUSDT AAVEUSDT ADAUSDT BCHUSDT TIAUSDT UNIUSDT HBARUSDT SEIUSDT FETUSDT DOTUSDT --months all --split-mode ratio --train-ratio 0.70 --validation-ratio 0.15 --test-ratio 0.15 --label-mode target_stop --target-exit-mode first_decline --upside-target 0.02 --downside-stop 0.02 --market-regime-features --market-breadth-features --market-breadth-min-symbols 5 --generate-only --shard-output-dir shard_dataset_25 --compress-shards gzip --skip-combined-output'
 ```
 
 ## Hybrid Upgrades
@@ -517,6 +532,68 @@ The main files to save and compare after each run are:
 - `kline_growth_run_summary.json`
 - `kline_growth_experiment_summary.csv`
 
+## Research Report Examples
+
+Laptop-safe run with embargo plus the new reports:
+
+```bash
+.venv/bin/python -u gbdt_pipeline.py \
+  --model lightgbm \
+  --split-mode ratio \
+  --walk-forward \
+  --memory-budget-gb 7.8 \
+  --max-rss-gb 7.8 \
+  --feature-storage memmap32 \
+  --cache-dir .gbdt_cache \
+  --embargo-minutes 10 \
+  --threshold-objective avg_profit \
+  --position-sizing-mode confidence_weighted \
+  --calibration platt \
+  --metrics-out kline_growth_metrics_gbdt.csv \
+  --run-summary-out kline_growth_run_summary.json
+```
+
+Walk-forward research run with full report outputs:
+
+```bash
+.venv/bin/python -u gbdt_pipeline.py \
+  --model lightgbm \
+  --split-mode ratio \
+  --walk-forward \
+  --embargo-minutes 10 \
+  --threshold-objective avg_profit \
+  --profit-safety explore \
+  --position-sizing-mode confidence_weighted \
+  --calibration platt \
+  --calibration-report-out kline_growth_calibration_report.csv \
+  --regime-report-out kline_growth_regime_report.csv \
+  --symbol-report-out kline_growth_symbol_report.csv \
+  --feature-stability-out kline_growth_feature_stability.csv \
+  --baseline-report-out kline_growth_baseline_report.csv \
+  --experiment-report-out kline_growth_experiment_report.md \
+  --metrics-out kline_growth_metrics_gbdt.csv \
+  --run-summary-out kline_growth_run_summary.json
+```
+
+Stricter execution-realism run:
+
+```bash
+.venv/bin/python -u gbdt_pipeline.py \
+  --model lightgbm \
+  --split-mode ratio \
+  --walk-forward \
+  --embargo-minutes 10 \
+  --position-sizing-mode volatility_adjusted \
+  --min-order-notional 10 \
+  --lot-size-step 1 \
+  --latency-penalty-bps 2 \
+  --max-open-positions 10 \
+  --max-daily-loss-fraction 0.03 \
+  --cooldown-after-loss-minutes 15 \
+  --max-trades-per-day 20 \
+  --max-daily-drawdown 0.015
+```
+
 ## Outputs
 
 The boosted-tree runner writes:
@@ -527,6 +604,12 @@ The boosted-tree runner writes:
 - `kline_growth_walkforward_diagnostics.csv`: one row per walk-forward fold with fold activity, calibration, threshold, and portfolio diagnostics.
 - `kline_growth_predictions_gbdt_walkforward.csv`: walk-forward executed trades.
 - `kline_growth_feature_importance.csv`: model feature importance.
+- `kline_growth_calibration_report.csv`: probability bucket calibration for raw and calibrated probabilities.
+- `kline_growth_regime_report.csv`: regime-by-regime trade quality, profit, and isolated drawdown.
+- `kline_growth_symbol_report.csv`: symbol-level robustness, profit contribution, and concentration checks.
+- `kline_growth_feature_stability.csv`: per-feature walk-forward stability across folds.
+- `kline_growth_baseline_report.csv`: no-trade, random, momentum, volume, and logistic baseline comparisons when available.
+- `kline_growth_experiment_report.md`: readable Markdown summary of the dataset, settings, reports, and pass/fail conclusion.
 - `kline_growth_run_summary.json`: current run arguments, cache details, parameters, and metrics.
 - `kline_growth_experiment_summary.csv`: one appended comparison row per experiment.
 - `kline_growth_experiment_grid_results.csv`: experiment-runner comparison table across the same-spec grid.

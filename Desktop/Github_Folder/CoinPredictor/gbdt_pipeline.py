@@ -18,6 +18,7 @@ import importlib.util
 import json
 import math
 import os
+import random
 import shutil
 import subprocess
 import sys
@@ -57,8 +58,8 @@ METADATA_COLUMNS = set([
 ])
 
 RECONSTRUCTED_QUOTE_VOLUME_DISCOUNT = 0.99999
-CACHE_VERSION = 2
-SHARDED_AGGREGATE_CACHE_VERSION = 3
+CACHE_VERSION = 3
+SHARDED_AGGREGATE_CACHE_VERSION = 4
 START_TIME = time.time()
 CACHE_LOAD_INFO = {}
 TEMP_PREDICTION_PATHS = set()
@@ -101,6 +102,18 @@ PROFILE_COLUMNS = [
     "rows_processed",
     "rows_per_second_if_available",
     "extra_info",
+]
+CACHE_METADATA_ARRAY_ORDER = [
+    "symbol_codes",
+    "month_codes",
+    "month_indices",
+    "open_times",
+    "labels",
+    "forward_returns",
+    "trade_returns",
+    "max_future_high_returns",
+    "max_future_low_returns",
+    "quote_volumes",
 ]
 MEMORY_BUDGET_DEFAULTS = {
     "feature_storage": "memmap32",
@@ -432,13 +445,36 @@ def output_path_args():
         "symbol_filter_diagnostics_out",
         "walk_predictions_out",
         "feature_importance_out",
+        "calibration_report_out",
+        "regime_report_out",
+        "symbol_report_out",
+        "feature_stability_out",
+        "baseline_report_out",
+        "experiment_report_out",
         "run_summary_out",
         "experiment_summary_out",
         "profile_out",
     ]
 
 
+DEFAULT_REPORT_FILENAMES = {
+    "calibration_report_out": "kline_growth_calibration_report.csv",
+    "regime_report_out": "kline_growth_regime_report.csv",
+    "symbol_report_out": "kline_growth_symbol_report.csv",
+    "feature_stability_out": "kline_growth_feature_stability.csv",
+    "baseline_report_out": "kline_growth_baseline_report.csv",
+    "experiment_report_out": "kline_growth_experiment_report.md",
+}
+
+
+def apply_default_report_paths(args):
+    for name, filename in DEFAULT_REPORT_FILENAMES.items():
+        if not getattr(args, name, "") and getattr(args, "metrics_out", ""):
+            setattr(args, name, filename)
+
+
 def configure_output_paths(args):
+    apply_default_report_paths(args)
     if not getattr(args, "results_dir", ""):
         return
     results_dir = os.path.abspath(args.results_dir)
@@ -2556,6 +2592,18 @@ def aggregate_cache_manifest_paths(cache_dir):
     )
 
 
+def valid_sharded_dataset_manifest(path, manifest_path):
+    try:
+        manifest, resolved_manifest_path = load_training_manifest(path)
+    except ValueError:
+        return None
+    if manifest is None:
+        return None
+    if os.path.abspath(resolved_manifest_path) != os.path.abspath(manifest_path):
+        return None
+    return manifest
+
+
 def discover_recoverable_default_dataset(requested_path, cache_dir=None):
     if not canonical_training_csv(requested_path):
         return None
@@ -2599,6 +2647,8 @@ def discover_recoverable_default_dataset(requested_path, cache_dir=None):
             dataset_manifest_path = os.path.abspath(dataset_manifest_path)
             if not os.path.isdir(dataset_path) or not os.path.exists(dataset_manifest_path):
                 continue
+            if valid_sharded_dataset_manifest(dataset_path, dataset_manifest_path) is None:
+                continue
             candidate = dataset_candidates.setdefault(dataset_path, {
                 "input_path": dataset_path,
                 "manifest_path": dataset_manifest_path,
@@ -2627,6 +2677,8 @@ def discover_recoverable_default_dataset(requested_path, cache_dir=None):
                 continue
             manifest_path = os.path.join(candidate_dir, SHARDED_DATASET_MANIFEST)
             if not os.path.exists(manifest_path):
+                continue
+            if valid_sharded_dataset_manifest(candidate_dir, manifest_path) is None:
                 continue
             local_candidates.append({
                 "input_path": os.path.abspath(candidate_dir),
@@ -2706,7 +2758,7 @@ def inspect_market_breadth_sidecar(path, rows, feature_columns, cache_dir, min_s
     manifest, manifest_load_seconds = load_cache_manifest_file(paths["manifest"])
     print("Breadth sidecar manifest load time: {:.3f}s".format(manifest_load_seconds), flush=True)
     base_manifest = CACHE_LOAD_INFO.get("manifest", {})
-    base_cache_manifest_signature = manifest_signature(base_manifest) if isinstance(base_manifest, dict) and base_manifest else ""
+    base_cache_manifest_signature = base_cache_reuse_signature(base_manifest)
     if not manifest or not market_breadth_sidecar_manifest_matches(
             manifest,
             path,
@@ -2860,7 +2912,7 @@ def build_market_breadth_sidecar(path, rows, feature_columns, cache_dir, min_sym
         "row_count": int(row_count),
         "market_breadth_min_symbols": int(min_symbols),
         "base_feature_signature": base_feature_signature(feature_columns),
-        "base_cache_manifest_signature": manifest_signature(base_manifest) if isinstance(base_manifest, dict) and base_manifest else "",
+        "base_cache_manifest_signature": base_cache_reuse_signature(base_manifest),
         "feature_columns": MARKET_BREADTH_FEATURE_COLUMNS,
     }
     with open(paths["manifest"], "w", encoding="utf-8") as handle:
@@ -2954,6 +3006,7 @@ def manifest_signature_subset(manifest):
         "test_months",
         "market_regime_features",
         "market_breadth_features",
+        "market_breadth_min_symbols",
     ]
     return {key: manifest.get(key) for key in keys}
 
@@ -2963,7 +3016,11 @@ def manifest_compatibility_signature(manifest):
 
 
 def shard_manifest_path(path):
-    root, _ = os.path.splitext(os.path.abspath(path))
+    absolute_path = os.path.abspath(path)
+    if absolute_path.endswith(".csv.gz"):
+        root = absolute_path[:-len(".csv.gz")]
+    else:
+        root, _ = os.path.splitext(absolute_path)
     return root + ".meta.json"
 
 
@@ -3080,47 +3137,93 @@ def load_json_file(path, description):
         raise ValueError("unable to read {} {}: {}".format(description, path, error))
 
 
+def resolve_dataset_relative_path(base_dir, stored_path):
+    if not stored_path:
+        return ""
+    if os.path.isabs(stored_path):
+        return os.path.abspath(stored_path)
+    return os.path.abspath(os.path.join(base_dir, stored_path))
+
+
 def discover_sharded_dataset_shards(path, dataset_manifest):
-    shard_root = os.path.join(os.path.abspath(path), "shards")
+    dataset_dir = os.path.abspath(path)
+    shard_root = os.path.join(dataset_dir, "shards")
     if not os.path.isdir(shard_root):
         raise ValueError("{} does not contain a shards/ directory".format(path))
     dataset_signature = manifest_compatibility_signature(dataset_manifest)
     shards = []
-    for root, _, files in os.walk(shard_root):
-        for name in files:
-            if not name.endswith(".csv"):
-                continue
-            csv_path = os.path.join(root, name)
-            meta_path = shard_manifest_path(csv_path)
-            if not os.path.exists(meta_path):
-                raise ValueError("shard {} is missing {}".format(csv_path, os.path.basename(meta_path)))
-            shard_manifest = load_json_file(meta_path, "shard manifest")
-            if shard_manifest.get("version") != SHARD_MANIFEST_VERSION or shard_manifest.get("kind") != "symbol_month_shard":
-                raise ValueError("shard manifest {} has unsupported version/kind".format(meta_path))
-            shard_signature = manifest_compatibility_signature(shard_manifest)
-            if shard_signature != dataset_signature:
-                raise ValueError(
-                    "shard {} is incompatible with {}. Its feature/label configuration does not match the dataset manifest. "
-                    "Use a separate shard directory for different settings or regenerate the mismatched shards.".format(
-                        csv_path,
-                        os.path.basename(training_manifest_path(path)),
-                    )
+    listed_shards = dataset_manifest.get("shards")
+    candidate_paths = []
+    if isinstance(listed_shards, list):
+        for item in listed_shards:
+            if not isinstance(item, dict):
+                raise ValueError("{} contains an invalid shard inventory entry".format(training_manifest_path(path)))
+            symbol = str(item.get("symbol", ""))
+            month = str(item.get("month", ""))
+            if not symbol or not month:
+                raise ValueError("{} contains a shard inventory entry missing symbol/month".format(training_manifest_path(path)))
+            csv_path = resolve_dataset_relative_path(dataset_dir, item.get("csv_path"))
+            if not csv_path:
+                compression = str(item.get("compression", "") or "")
+                filename = "{}.csv.gz".format(month) if compression == "gzip" else "{}.csv".format(month)
+                csv_path = os.path.join(shard_root, symbol, filename)
+                if not os.path.exists(csv_path) and compression in ("", "none"):
+                    gz_path = os.path.join(shard_root, symbol, "{}.csv.gz".format(month))
+                    if os.path.exists(gz_path):
+                        csv_path = gz_path
+            candidate_paths.append((
+                csv_path,
+                os.path.join(shard_root, symbol, "{}.meta.json".format(month)),
+            ))
+    else:
+        for root, _, files in os.walk(shard_root):
+            for name in files:
+                if not (name.endswith(".csv") or name.endswith(".csv.gz")):
+                    continue
+                csv_path = os.path.join(root, name)
+                candidate_paths.append((csv_path, shard_manifest_path(csv_path)))
+
+    for csv_path, meta_path in candidate_paths:
+        if not os.path.exists(meta_path):
+            raise ValueError("shard {} is missing {}".format(csv_path, os.path.basename(meta_path)))
+        shard_manifest = load_json_file(meta_path, "shard manifest")
+        if shard_manifest.get("version") != SHARD_MANIFEST_VERSION or shard_manifest.get("kind") != "symbol_month_shard":
+            raise ValueError("shard manifest {} has unsupported version/kind".format(meta_path))
+        manifest_csv_path = resolve_dataset_relative_path(dataset_dir, shard_manifest.get("csv_path"))
+        if manifest_csv_path and manifest_csv_path != os.path.abspath(csv_path):
+            if os.path.exists(manifest_csv_path):
+                csv_path = manifest_csv_path
+            else:
+                raise ValueError("shard manifest {} references missing csv_path {}".format(meta_path, manifest_csv_path))
+        if not os.path.exists(csv_path):
+            raise ValueError("shard csv is missing: {}".format(csv_path))
+        shard_signature = manifest_compatibility_signature(shard_manifest)
+        if shard_signature != dataset_signature:
+            raise ValueError(
+                "shard {} is incompatible with {}. Its feature/label configuration does not match the dataset manifest. "
+                "Use a separate shard directory for different settings or regenerate the mismatched shards.".format(
+                    csv_path,
+                    os.path.basename(training_manifest_path(path)),
                 )
-            csv_stat = os.stat(csv_path)
-            meta_stat = os.stat(meta_path)
-            shards.append({
-                "csv_path": os.path.abspath(csv_path),
-                "meta_path": os.path.abspath(meta_path),
-                "symbol": str(shard_manifest.get("symbol", "")),
-                "month": str(shard_manifest.get("month", "")),
-                "row_count": int(shard_manifest.get("row_count", 0)),
-                "manifest": shard_manifest,
-                "manifest_signature": shard_signature,
-                "csv_mtime_ns": getattr(csv_stat, "st_mtime_ns", int(csv_stat.st_mtime * 1000000000)),
-                "csv_size": int(csv_stat.st_size),
-                "meta_mtime_ns": getattr(meta_stat, "st_mtime_ns", int(meta_stat.st_mtime * 1000000000)),
-                "meta_size": int(meta_stat.st_size),
-            })
+            )
+        csv_stat = os.stat(csv_path)
+        meta_stat = os.stat(meta_path)
+        compression = str(shard_manifest.get("compression", "") or ("gzip" if csv_path.endswith(".gz") else "none"))
+        shards.append({
+            "csv_path": os.path.abspath(csv_path),
+            "meta_path": os.path.abspath(meta_path),
+            "relative_csv_path": os.path.relpath(os.path.abspath(csv_path), dataset_dir),
+            "symbol": str(shard_manifest.get("symbol", "")),
+            "month": str(shard_manifest.get("month", "")),
+            "compression": compression,
+            "row_count": int(shard_manifest.get("row_count", 0)),
+            "manifest": shard_manifest,
+            "manifest_signature": shard_signature,
+            "csv_mtime_ns": getattr(csv_stat, "st_mtime_ns", int(csv_stat.st_mtime * 1000000000)),
+            "csv_size": int(csv_stat.st_size),
+            "meta_mtime_ns": getattr(meta_stat, "st_mtime_ns", int(meta_stat.st_mtime * 1000000000)),
+            "meta_size": int(meta_stat.st_size),
+        })
     shards.sort(key=lambda item: (item["symbol"], item["month"], item["csv_path"]))
     if not shards:
         raise ValueError("{} does not contain any shard CSV files under shards/".format(path))
@@ -3131,11 +3234,15 @@ def sharded_inventory_signature(shards):
     payload = [
         {
             "csv_path": item["csv_path"],
+            "relative_csv_path": item.get("relative_csv_path", ""),
+            "compression": item.get("compression", ""),
+            "row_count": int(item.get("row_count", 0)),
             "csv_mtime_ns": item["csv_mtime_ns"],
             "csv_size": item["csv_size"],
             "meta_path": item["meta_path"],
             "meta_mtime_ns": item["meta_mtime_ns"],
             "meta_size": item["meta_size"],
+            "manifest_signature": item.get("manifest_signature", ""),
         }
         for item in shards
     ]
@@ -3147,6 +3254,17 @@ def cached_text(cache, value):
         return cache[value]
     cache[value] = value
     return value
+
+
+def global_month_lookup(month_values):
+    ordered = sorted(
+        value for value in set(month_values)
+        if str(value).strip()
+    )
+    return {
+        month_name: index
+        for index, month_name in enumerate(ordered)
+    }
 
 
 def build_features(item, feature_columns, storage):
@@ -3342,6 +3460,7 @@ class CompactTable(object):
         "base_feature_count",
         "memmap_path",
         "remove_memmap_on_cleanup",
+        "metadata_memmaps",
         "extra_memmap_path",
         "remove_extra_memmap_on_cleanup",
     )
@@ -3349,7 +3468,7 @@ class CompactTable(object):
     def __init__(self, symbols, months, symbol_codes, month_codes, month_indices, open_times,
                  labels, forward_returns, trade_returns, max_future_high_returns,
                  max_future_low_returns, quote_volumes, features, feature_lookup, memmap_path=None,
-                 remove_memmap_on_cleanup=True, extra_features=None,
+                 remove_memmap_on_cleanup=True, metadata_memmaps=None, extra_features=None,
                  extra_memmap_path=None, remove_extra_memmap_on_cleanup=True):
         self.symbols = symbols
         self.months = months
@@ -3369,6 +3488,7 @@ class CompactTable(object):
         self.base_feature_count = int(features.shape[1]) if features is not None and hasattr(features, "shape") else len(feature_lookup)
         self.memmap_path = memmap_path
         self.remove_memmap_on_cleanup = remove_memmap_on_cleanup
+        self.metadata_memmaps = list(metadata_memmaps or [])
         self.extra_memmap_path = extra_memmap_path
         self.remove_extra_memmap_on_cleanup = remove_extra_memmap_on_cleanup
 
@@ -3421,6 +3541,9 @@ class CompactTable(object):
                 except OSError:
                     pass
             self.extra_memmap_path = None
+        for values in self.metadata_memmaps:
+            close_memmap(values)
+        self.metadata_memmaps = []
 
 
 class CompactRows(object):
@@ -3469,6 +3592,31 @@ def is_compact_rows(rows):
 def manifest_signature(manifest):
     encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha1(encoded).hexdigest()
+
+
+def base_cache_reuse_signature(manifest):
+    if not isinstance(manifest, dict):
+        return ""
+    keys = [
+        "version",
+        "source_csv_path",
+        "source_csv_mtime_ns",
+        "source_csv_size",
+        "training_manifest_path",
+        "training_manifest_mtime_ns",
+        "training_manifest_signature",
+        "dataset_path",
+        "dataset_manifest_path",
+        "dataset_manifest_signature",
+        "inventory_signature",
+        "feature_dtype",
+        "feature_columns",
+        "row_count",
+        "has_returns",
+        "quote_volumes_present",
+    ]
+    payload = {key: manifest.get(key) for key in keys if key in manifest}
+    return manifest_signature(payload) if payload else ""
 
 
 def compact_trade_return_arrays(rows):
@@ -3590,7 +3738,11 @@ def make_row(item, feature_columns, month_index_lookup, text_cache, feature_stor
     global NORMALIZED_MICROSECOND_OPEN_TIMES
     symbol = cached_text(text_cache, item.get("symbol", ""))
     month = cached_text(text_cache, item.get("month", ""))
-    month_index = int(safe_float(item.get("month_index"), month_index_lookup.get((symbol, month), 0)))
+    month_index = month_index_lookup.get(month)
+    if month_index is None:
+        month_index = month_index_lookup.get((symbol, month))
+    if month_index is None:
+        month_index = int(safe_float(item.get("month_index"), 0.0))
     raw_open_time = int(safe_float(item.get("open_time"), 0.0))
     open_time = normalize_open_time_ms(raw_open_time)
     if open_time != raw_open_time:
@@ -3639,6 +3791,18 @@ def count_csv_rows(path):
         except StopIteration:
             return 0
         return sum(1 for _ in reader)
+
+
+def assign_global_month_indices(rows):
+    if not rows:
+        return rows
+    month_index_lookup = global_month_lookup(row.month for row in rows)
+    if not month_index_lookup:
+        return rows
+    for row in rows:
+        if row.month in month_index_lookup:
+            row.month_index = month_index_lookup[row.month]
+    return rows
 
 
 def load_compact_rows(path, feature_storage="matrix32", memmap_dir=None, feature_path=None,
@@ -3756,6 +3920,14 @@ def load_compact_rows(path, feature_storage="matrix32", memmap_dir=None, feature
             features.flush()
     finish_profile_stage(parse_token, rows_processed=row_count, extra_info=os.path.abspath(path))
 
+    month_index_lookup = global_month_lookup(months)
+    if month_index_lookup:
+        canonical_months = sorted(month_index_lookup, key=month_index_lookup.get)
+        remap = np.asarray([month_index_lookup[name] for name in months], dtype=np.int32)
+        month_codes = remap[month_codes]
+        month_indices = month_codes.astype(np.int16, copy=False)
+        months = canonical_months
+
     table = CompactTable(
         symbols,
         months,
@@ -3795,35 +3967,23 @@ def load_object_rows(path, feature_storage="float32"):
             raise ValueError("{} must contain quote_volume or log_quote_volume".format(path))
 
         raw_rows = []
-        symbol_months = {}
-        has_month_index = "month_index" in reader.fieldnames
         has_returns = "forward_return" in reader.fieldnames
         text_cache = {}
+        month_values = set()
 
         for item in reader:
-            if has_month_index:
-                raw_rows.append(make_row(item, feature_columns, {}, text_cache, feature_storage))
-            else:
-                symbol = item.get("symbol", "")
-                month = item.get("month", "")
-                if symbol and month:
-                    symbol_months.setdefault(symbol, set()).add(month)
-                raw_rows.append(item)
+            month = item.get("month", "")
+            if month:
+                month_values.add(month)
+            raw_rows.append(item)
 
-    if has_month_index:
-        rows = raw_rows
-        rows.sort(key=lambda row: (row.month_index, row.open_time, row.symbol))
-        return rows, feature_columns, has_returns
-
-    month_index_lookup = {}
-    for symbol, months in symbol_months.items():
-        for index, month in enumerate(sorted(months)):
-            month_index_lookup[(symbol, month)] = index
+    month_index_lookup = global_month_lookup(month_values)
 
     rows = []
     for item in raw_rows:
         rows.append(make_row(item, feature_columns, month_index_lookup, text_cache, feature_storage))
 
+    assign_global_month_indices(rows)
     rows.sort(key=lambda row: (row.month_index, row.open_time, row.symbol))
     return rows, feature_columns, has_returns
 
@@ -3833,11 +3993,132 @@ def cache_paths(path, cache_dir, dtype):
     source_hash = hashlib.sha1(source_path.encode("utf-8")).hexdigest()[:12]
     stem = os.path.splitext(os.path.basename(path))[0]
     prefix = os.path.join(cache_dir, "{}-{}-{}".format(stem, source_hash, np.dtype(dtype).name))
+    return build_flat_cache_paths(prefix, prefix + ".manifest.json")
+
+
+def build_flat_cache_paths(prefix, manifest_path):
     return {
         "features": prefix + ".features.dat",
-        "metadata": prefix + ".metadata.npz",
-        "manifest": prefix + ".manifest.json",
+        "manifest": manifest_path,
+        "metadata_arrays": {
+            name: prefix + ".{}.npy".format(name)
+            for name in CACHE_METADATA_ARRAY_ORDER
+        },
     }
+
+
+def shard_cache_paths(path, cache_dir, dtype):
+    source_path = os.path.abspath(path)
+    source_hash = hashlib.sha1(source_path.encode("utf-8")).hexdigest()[:12]
+    stem = os.path.splitext(os.path.basename(path))[0]
+    cache_root = os.path.join(cache_dir, "{}-{}-{}".format(stem, source_hash, np.dtype(dtype).name))
+    return {
+        "cache_root": cache_root,
+        "features": os.path.join(cache_root, "features.dat"),
+        "manifest": os.path.join(cache_root, "shard_cache_manifest.json"),
+        "metadata_arrays": {
+            name: os.path.join(cache_root, "{}.npy".format(name))
+            for name in CACHE_METADATA_ARRAY_ORDER
+        },
+    }
+
+
+def iter_cache_path_strings(value):
+    if isinstance(value, dict):
+        for item in value.values():
+            for child in iter_cache_path_strings(item):
+                yield child
+        return
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            for child in iter_cache_path_strings(item):
+                yield child
+        return
+    if isinstance(value, str):
+        yield value
+
+
+def atomic_write_json(path, payload):
+    def write_one(temp_path):
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+    atomic_write_path(path, write_one)
+
+
+def atomic_save_npy(path, values):
+    def write_one(temp_path):
+        with open(temp_path, "wb") as handle:
+            np.save(handle, np.asarray(values), allow_pickle=False)
+    atomic_write_path(path, write_one)
+
+
+def compact_nonnegative_dtype(max_value):
+    if max_value <= np.iinfo(np.uint8).max:
+        return np.uint8
+    if max_value <= np.iinfo(np.uint16).max:
+        return np.uint16
+    if max_value <= np.iinfo(np.uint32).max:
+        return np.uint32
+    return np.uint64
+
+
+def compact_nonnegative_array(values):
+    array = np.asarray(values)
+    if array.size == 0:
+        return array.astype(np.uint8, copy=False)
+    max_value = int(np.max(array))
+    if max_value < 0:
+        return array.astype(np.int64, copy=False)
+    return array.astype(compact_nonnegative_dtype(max_value), copy=False)
+
+
+def metadata_arrays_from_table(table):
+    return {
+        "symbol_codes": compact_nonnegative_array(table.symbol_codes),
+        "month_codes": compact_nonnegative_array(table.month_codes),
+        "month_indices": compact_nonnegative_array(table.month_indices),
+        "open_times": np.asarray(table.open_times, dtype=np.int64),
+        "labels": np.asarray(table.labels, dtype=np.int8),
+        "forward_returns": np.asarray(table.forward_returns, dtype=np.float32),
+        "trade_returns": np.asarray(table.trade_returns, dtype=np.float32),
+        "max_future_high_returns": np.asarray(table.max_future_high_returns, dtype=np.float32),
+        "max_future_low_returns": np.asarray(table.max_future_low_returns, dtype=np.float32),
+        "quote_volumes": (
+            np.asarray(table.quote_volumes, dtype=np.float32)
+            if table.quote_volumes is not None
+            else np.asarray([], dtype=np.float32)
+        ),
+    }
+
+
+def metadata_files_exist(paths):
+    return all(os.path.exists(path) for path in paths["metadata_arrays"].values())
+
+
+def write_metadata_arrays(paths, arrays):
+    for array_name, array_values in arrays.items():
+        atomic_save_npy(paths["metadata_arrays"][array_name], array_values)
+
+
+def load_metadata_arrays(paths, manifest):
+    metadata_started = time.time()
+    arrays = {}
+    memmaps = []
+    row_count = int(manifest.get("row_count", 0))
+    quote_volumes_present = bool(manifest.get("quote_volumes_present", True))
+    for name in CACHE_METADATA_ARRAY_ORDER:
+        array_path = paths["metadata_arrays"][name]
+        values = np.load(array_path, mmap_mode="r", allow_pickle=False)
+        if name == "quote_volumes" and not quote_volumes_present:
+            arrays[name] = None
+            memmaps.append(values)
+            continue
+        if len(values) != row_count:
+            raise ValueError("cache metadata row count mismatch for {}".format(array_path))
+        arrays[name] = values
+        memmaps.append(values)
+    metadata_load_seconds = time.time() - metadata_started
+    return arrays, memmaps, metadata_load_seconds
 
 
 def load_cache_manifest_file(path):
@@ -3856,7 +4137,9 @@ def load_cache_manifest_file(path):
 
 
 def clear_cache_files(paths):
-    for cache_path in paths.values():
+    for cache_path in iter_cache_path_strings(paths):
+        if os.path.isdir(cache_path):
+            continue
         try:
             os.remove(cache_path)
         except OSError:
@@ -3868,6 +4151,54 @@ def cache_only_missing_message(cache_dir):
         "ERROR: --cache-only was set, but no compatible cache was found in {}.\n"
         "Run once without --cache-only or rebuild the dataset/cache intentionally."
     ).format(cache_dir)
+
+
+def cache_manifest_targets_input(manifest, input_path, manifest_path):
+    if not isinstance(manifest, dict):
+        return False
+    input_abs = os.path.abspath(input_path)
+    manifest_abs = os.path.abspath(manifest_path) if manifest_path else ""
+    for key in ("source_csv_path", "dataset_path"):
+        value = manifest.get(key)
+        if value and os.path.abspath(value) == input_abs:
+            return True
+    for key in ("training_manifest_path", "dataset_manifest_path"):
+        value = manifest.get(key)
+        if value and manifest_abs and os.path.abspath(value) == manifest_abs:
+            return True
+    return False
+
+
+def cache_manifest_related_paths(path):
+    manifest_path = os.path.abspath(path)
+    if manifest_path.endswith(".aggregate.manifest.json"):
+        prefix = manifest_path[:-len(".aggregate.manifest.json")]
+        return {
+            "files": set(iter_cache_path_strings(build_flat_cache_paths(prefix + ".aggregate", manifest_path))),
+            "directories": {
+                prefix + ".shards",
+            },
+        }
+    if os.path.basename(manifest_path) == "shard_cache_manifest.json":
+        cache_root = os.path.dirname(manifest_path)
+        return {
+            "files": {
+                os.path.join(cache_root, name)
+                for name in os.listdir(cache_root)
+                if os.path.isfile(os.path.join(cache_root, name))
+            } if os.path.isdir(cache_root) else {manifest_path},
+            "directories": {cache_root} if cache_root else set(),
+        }
+    if manifest_path.endswith(".manifest.json"):
+        prefix = manifest_path[:-len(".manifest.json")]
+        return {
+            "files": set(iter_cache_path_strings(build_flat_cache_paths(prefix, manifest_path))),
+            "directories": set(),
+        }
+    return {
+        "files": {manifest_path},
+        "directories": set(),
+    }
 
 
 def source_csv_info(path, training_manifest=None, manifest_path=None, manifest_signature_override=None):
@@ -3907,20 +4238,20 @@ def cache_manifest_matches(manifest, path, dtype, paths, training_manifest=None,
         and manifest.get("row_count", 0) >= 0
         and bool(manifest.get("feature_columns"))
         and os.path.exists(paths["features"])
-        and os.path.exists(paths["metadata"])
+        and metadata_files_exist(paths)
     )
 
 
 def inspect_binary_cache(path, feature_storage, cache_dir, training_manifest=None,
                          manifest_path=None, require_cache_hit=False,
-                         manifest_signature_override=None):
+                         manifest_signature_override=None, use_shard_cache_layout=False):
     if np is None:
         raise ValueError("binary cache inspection requires numpy")
     if feature_storage not in ("memmap32", "memmap64"):
         raise ValueError("--cache-only/--smoke-test-cache require --feature-storage memmap32 or memmap64")
     dtype = np.float32 if feature_storage == "memmap32" else np.float64
     resolved_cache_dir = resolve_cache_dir(path, cache_dir)
-    paths = cache_paths(path, resolved_cache_dir, dtype)
+    paths = shard_cache_paths(path, resolved_cache_dir, dtype) if use_shard_cache_layout else cache_paths(path, resolved_cache_dir, dtype)
     manifest, manifest_load_seconds = load_cache_manifest_file(paths["manifest"])
     print("Cache manifest load time: {:.3f}s".format(manifest_load_seconds), flush=True)
     if not manifest or not cache_manifest_matches(
@@ -3929,42 +4260,33 @@ def inspect_binary_cache(path, feature_storage, cache_dir, training_manifest=Non
             raise ValueError(cache_only_missing_message(resolved_cache_dir))
         return None
 
-    metadata_started = time.time()
-    with np.load(paths["metadata"], allow_pickle=False) as metadata:
-        metadata_info = {
-            "symbols": [str(value) for value in metadata["symbols"]],
-            "months": [str(value) for value in metadata["months"]],
-            "symbol_codes": metadata["symbol_codes"],
-            "month_codes": metadata["month_codes"],
-            "month_indices": metadata["month_indices"],
-            "labels": metadata["labels"],
-            "forward_returns": metadata["forward_returns"],
-            "trade_returns": metadata["trade_returns"],
-            "max_future_high_returns": metadata["max_future_high_returns"],
-            "max_future_low_returns": metadata["max_future_low_returns"],
-            "quote_volumes": metadata["quote_volumes"],
-            "open_times": metadata["open_times"],
-        }
-    metadata_load_seconds = time.time() - metadata_started
+    metadata_arrays, metadata_memmaps, metadata_load_seconds = load_metadata_arrays(paths, manifest)
+    metadata_info = {
+        "symbols": [str(value) for value in manifest.get("symbols", [])],
+        "months": [str(value) for value in manifest.get("months", [])],
+        "symbol_codes": metadata_arrays["symbol_codes"],
+        "month_codes": metadata_arrays["month_codes"],
+        "month_indices": metadata_arrays["month_indices"],
+        "labels": metadata_arrays["labels"],
+        "forward_returns": metadata_arrays["forward_returns"],
+        "trade_returns": metadata_arrays["trade_returns"],
+        "max_future_high_returns": metadata_arrays["max_future_high_returns"],
+        "max_future_low_returns": metadata_arrays["max_future_low_returns"],
+        "quote_volumes": metadata_arrays["quote_volumes"],
+        "open_times": metadata_arrays["open_times"],
+    }
     print("Metadata load time: {:.3f}s".format(metadata_load_seconds), flush=True)
     record_profile_stage(
         "metadata_load",
         metadata_load_seconds,
         rows_processed=len(metadata_info["labels"]),
-        extra_info=paths["metadata"],
+        extra_info=paths["manifest"],
     )
-
-    row_count = int(manifest["row_count"])
-    feature_count = len(manifest["feature_columns"])
-    if len(metadata_info["labels"]) != row_count:
-        raise ValueError("cache metadata row count mismatch for {}".format(paths["metadata"]))
 
     open_times, normalized_count = normalize_open_times_array(metadata_info["open_times"])
     metadata_info["open_times"] = open_times
-    quote_volumes = metadata_info["quote_volumes"]
-    if quote_volumes.size == 0:
-        quote_volumes = None
-    metadata_info["quote_volumes"] = quote_volumes
+    row_count = int(manifest["row_count"])
+    feature_count = len(manifest["feature_columns"])
 
     memmap_started = time.time()
     feature_values = np.memmap(
@@ -3997,6 +4319,7 @@ def inspect_binary_cache(path, feature_storage, cache_dir, training_manifest=Non
     return {
         "manifest": manifest,
         "metadata": metadata_info,
+        "metadata_memmaps": metadata_memmaps,
         "features": feature_values,
         "dtype": np.dtype(dtype).name,
         "paths": paths,
@@ -4010,7 +4333,8 @@ def inspect_binary_cache(path, feature_storage, cache_dir, training_manifest=Non
 
 def load_cached_compact_rows(path, feature_storage, cache_dir, rebuild_cache=False,
                              training_manifest=None, manifest_path=None,
-                             cache_only=False, manifest_signature_override=None):
+                             cache_only=False, manifest_signature_override=None,
+                             use_shard_cache_layout=False):
     dtype = np.float32 if feature_storage == "memmap32" else np.float64
     resolved_cache_dir = resolve_cache_dir(path, cache_dir)
     if rebuild_cache and cache_only:
@@ -4023,6 +4347,7 @@ def load_cached_compact_rows(path, feature_storage, cache_dir, rebuild_cache=Fal
         manifest_path,
         require_cache_hit=cache_only,
         manifest_signature_override=manifest_signature_override,
+        use_shard_cache_layout=use_shard_cache_layout,
     )
 
     if cache_hit:
@@ -4045,6 +4370,7 @@ def load_cached_compact_rows(path, feature_storage, cache_dir, rebuild_cache=Fal
             {name: index for index, name in enumerate(manifest["feature_columns"])},
             cache_hit["paths"]["features"],
             False,
+            metadata_memmaps=cache_hit.get("metadata_memmaps"),
         )
         log_memory("Loaded compatible binary cache")
         return CompactRows(table), list(manifest["feature_columns"]), bool(manifest.get("has_returns"))
@@ -4053,7 +4379,9 @@ def load_cached_compact_rows(path, feature_storage, cache_dir, rebuild_cache=Fal
         raise ValueError(cache_only_missing_message(resolved_cache_dir))
 
     os.makedirs(resolved_cache_dir, exist_ok=True)
-    paths = cache_paths(path, resolved_cache_dir, dtype)
+    paths = shard_cache_paths(path, resolved_cache_dir, dtype) if use_shard_cache_layout else cache_paths(path, resolved_cache_dir, dtype)
+    if paths.get("cache_root"):
+        os.makedirs(paths["cache_root"], exist_ok=True)
     clear_cache_files(paths)
 
     log_memory("Building binary cache from CSV")
@@ -4066,21 +4394,8 @@ def load_cached_compact_rows(path, feature_storage, cache_dir, rebuild_cache=Fal
         remove_memmap_on_cleanup=False,
     )
     table = rows.table
-    np.savez_compressed(
-        paths["metadata"],
-        symbols=np.asarray(table.symbols),
-        months=np.asarray(table.months),
-        symbol_codes=table.symbol_codes,
-        month_codes=table.month_codes,
-        month_indices=table.month_indices,
-        open_times=table.open_times,
-        labels=table.labels,
-        forward_returns=table.forward_returns,
-        trade_returns=table.trade_returns,
-        max_future_high_returns=table.max_future_high_returns,
-        max_future_low_returns=table.max_future_low_returns,
-        quote_volumes=table.quote_volumes if table.quote_volumes is not None else np.asarray([], dtype=np.float32),
-    )
+    metadata_arrays = metadata_arrays_from_table(table)
+    write_metadata_arrays(paths, metadata_arrays)
     manifest = source_csv_info(path, training_manifest, manifest_path, manifest_signature_override)
     manifest.update({
         "version": CACHE_VERSION,
@@ -4088,9 +4403,12 @@ def load_cached_compact_rows(path, feature_storage, cache_dir, rebuild_cache=Fal
         "feature_columns": feature_columns,
         "row_count": len(rows),
         "has_returns": has_returns,
+        "quote_volumes_present": table.quote_volumes is not None,
+        "symbols": list(table.symbols),
+        "months": list(table.months),
     })
-    with open(paths["manifest"], "w", encoding="utf-8") as handle:
-        json.dump(manifest, handle, indent=2, sort_keys=True)
+    atomic_write_json(paths["manifest"], manifest)
+    CACHE_LOAD_INFO.clear()
     CACHE_LOAD_INFO.update({
         "status": "rebuilt",
         "paths": paths,
@@ -4108,12 +4426,9 @@ def sharded_dataset_cache_paths(path, cache_dir, dtype):
     source_path = os.path.abspath(path)
     source_hash = hashlib.sha1(source_path.encode("utf-8")).hexdigest()[:12]
     prefix = os.path.join(cache_dir, "sharded-{}-{}".format(source_hash, np.dtype(dtype).name))
-    return {
-        "features": prefix + ".aggregate.features.dat",
-        "metadata": prefix + ".aggregate.metadata.npz",
-        "manifest": prefix + ".aggregate.manifest.json",
-        "shard_cache_dir": prefix + ".shards",
-    }
+    paths = build_flat_cache_paths(prefix + ".aggregate", prefix + ".aggregate.manifest.json")
+    paths["shard_cache_dir"] = prefix + ".shards"
+    return paths
 
 
 def sharded_aggregate_manifest_matches(manifest, path, dtype, paths, dataset_manifest, shards):
@@ -4127,7 +4442,7 @@ def sharded_aggregate_manifest_matches(manifest, path, dtype, paths, dataset_man
         and manifest.get("row_count", 0) >= 0
         and bool(manifest.get("feature_columns"))
         and os.path.exists(paths["features"])
-        and os.path.exists(paths["metadata"])
+        and metadata_files_exist(paths)
     )
 
 
@@ -4146,36 +4461,28 @@ def inspect_sharded_binary_cache(path, feature_storage, cache_dir, dataset_manif
             raise ValueError(cache_only_missing_message(resolved_cache_dir))
         return None
 
-    metadata_started = time.time()
-    with np.load(paths["metadata"], allow_pickle=False) as metadata:
-        metadata_info = {
-            "symbols": [str(value) for value in metadata["symbols"]],
-            "months": [str(value) for value in metadata["months"]],
-            "symbol_codes": metadata["symbol_codes"],
-            "month_codes": metadata["month_codes"],
-            "month_indices": metadata["month_indices"],
-            "labels": metadata["labels"],
-            "forward_returns": metadata["forward_returns"],
-            "trade_returns": metadata["trade_returns"],
-            "max_future_high_returns": metadata["max_future_high_returns"],
-            "max_future_low_returns": metadata["max_future_low_returns"],
-            "quote_volumes": metadata["quote_volumes"],
-            "open_times": metadata["open_times"],
-        }
-    metadata_load_seconds = time.time() - metadata_started
+    metadata_arrays, metadata_memmaps, metadata_load_seconds = load_metadata_arrays(paths, manifest)
+    metadata_info = {
+        "symbols": [str(value) for value in manifest.get("symbols", [])],
+        "months": [str(value) for value in manifest.get("months", [])],
+        "symbol_codes": metadata_arrays["symbol_codes"],
+        "month_codes": metadata_arrays["month_codes"],
+        "month_indices": metadata_arrays["month_indices"],
+        "labels": metadata_arrays["labels"],
+        "forward_returns": metadata_arrays["forward_returns"],
+        "trade_returns": metadata_arrays["trade_returns"],
+        "max_future_high_returns": metadata_arrays["max_future_high_returns"],
+        "max_future_low_returns": metadata_arrays["max_future_low_returns"],
+        "quote_volumes": metadata_arrays["quote_volumes"],
+        "open_times": metadata_arrays["open_times"],
+    }
     print("Metadata load time: {:.3f}s".format(metadata_load_seconds), flush=True)
 
     row_count = int(manifest["row_count"])
     feature_count = len(manifest["feature_columns"])
-    if len(metadata_info["labels"]) != row_count:
-        raise ValueError("cache metadata row count mismatch for {}".format(paths["metadata"]))
 
     open_times, normalized_count = normalize_open_times_array(metadata_info["open_times"])
     metadata_info["open_times"] = open_times
-    quote_volumes = metadata_info["quote_volumes"]
-    if quote_volumes.size == 0:
-        quote_volumes = None
-    metadata_info["quote_volumes"] = quote_volumes
 
     memmap_started = time.time()
     feature_values = np.memmap(
@@ -4203,6 +4510,7 @@ def inspect_sharded_binary_cache(path, feature_storage, cache_dir, dataset_manif
     return {
         "manifest": manifest,
         "metadata": metadata_info,
+        "metadata_memmaps": metadata_memmaps,
         "features": feature_values,
         "dtype": np.dtype(dtype).name,
         "paths": paths,
@@ -4221,7 +4529,7 @@ def build_sharded_aggregate_cache(path, feature_storage, cache_dir, dataset_mani
     paths = sharded_dataset_cache_paths(path, resolved_cache_dir, dtype)
     clear_cache_files({
         "features": paths["features"],
-        "metadata": paths["metadata"],
+        "metadata_arrays": paths["metadata_arrays"],
         "manifest": paths["manifest"],
     })
     os.makedirs(paths["shard_cache_dir"], exist_ok=True)
@@ -4233,6 +4541,8 @@ def build_sharded_aggregate_cache(path, feature_storage, cache_dir, dataset_mani
     has_returns = False
     total_rows = 0
     all_month_names = set()
+    shard_cache_hits = 0
+    shard_cache_rebuilt = 0
     for shard in shards:
         rows, shard_feature_columns, shard_has_returns = load_cached_compact_rows(
             shard["csv_path"],
@@ -4243,7 +4553,13 @@ def build_sharded_aggregate_cache(path, feature_storage, cache_dir, dataset_mani
             manifest_path=training_manifest_path(path),
             cache_only=False,
             manifest_signature_override=shard_signature_override,
+            use_shard_cache_layout=True,
         )
+        shard_status = CACHE_LOAD_INFO.get("status", "")
+        if shard_status == "hit":
+            shard_cache_hits += 1
+        elif shard_status == "rebuilt":
+            shard_cache_rebuilt += 1
         if feature_columns is None:
             feature_columns = list(shard_feature_columns)
         elif list(shard_feature_columns) != feature_columns:
@@ -4314,61 +4630,7 @@ def build_sharded_aggregate_cache(path, feature_storage, cache_dir, dataset_mani
         close_memmap(feature_values)
         raise
 
-    np.savez_compressed(
-        paths["metadata"],
-        symbols=np.asarray(symbols),
-        months=np.asarray(months),
-        symbol_codes=symbol_codes,
-        month_codes=month_codes,
-        month_indices=month_indices,
-        open_times=open_times,
-        labels=labels_values,
-        forward_returns=forward_returns,
-        trade_returns=trade_returns,
-        max_future_high_returns=max_future_high_returns,
-        max_future_low_returns=max_future_low_returns,
-        quote_volumes=quote_volumes,
-    )
-    manifest = {
-        "version": SHARDED_AGGREGATE_CACHE_VERSION,
-        "dataset_path": os.path.abspath(path),
-        "dataset_manifest_path": os.path.abspath(training_manifest_path(path)),
-        "dataset_manifest_signature": manifest_compatibility_signature(dataset_manifest),
-        "inventory_signature": sharded_inventory_signature(shards),
-        "feature_dtype": np.dtype(dtype).name,
-        "feature_columns": feature_columns,
-        "row_count": int(total_rows),
-        "has_returns": bool(has_returns),
-        "shard_count": len(shards),
-    }
-    with open(paths["manifest"], "w", encoding="utf-8") as handle:
-        json.dump(manifest, handle, indent=2, sort_keys=True)
-    CACHE_LOAD_INFO.clear()
-    CACHE_LOAD_INFO.update({
-        "status": "rebuilt",
-        "paths": paths,
-        "manifest": manifest,
-        "cache_dir": resolved_cache_dir,
-        "feature_dtype": np.dtype(dtype).name,
-        "normalized_microsecond_open_times": NORMALIZED_MICROSECOND_OPEN_TIMES,
-        "sharded_dataset": True,
-    })
-    finish_profile_stage(cache_build_token, rows_processed=total_rows, extra_info=paths["manifest"])
-    metadata = {
-        "symbols": symbols,
-        "months": months,
-        "symbol_codes": symbol_codes,
-        "month_codes": month_codes,
-        "month_indices": month_indices,
-        "labels": labels_values,
-        "forward_returns": forward_returns,
-        "trade_returns": trade_returns,
-        "max_future_high_returns": max_future_high_returns,
-        "max_future_low_returns": max_future_low_returns,
-        "quote_volumes": quote_volumes,
-        "open_times": open_times,
-    }
-    table = CompactTable(
+    aggregate_table = CompactTable(
         symbols,
         months,
         symbol_codes,
@@ -4386,7 +4648,39 @@ def build_sharded_aggregate_cache(path, feature_storage, cache_dir, dataset_mani
         paths["features"],
         False,
     )
-    return CompactRows(table), feature_columns, has_returns
+    write_metadata_arrays(paths, metadata_arrays_from_table(aggregate_table))
+    manifest = {
+        "version": SHARDED_AGGREGATE_CACHE_VERSION,
+        "dataset_path": os.path.abspath(path),
+        "dataset_manifest_path": os.path.abspath(training_manifest_path(path)),
+        "dataset_manifest_signature": manifest_compatibility_signature(dataset_manifest),
+        "inventory_signature": sharded_inventory_signature(shards),
+        "feature_dtype": np.dtype(dtype).name,
+        "feature_columns": feature_columns,
+        "row_count": int(total_rows),
+        "has_returns": bool(has_returns),
+        "quote_volumes_present": True,
+        "symbols": list(symbols),
+        "months": list(months),
+        "shard_count": len(shards),
+        "shard_cache_hits": shard_cache_hits,
+        "shard_cache_rebuilt": shard_cache_rebuilt,
+    }
+    atomic_write_json(paths["manifest"], manifest)
+    CACHE_LOAD_INFO.clear()
+    CACHE_LOAD_INFO.update({
+        "status": "rebuilt",
+        "paths": paths,
+        "manifest": manifest,
+        "cache_dir": resolved_cache_dir,
+        "feature_dtype": np.dtype(dtype).name,
+        "normalized_microsecond_open_times": NORMALIZED_MICROSECOND_OPEN_TIMES,
+        "sharded_dataset": True,
+        "shard_cache_hits": shard_cache_hits,
+        "shard_cache_rebuilt": shard_cache_rebuilt,
+    })
+    finish_profile_stage(cache_build_token, rows_processed=total_rows, extra_info=paths["manifest"])
+    return CompactRows(aggregate_table), feature_columns, has_returns
 
 
 def load_sharded_rows(path, feature_storage="float32", memmap_dir=None, cache_dir=None,
@@ -4429,6 +4723,7 @@ def load_sharded_rows(path, feature_storage="float32", memmap_dir=None, cache_di
                 {name: index for index, name in enumerate(manifest["feature_columns"])},
                 cache_hit["paths"]["features"],
                 False,
+                metadata_memmaps=cache_hit.get("metadata_memmaps"),
             )
             log_memory("Loaded compatible binary cache")
             rows = CompactRows(table)
@@ -4461,6 +4756,7 @@ def load_sharded_rows(path, feature_storage="float32", memmap_dir=None, cache_di
             raise ValueError("shard {} has incompatible feature columns".format(shard["csv_path"]))
         has_returns = has_returns or shard_has_returns
         combined_rows.extend(shard_rows)
+    assign_global_month_indices(combined_rows)
     combined_rows.sort(key=lambda row: (row.symbol, row.month_index, row.open_time))
     validate_rows_against_training_manifest(path, combined_rows, training_manifest)
     return combined_rows, feature_columns or [], has_returns
@@ -4730,6 +5026,18 @@ def actual_trade_returns(rows):
     return values
 
 
+def actual_forward_returns(rows):
+    if is_compact_rows(rows):
+        values = rows.table.forward_returns if rows.indices is None else rows.table.forward_returns[rows.indices]
+        if np is not None:
+            return np.asarray(values, dtype=np.float32)
+        return [float(value) for value in values]
+    values = [row.forward_return for row in rows]
+    if np is not None:
+        return np.asarray(values, dtype=np.float32)
+    return values
+
+
 def regression_targets_for_rows(rows, args):
     target_name = regression_target_name(args)
     values = actual_trade_returns(rows)
@@ -4943,6 +5251,88 @@ def select_ratio_split(rows, args):
     return train_rows, validation_rows, test_rows
 
 
+def row_open_time_array(rows):
+    if is_compact_rows(rows):
+        if rows.indices is None:
+            values = rows.table.open_times
+        else:
+            values = rows.table.open_times[rows.indices]
+        if np is not None:
+            return np.asarray(values, dtype=np.int64)
+        return [int(value) for value in values]
+    return [int(row.open_time) for row in rows]
+
+
+def subset_rows_by_mask(rows, keep_mask):
+    if is_compact_rows(rows):
+        if np is None:
+            raise ValueError("compact row masking requires numpy")
+        mask = np.asarray(keep_mask, dtype=bool)
+        if rows.indices is None:
+            return rows.subset(np.nonzero(mask)[0].astype(np.int32, copy=False))
+        return rows.subset(np.asarray(rows.indices, dtype=np.int32)[mask])
+    return [row for row, keep in zip(rows, keep_mask) if keep]
+
+
+def earliest_open_time(rows):
+    if not rows:
+        return None
+    values = row_open_time_array(rows)
+    if np is not None and isinstance(values, np.ndarray):
+        return int(np.min(values))
+    return min(int(value) for value in values)
+
+
+def apply_split_embargo(train_rows, validation_rows, test_rows, embargo_minutes):
+    summary = {
+        "embargo_minutes": int(max(0, int(embargo_minutes))),
+        "embargo_train_rows_removed": 0,
+        "embargo_validation_rows_removed": 0,
+        "embargo_test_rows_removed": 0,
+    }
+    if summary["embargo_minutes"] <= 0:
+        return train_rows, validation_rows, test_rows, summary
+
+    embargo_ms = int(summary["embargo_minutes"]) * 60 * 1000
+    validation_start = earliest_open_time(validation_rows)
+    test_start = earliest_open_time(test_rows)
+    train_keep = [True] * len(train_rows)
+    validation_keep = [True] * len(validation_rows)
+    test_keep = [True] * len(test_rows)
+
+    def apply_boundary(left_rows, left_keep, right_rows, right_keep, boundary_open_time):
+        if boundary_open_time is None:
+            return
+        left_values = row_open_time_array(left_rows)
+        right_values = row_open_time_array(right_rows)
+        if np is not None and isinstance(left_values, np.ndarray):
+            left_mask = left_values < (boundary_open_time - embargo_ms)
+            right_mask = right_values >= (boundary_open_time + embargo_ms)
+            for index, keep in enumerate(left_mask):
+                if not bool(keep):
+                    left_keep[index] = False
+            for index, keep in enumerate(right_mask):
+                if not bool(keep):
+                    right_keep[index] = False
+            return
+        for index, open_time in enumerate(left_values):
+            if int(open_time) >= boundary_open_time - embargo_ms:
+                left_keep[index] = False
+        for index, open_time in enumerate(right_values):
+            if int(open_time) < boundary_open_time + embargo_ms:
+                right_keep[index] = False
+
+    apply_boundary(train_rows, train_keep, validation_rows, validation_keep, validation_start)
+    apply_boundary(validation_rows, validation_keep, test_rows, test_keep, test_start)
+    embargoed_train = subset_rows_by_mask(train_rows, train_keep)
+    embargoed_validation = subset_rows_by_mask(validation_rows, validation_keep)
+    embargoed_test = subset_rows_by_mask(test_rows, test_keep)
+    summary["embargo_train_rows_removed"] = len(train_rows) - len(embargoed_train)
+    summary["embargo_validation_rows_removed"] = len(validation_rows) - len(embargoed_validation)
+    summary["embargo_test_rows_removed"] = len(test_rows) - len(embargoed_test)
+    return embargoed_train, embargoed_validation, embargoed_test, summary
+
+
 def auc_score_from_rows(probabilities, rows):
     if is_compact_rows(rows):
         y_true = rows.labels_array()
@@ -5046,17 +5436,21 @@ def evaluate_acceptance_tier(summary, tier):
 def walkforward_acceptance_summary(records, args):
     fold_records = [row for row in records if str(row.get("split", "")).startswith("walkforward_fold_")]
     overactive_threshold = int(getattr(args, "overactive_trade_threshold", 150))
+    acceptance_tier = getattr(args, "acceptance_tier", "none")
     if not fold_records:
-        acceptance_tier = getattr(args, "acceptance_tier", "none")
-        gated = acceptance_tier != "none" or getattr(args, "require_positive_walkforward", False)
         return {
             "walkforward_total_folds": 0,
+            "walkforward_folds_total": 0,
             "walkforward_profitable_folds": 0,
+            "walkforward_folds_profitable": 0,
+            "walkforward_folds_active": 0,
             "walkforward_profitable_fold_rate": 0.0,
             "walkforward_median_portfolio_return": 0.0,
             "walkforward_mean_portfolio_return": 0.0,
             "walkforward_min_portfolio_return": 0.0,
             "walkforward_max_portfolio_return": 0.0,
+            "walkforward_worst_fold_return": 0.0,
+            "walkforward_worst_fold_drawdown": 0.0,
             "walkforward_total_portfolio_profit": 0.0,
             "walkforward_total_predicted_trades": 0,
             "walkforward_mean_precision": 0.0,
@@ -5077,14 +5471,16 @@ def walkforward_acceptance_summary(records, args):
             "overactive_losing_folds": 0,
         "overactive_losing_fold_rate": 0.0,
         "avg_trades_in_losing_active_folds": 0.0,
-        "avg_trades_in_profitable_active_folds": 0.0,
-        "meta_filter_enabled_folds": 0,
-        "meta_filter_disabled_folds": 0,
-        "acceptance_tier": acceptance_tier,
-        "accepted": 0 if gated else 1,
-            "rejection_reason": "no_walkforward_folds" if gated else "",
-            "failed_acceptance_checks": "no_walkforward_folds" if gated else "",
-            "strategy_strength": "rejected" if gated else "not_checked",
+            "avg_trades_in_profitable_active_folds": 0.0,
+            "meta_filter_enabled_folds": 0,
+            "meta_filter_disabled_folds": 0,
+            "acceptance_tier": acceptance_tier,
+            "walkforward_acceptance_passed": 0,
+            "walkforward_acceptance_reasons": "no_walkforward_folds",
+            "accepted": 0 if acceptance_tier != "none" or getattr(args, "require_positive_walkforward", False) else 1,
+            "rejection_reason": "no_walkforward_folds" if acceptance_tier != "none" or getattr(args, "require_positive_walkforward", False) else "",
+            "failed_acceptance_checks": "no_walkforward_folds" if acceptance_tier != "none" or getattr(args, "require_positive_walkforward", False) else "",
+            "strategy_strength": "rejected" if acceptance_tier != "none" or getattr(args, "require_positive_walkforward", False) else "not_checked",
         }
 
     profits = [float(row.get("portfolio_profit", 0.0)) for row in fold_records]
@@ -5109,12 +5505,17 @@ def walkforward_acceptance_summary(records, args):
 
     summary = {
         "walkforward_total_folds": total_folds,
+        "walkforward_folds_total": total_folds,
         "walkforward_profitable_folds": profitable_folds,
+        "walkforward_folds_profitable": profitable_folds,
+        "walkforward_folds_active": active_fold_count,
         "walkforward_profitable_fold_rate": profitable_folds / float(total_folds) if total_folds else 0.0,
         "walkforward_median_portfolio_return": median(returns),
         "walkforward_mean_portfolio_return": sum(returns) / float(total_folds) if total_folds else 0.0,
         "walkforward_min_portfolio_return": min(returns) if returns else 0.0,
         "walkforward_max_portfolio_return": max(returns) if returns else 0.0,
+        "walkforward_worst_fold_return": min(returns) if returns else 0.0,
+        "walkforward_worst_fold_drawdown": max(drawdowns) if drawdowns else 0.0,
         "walkforward_total_portfolio_profit": sum(profits),
         "walkforward_total_predicted_trades": sum(int(row.get("predicted_trades", 0)) for row in fold_records),
         "walkforward_mean_precision": sum(precisions) / float(total_folds) if total_folds else 0.0,
@@ -5144,14 +5545,41 @@ def walkforward_acceptance_summary(records, args):
         ),
         "meta_filter_enabled_folds": meta_filter_enabled_folds,
         "meta_filter_disabled_folds": total_folds - meta_filter_enabled_folds,
-        "acceptance_tier": getattr(args, "acceptance_tier", "none"),
+        "acceptance_tier": acceptance_tier,
+        "walkforward_acceptance_passed": 1,
+        "walkforward_acceptance_reasons": "",
         "accepted": 1,
         "rejection_reason": "",
         "failed_acceptance_checks": "",
         "strategy_strength": "not_checked",
     }
 
-    if getattr(args, "acceptance_tier", "none") != "none":
+    gate_failures = []
+    if summary["walkforward_profitable_fold_rate"] < getattr(args, "min_profitable_fold_rate", 0.0):
+        gate_failures.append(
+            "profitable_fold_rate {:.4f} < {:.4f}".format(
+                summary["walkforward_profitable_fold_rate"],
+                getattr(args, "min_profitable_fold_rate", 0.0),
+            )
+        )
+    if summary["walkforward_median_portfolio_return"] < getattr(args, "min_median_fold_return", -999.0):
+        gate_failures.append(
+            "median_fold_return {:.4f} < {:.4f}".format(
+                summary["walkforward_median_portfolio_return"],
+                getattr(args, "min_median_fold_return", -999.0),
+            )
+        )
+    if summary["walkforward_worst_fold_drawdown"] > getattr(args, "max_worst_fold_drawdown", 1.0):
+        gate_failures.append(
+            "worst_fold_drawdown {:.4f} > {:.4f}".format(
+                summary["walkforward_worst_fold_drawdown"],
+                getattr(args, "max_worst_fold_drawdown", 1.0),
+            )
+        )
+    summary["walkforward_acceptance_passed"] = 0 if gate_failures else 1
+    summary["walkforward_acceptance_reasons"] = "; ".join(gate_failures)
+
+    if acceptance_tier != "none":
         failures = evaluate_acceptance_tier(summary, args.acceptance_tier)
         if failures:
             summary["accepted"] = 0
@@ -5161,38 +5589,9 @@ def walkforward_acceptance_summary(records, args):
         else:
             summary["strategy_strength"] = "{}_pass".format(args.acceptance_tier)
     elif getattr(args, "require_positive_walkforward", False):
-        reasons = []
-        if summary["walkforward_profitable_fold_rate"] < args.min_profitable_fold_rate:
-            reasons.append(
-                "profitable_fold_rate {:.4f} < {:.4f}".format(
-                    summary["walkforward_profitable_fold_rate"],
-                    args.min_profitable_fold_rate,
-                )
-            )
-        if summary["walkforward_median_portfolio_return"] < args.min_median_fold_return:
-            reasons.append(
-                "median_fold_return {:.4f} < {:.4f}".format(
-                    summary["walkforward_median_portfolio_return"],
-                    args.min_median_fold_return,
-                )
-            )
-        if summary["walkforward_mean_portfolio_return"] < args.min_mean_fold_return:
-            reasons.append(
-                "mean_fold_return {:.4f} < {:.4f}".format(
-                    summary["walkforward_mean_portfolio_return"],
-                    args.min_mean_fold_return,
-                )
-            )
-        if summary["walkforward_max_drawdown_worst"] > args.max_worst_fold_drawdown:
-            reasons.append(
-                "worst_fold_drawdown {:.4f} > {:.4f}".format(
-                    summary["walkforward_max_drawdown_worst"],
-                    args.max_worst_fold_drawdown,
-                )
-            )
-        if reasons:
+        if gate_failures:
             summary["accepted"] = 0
-            summary["rejection_reason"] = "; ".join(reasons)
+            summary["rejection_reason"] = "; ".join(gate_failures)
             summary["failed_acceptance_checks"] = summary["rejection_reason"]
     return summary
 
@@ -5235,10 +5634,19 @@ def single_month_label(rows):
 WALKFORWARD_DIAGNOSTIC_COLUMNS = [
     "fold_index",
     "split",
+    "train_start",
+    "train_end",
+    "validation_start",
+    "validation_end",
+    "test_start",
+    "test_end",
     "train_start_month",
     "train_end_month",
     "validation_month",
     "test_month",
+    "rows_train",
+    "rows_validation",
+    "rows_test",
     "train_rows",
     "validation_rows",
     "test_rows",
@@ -5267,11 +5675,15 @@ WALKFORWARD_DIAGNOSTIC_COLUMNS = [
     "median_expected_value",
     "average_trade_return",
     "median_trade_return",
+    "avg_trade_return",
+    "total_profit_after_fee",
+    "total_profit_after_fee_and_slippage",
     "average_profit_after_fee_and_slippage",
     "average_profit_per_trade",
     "portfolio_profit",
     "portfolio_return",
     "max_capital_drawdown",
+    "profit_factor",
     "worst_trade",
     "average_position_size",
     "median_position_size",
@@ -5311,6 +5723,11 @@ WALKFORWARD_DIAGNOSTIC_COLUMNS = [
     "inactive_blocker_gap",
     "inactive_closest_symbol",
     "inactive_promising_fold",
+    "rejected_reason",
+    "embargo_minutes",
+    "embargo_train_rows_removed",
+    "embargo_validation_rows_removed",
+    "embargo_test_rows_removed",
     "regression_calibration",
     "regression_calibration_a",
     "regression_calibration_b",
@@ -5376,19 +5793,31 @@ WALKFORWARD_DIAGNOSTIC_COLUMNS = [
 def build_walkforward_diagnostic_record(fold_index, split_name, train_rows, validation_rows, test_rows,
                                         selected_threshold, selected_score, metrics, calibration_info,
                                         validation_metrics,
-                                        args):
+                                        args, embargo_summary=None):
     train_start_month, train_end_month = month_range_bounds(train_rows)
+    validation_start_month, validation_end_month = month_range_bounds(validation_rows)
+    test_start_month, test_end_month = month_range_bounds(test_rows)
     predicted_trades = int(metrics.get("predicted_trades", 0))
     portfolio_profit = float(metrics.get("portfolio_profit", 0.0))
     calibration_info = calibration_info or {}
     validation_metrics = validation_metrics or {}
+    embargo_summary = embargo_summary or {}
     return {
         "fold_index": fold_index,
         "split": split_name,
+        "train_start": train_start_month,
+        "train_end": train_end_month,
+        "validation_start": validation_start_month,
+        "validation_end": validation_end_month,
+        "test_start": test_start_month,
+        "test_end": test_end_month,
         "train_start_month": train_start_month,
         "train_end_month": train_end_month,
         "validation_month": single_month_label(validation_rows),
         "test_month": single_month_label(test_rows),
+        "rows_train": len(train_rows),
+        "rows_validation": len(validation_rows),
+        "rows_test": len(test_rows),
         "train_rows": len(train_rows),
         "validation_rows": len(validation_rows),
         "test_rows": len(test_rows),
@@ -5417,11 +5846,15 @@ def build_walkforward_diagnostic_record(fold_index, split_name, train_rows, vali
         "median_expected_value": metrics.get("median_expected_value", 0.0),
         "average_trade_return": metrics.get("average_trade_return", 0.0),
         "median_trade_return": metrics.get("median_trade_return", 0.0),
+        "avg_trade_return": metrics.get("average_trade_return", 0.0),
+        "total_profit_after_fee": metrics.get("total_profit_after_fee", 0.0),
+        "total_profit_after_fee_and_slippage": metrics.get("total_profit_after_fee_and_slippage", 0.0),
         "average_profit_after_fee_and_slippage": metrics.get("average_profit_after_fee_and_slippage", 0.0),
         "average_profit_per_trade": metrics.get("average_profit_per_trade", 0.0),
         "portfolio_profit": portfolio_profit,
         "portfolio_return": metrics.get("portfolio_return", 0.0),
         "max_capital_drawdown": metrics.get("max_capital_drawdown", 0.0),
+        "profit_factor": metrics.get("profit_factor", 0.0),
         "worst_trade": metrics.get("worst_trade", 0.0),
         "average_position_size": metrics.get("average_position_size", 0.0),
         "median_position_size": metrics.get("median_position_size", 0.0),
@@ -5467,6 +5900,11 @@ def build_walkforward_diagnostic_record(fold_index, split_name, train_rows, vali
         "inactive_blocker_gap": metrics.get("inactive_blocker_gap", 0.0),
         "inactive_closest_symbol": metrics.get("inactive_closest_symbol", ""),
         "inactive_promising_fold": metrics.get("inactive_promising_fold", 0),
+        "rejected_reason": metrics.get("rejected_reason", ""),
+        "embargo_minutes": embargo_summary.get("embargo_minutes", 0),
+        "embargo_train_rows_removed": embargo_summary.get("embargo_train_rows_removed", 0),
+        "embargo_validation_rows_removed": embargo_summary.get("embargo_validation_rows_removed", 0),
+        "embargo_test_rows_removed": embargo_summary.get("embargo_test_rows_removed", 0),
         "regression_calibration": calibration_info.get("regression_calibration", "none"),
         "regression_calibration_a": calibration_info.get("regression_calibration_a", 1.0),
         "regression_calibration_b": calibration_info.get("regression_calibration_b", 0.0),
@@ -5675,6 +6113,17 @@ def normalize_prediction_bundle(predictions):
     return build_prediction_bundle(probability=predictions, calibrated_probability=predictions)
 
 
+def resolve_execution_fee(fee, args):
+    mode = getattr(args, "fee_mode", "fixed") if args is not None else "fixed"
+    if mode == "maker":
+        maker_fee = getattr(args, "maker_fee", None)
+        return float(fee if maker_fee is None else maker_fee)
+    if mode == "taker":
+        taker_fee = getattr(args, "taker_fee", None)
+        return float(fee if taker_fee is None else taker_fee)
+    return float(fee)
+
+
 def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_capital,
                         max_position_fraction, max_volume_fraction, max_trades_per_period,
                         trade_period_minutes, holding_period_minutes,
@@ -5715,17 +6164,36 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
         "daily_loss_limit_blocked": 0,
         "daily_drawdown_limit_blocked": 0,
         "period_trade_limit_blocked": 0,
+        "min_order_notional_blocked": 0,
+        "max_open_positions_blocked": 0,
+        "daily_loss_fraction_blocked": 0,
+        "cooldown_after_loss_blocked": 0,
+        "lot_size_adjusted": 0,
+        "tick_size_adjusted": 0,
+        "partial_fill_adjusted": 0,
+        "latency_penalty_adjusted": 0,
     }
     entries_by_day = {}
     realized_pnl_by_day = {}
     realized_losing_trades_by_day = {}
     pause_until_minute_by_day = {}
+    symbol_pause_until_minute = {}
     fold_trade_count = 0
     use_expected_value_ranking = (
         trade_selection == "topk_ev"
         and bundle.get("probability") is not None
         and objective_mode == "classification"
     )
+    effective_fee = resolve_execution_fee(fee, hybrid_runtime_args)
+    position_sizing_mode = getattr(hybrid_runtime_args, "position_sizing_mode", "fixed_fraction") if hybrid_runtime_args is not None else "fixed_fraction"
+    min_order_notional = max(0.0, float(getattr(hybrid_runtime_args, "min_order_notional", 0.0))) if hybrid_runtime_args is not None else 0.0
+    lot_size_step = max(0.0, float(getattr(hybrid_runtime_args, "lot_size_step", 0.0))) if hybrid_runtime_args is not None else 0.0
+    tick_size = max(0.0, float(getattr(hybrid_runtime_args, "tick_size", 0.0))) if hybrid_runtime_args is not None else 0.0
+    latency_penalty = max(0.0, float(getattr(hybrid_runtime_args, "latency_penalty_bps", 0.0))) / 10000.0 if hybrid_runtime_args is not None else 0.0
+    partial_fill_mode = getattr(hybrid_runtime_args, "partial_fill_mode", "none") if hybrid_runtime_args is not None else "none"
+    max_open_positions = max(0, int(getattr(hybrid_runtime_args, "max_open_positions", 0))) if hybrid_runtime_args is not None else 0
+    max_daily_loss_fraction = max(0.0, float(getattr(hybrid_runtime_args, "max_daily_loss_fraction", 0.0))) if hybrid_runtime_args is not None else 0.0
+    cooldown_after_loss_minutes = max(0, int(getattr(hybrid_runtime_args, "cooldown_after_loss_minutes", 0))) if hybrid_runtime_args is not None else 0
     hybrid_score_mode = getattr(hybrid_runtime_args, "hybrid_score_mode", "basic") if hybrid_runtime_args is not None else "basic"
     hybrid_uncertainty_penalty = getattr(hybrid_runtime_args, "hybrid_uncertainty_penalty", 0.0) if hybrid_runtime_args is not None else 0.0
     meta_filter_mode = getattr(hybrid_runtime_args, "meta_filter", "none") if hybrid_runtime_args is not None else "none"
@@ -5765,13 +6233,18 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
     def release_positions(until_minute):
         nonlocal cash, invested, peak_equity, max_drawdown
         while open_positions and open_positions[0][0] <= until_minute:
-            release_minute, position_size, pnl, entry_day_id = open_positions.popleft()
+            release_minute, position_size, pnl, entry_day_id, symbol_name = open_positions.popleft()
             invested -= position_size
             cash += position_size + pnl
             day_id = entry_day_id if entry_day_id is not None else minute_day_id(release_minute)
             realized_pnl_by_day[day_id] = realized_pnl_by_day.get(day_id, 0.0) + pnl
             if pnl < 0.0:
                 realized_losing_trades_by_day[day_id] = realized_losing_trades_by_day.get(day_id, 0) + 1
+                if cooldown_after_loss_minutes > 0 and symbol_name:
+                    symbol_pause_until_minute[symbol_name] = max(
+                        symbol_pause_until_minute.get(symbol_name, 0),
+                        release_minute + cooldown_after_loss_minutes,
+                    )
             if max_daily_drawdown > 0.0 and realized_pnl_by_day.get(day_id, 0.0) <= -max_daily_drawdown * initial_capital:
                 if pause_after_drawdown_minutes > 0:
                     pause_until_minute_by_day[day_id] = max(
@@ -5783,13 +6256,43 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
                         pause_until_minute_by_day.get(day_id, 0),
                         (day_id + 1) * 24 * 60,
                     )
+            if max_daily_loss_fraction > 0.0 and realized_pnl_by_day.get(day_id, 0.0) <= -max_daily_loss_fraction * initial_capital:
+                pause_until_minute_by_day[day_id] = max(
+                    pause_until_minute_by_day.get(day_id, 0),
+                    (day_id + 1) * 24 * 60,
+                )
             equity = cash + invested
             peak_equity = max(peak_equity, equity)
             max_drawdown = max(max_drawdown, peak_equity - equity)
 
+    def position_size_multiplier(probability_value, threshold_value, expected_value, volatility_value):
+        if position_sizing_mode == "confidence_weighted":
+            denominator = max(1e-9, 1.0 - float(threshold_value))
+            return max(0.0, min(1.0, (float(probability_value) - float(threshold_value)) / denominator))
+        if position_sizing_mode == "volatility_adjusted":
+            reference = max(1e-9, float(getattr(hybrid_runtime_args, "volatility_high_threshold", 0.02)) if hybrid_runtime_args is not None else 0.02)
+            relative_volatility = max(0.0, float(volatility_value)) / reference
+            return max(0.1, 1.0 / (1.0 + relative_volatility))
+        if position_sizing_mode == "ev_weighted":
+            reference = max(1e-9, float(getattr(hybrid_runtime_args, "upside_target", 0.05)) if hybrid_runtime_args is not None else 0.05)
+            return max(0.0, min(1.0, max(0.0, float(expected_value)) / reference))
+        return 1.0
+
     def execute_candidate(item, selection_rank, selected_by_topk_flag):
         nonlocal cash, invested, fold_trade_count
-        local_index, minute, day_id, quote_volume_value, trade_return_value, expected_value, trade_score, calibrated_probability, meta_probability = item
+        (
+            local_index,
+            minute,
+            day_id,
+            symbol_name,
+            quote_volume_value,
+            trade_return_value,
+            expected_value,
+            trade_score,
+            calibrated_probability,
+            meta_probability,
+            volatility_value,
+        ) = item
         release_positions(minute)
         if meta_filter_active and meta_probability < meta_filter_min_probability:
             return
@@ -5804,7 +6307,17 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
             return
         pause_until = pause_until_minute_by_day.get(day_id, 0)
         if pause_until and minute < pause_until:
-            record_block(local_index, "daily_drawdown_limit_blocked")
+            if max_daily_loss_fraction > 0.0 and realized_pnl_by_day.get(day_id, 0.0) <= -max_daily_loss_fraction * initial_capital:
+                record_block(local_index, "daily_loss_fraction_blocked")
+            else:
+                record_block(local_index, "daily_drawdown_limit_blocked")
+            return
+        symbol_pause_until = symbol_pause_until_minute.get(symbol_name, 0)
+        if symbol_pause_until and minute < symbol_pause_until:
+            record_block(local_index, "cooldown_after_loss_blocked")
+            return
+        if max_open_positions > 0 and len(open_positions) >= max_open_positions:
+            record_block(local_index, "max_open_positions_blocked")
             return
         if max_trades_per_period > 0:
             while recent_entry_minutes and recent_entry_minutes[0] <= minute - trade_period_minutes:
@@ -5814,14 +6327,39 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
                 return
         volume_cap = quote_volume_value * max_volume_fraction
         equity_position_cap = (cash + invested) * max_position_fraction
-        position_size = min(equity_position_cap, volume_cap, cash)
+        threshold_value = row_probability_threshold(threshold, local_index)
+        desired_position_size = min(equity_position_cap, cash)
+        desired_position_size *= position_size_multiplier(
+            calibrated_probability,
+            threshold_value,
+            expected_value,
+            volatility_value,
+        )
+        if partial_fill_mode == "volume_fraction" and volume_cap + 1e-12 < desired_position_size:
+            blocked_counts["partial_fill_adjusted"] += 1
+        position_size = min(desired_position_size, volume_cap, cash)
+        if lot_size_step > 0.0 and position_size > 0.0:
+            rounded = math.floor(position_size / lot_size_step) * lot_size_step
+            if rounded + 1e-12 < position_size:
+                blocked_counts["lot_size_adjusted"] += 1
+            position_size = rounded
+        if tick_size > 0.0 and position_size > 0.0:
+            rounded = math.floor(position_size / tick_size) * tick_size
+            if rounded + 1e-12 < position_size:
+                blocked_counts["tick_size_adjusted"] += 1
+            position_size = rounded
+        if min_order_notional > 0.0 and position_size + 1e-12 < min_order_notional:
+            record_block(local_index, "min_order_notional_blocked")
+            return
         if position_size <= 0.0:
             return
         cash -= position_size
         invested += position_size
-        net_return = trade_return_value - fee - slippage
+        net_return = trade_return_value - effective_fee - slippage - latency_penalty
+        if latency_penalty > 0.0:
+            blocked_counts["latency_penalty_adjusted"] += 1
         pnl = position_size * net_return
-        open_positions.append((minute + holding_period_minutes, position_size, pnl, day_id))
+        open_positions.append((minute + holding_period_minutes, position_size, pnl, day_id, symbol_name))
         if max_trades_per_period > 0:
             recent_entry_minutes.append(minute)
         fold_trade_count += 1
@@ -5841,9 +6379,9 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
             return
         if trade_selection in ("topk_ev", "topk_score"):
             if use_expected_value_ranking:
-                ranked = sorted(bucket, key=lambda item: (-item[5], -item[7]))
+                ranked = sorted(bucket, key=lambda item: (-item[6], -item[8]))
             else:
-                ranked = sorted(bucket, key=lambda item: (-item[6], -item[7]))
+                ranked = sorted(bucket, key=lambda item: (-item[7], -item[8]))
             limit = max(0, int(top_k_per_minute))
             if limit <= 0:
                 chosen = ranked
@@ -5852,17 +6390,17 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
             else:
                 chosen = ranked[:limit]
             if use_expected_value_ranking:
-                chosen = sorted(chosen, key=lambda item: (-item[7], -item[6]))
+                chosen = sorted(chosen, key=lambda item: (-item[8], -item[7]))
             else:
-                chosen = sorted(chosen, key=lambda item: (-item[6], -item[7]))
+                chosen = sorted(chosen, key=lambda item: (-item[7], -item[8]))
             for rank, item in enumerate(chosen, 1):
                 execute_candidate(item, rank, 1)
             return
 
         if objective_mode == "classification":
-            ordered = sorted(bucket, key=lambda item: (-item[7], -item[6]))
+            ordered = sorted(bucket, key=lambda item: (-item[8], -item[7]))
         else:
-            ordered = sorted(bucket, key=lambda item: (-item[6], -item[7]))
+            ordered = sorted(bucket, key=lambda item: (-item[7], -item[8]))
         for item in ordered:
             execute_candidate(item, 1, 0)
 
@@ -5958,7 +6496,8 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
 
                 for offset, local_index in enumerate(signal_indices):
                     local_index = int(local_index)
-                    if allowed_symbols is not None and row_symbol_name(rows, local_index) not in allowed_symbols:
+                    symbol_name = row_symbol_name(rows, local_index)
+                    if allowed_symbols is not None and symbol_name not in allowed_symbols:
                         continue
                     raw_selected[local_index] = 1
                     position = int(absolute_positions[offset])
@@ -5966,12 +6505,14 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
                         local_index,
                         int(signal_minutes[offset]),
                         int(signal_day_ids[offset]),
+                        symbol_name,
                         compact_quote_volume(rows.table, position),
                         float(rows.table.trade_returns[position]),
                         float(selected_expected_values[offset]),
                         float(selected_trade_scores[offset]),
                         float(selected_calibrated[offset]),
                         meta_probability_value(bundle, local_index),
+                        feature_value(rows, local_index, "rolling_volatility_60m", feature_value(rows, local_index, "btc_volatility_60m", 0.0)),
                     ))
         else:
             for local_index in range(len(rows)):
@@ -5993,17 +6534,20 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
                     continue
                 position = local_index if rows.indices is None else int(rows.indices[local_index])
                 minute = open_time_minute(rows.table.open_times[position])
+                symbol_name = row_symbol_name(rows, local_index)
                 raw_selected[local_index] = 1
                 push_candidate((
                     int(local_index),
                     minute,
                     minute_day_id(minute),
+                    symbol_name,
                     compact_quote_volume(rows.table, position),
                     float(rows.table.trade_returns[position]),
                     expected_value_for_bundle(bundle, local_index, upside_target, downside_stop, fee, slippage, hybrid_runtime_args),
                     trade_score_value(bundle, local_index, trade_score_name, upside_target, downside_stop, fee, slippage, hybrid_score_mode, hybrid_uncertainty_penalty, hybrid_runtime_args),
                     calibrated_probability_value(bundle, local_index),
                     meta_probability_value(bundle, local_index),
+                    feature_value(rows, local_index, "rolling_volatility_60m", feature_value(rows, local_index, "btc_volatility_60m", 0.0)),
                 ))
     else:
         for local_index in range(len(rows)):
@@ -6024,17 +6568,20 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
             if allowed_symbols is not None and row_symbol_name(rows, local_index) not in allowed_symbols:
                 continue
             minute = open_time_minute(rows[local_index].open_time)
+            symbol_name = row_symbol_name(rows, local_index)
             raw_selected[local_index] = 1
             push_candidate((
                 local_index,
                 minute,
                 minute_day_id(minute),
+                symbol_name,
                 rows[local_index].quote_volume,
                 rows[local_index].trade_return,
                 expected_value_for_bundle(bundle, local_index, upside_target, downside_stop, fee, slippage, hybrid_runtime_args),
                 trade_score_value(bundle, local_index, trade_score_name, upside_target, downside_stop, fee, slippage, hybrid_score_mode, hybrid_uncertainty_penalty, hybrid_runtime_args),
                 calibrated_probability_value(bundle, local_index),
                 meta_probability_value(bundle, local_index),
+                feature_value(rows, local_index, "rolling_volatility_60m", feature_value(rows, local_index, "btc_volatility_60m", 0.0)),
             ))
 
     flush_bucket(current_bucket)
@@ -6062,23 +6609,45 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
         "ending_capital": cash,
         "portfolio_profit": portfolio_profit,
         "portfolio_return": portfolio_profit / initial_capital,
+        "applied_fee": effective_fee,
+        "position_sizing_mode": position_sizing_mode,
         "max_capital_drawdown": max_drawdown,
         "average_position_size": sum(position_sizes) / len(position_sizes) if position_sizes else 0.0,
         "median_position_size": median(position_sizes),
+        "min_position_size": min(position_sizes) if position_sizes else 0.0,
+        "max_position_size": max(position_sizes) if position_sizes else 0.0,
         "average_profit_per_trade": portfolio_profit / len(position_sizes) if position_sizes else 0.0,
         "worst_trade": min(executed_pnls.values()) if executed_pnls else 0.0,
         "daily_trade_limit_blocked": blocked_counts["daily_trade_limit_blocked"],
         "fold_trade_limit_blocked": blocked_counts["fold_trade_limit_blocked"],
         "daily_loss_limit_blocked": blocked_counts["daily_loss_limit_blocked"],
         "daily_drawdown_limit_blocked": blocked_counts["daily_drawdown_limit_blocked"],
-        "blocked_trades_total": sum(blocked_counts.values()),
+        "min_order_notional_blocked": blocked_counts["min_order_notional_blocked"],
+        "max_open_positions_blocked": blocked_counts["max_open_positions_blocked"],
+        "daily_loss_fraction_blocked": blocked_counts["daily_loss_fraction_blocked"],
+        "cooldown_after_loss_blocked": blocked_counts["cooldown_after_loss_blocked"],
+        "lot_size_adjusted": blocked_counts["lot_size_adjusted"],
+        "tick_size_adjusted": blocked_counts["tick_size_adjusted"],
+        "partial_fill_adjusted": blocked_counts["partial_fill_adjusted"],
+        "latency_penalty_adjusted": blocked_counts["latency_penalty_adjusted"],
+        "blocked_trades_total": (
+            blocked_counts["daily_trade_limit_blocked"]
+            + blocked_counts["fold_trade_limit_blocked"]
+            + blocked_counts["daily_loss_limit_blocked"]
+            + blocked_counts["daily_drawdown_limit_blocked"]
+            + blocked_counts["period_trade_limit_blocked"]
+            + blocked_counts["min_order_notional_blocked"]
+            + blocked_counts["max_open_positions_blocked"]
+            + blocked_counts["daily_loss_fraction_blocked"]
+            + blocked_counts["cooldown_after_loss_blocked"]
+        ),
         "blocked_by_trade_frequency": (
             blocked_counts["daily_trade_limit_blocked"]
             + blocked_counts["fold_trade_limit_blocked"]
             + blocked_counts["daily_loss_limit_blocked"]
             + blocked_counts["period_trade_limit_blocked"]
         ),
-        "blocked_by_drawdown": blocked_counts["daily_drawdown_limit_blocked"],
+        "blocked_by_drawdown": blocked_counts["daily_drawdown_limit_blocked"] + blocked_counts["daily_loss_fraction_blocked"],
         "max_trades_in_any_day": max_trades_in_any_day,
         "max_trades_in_any_fold": fold_trade_count,
         "trades_per_active_day": float(fold_trade_count) / active_days if active_days else 0.0,
@@ -6314,6 +6883,7 @@ def evaluate_compact(rows, predictions, threshold, fee, slippage, compute_auc=Tr
     accuracy = float(tp + tn) / total if total else 0.0
     f1 = 2.0 * precision * recall / (precision + recall) if precision + recall else 0.0
     trade_count = float(predicted_trades) if predicted_trades else 1.0
+    calibration_report = calibration_report_for_rows(rows, bundle, threshold)
 
     metrics = {
         "rows": total,
@@ -6349,8 +6919,12 @@ def evaluate_compact(rows, predictions, threshold, fee, slippage, compute_auc=Tr
         "ending_capital": execution["ending_capital"],
         "portfolio_profit": execution["portfolio_profit"],
         "portfolio_return": execution["portfolio_return"],
+        "applied_fee": execution.get("applied_fee", fee),
+        "position_sizing_mode": execution.get("position_sizing_mode", getattr(hybrid_runtime_args, "position_sizing_mode", "fixed_fraction") if hybrid_runtime_args is not None else "fixed_fraction"),
         "average_position_size": execution["average_position_size"],
         "median_position_size": execution["median_position_size"],
+        "min_position_size": execution.get("min_position_size", 0.0),
+        "max_position_size": execution.get("max_position_size", 0.0),
         "average_profit_per_trade": execution["average_profit_per_trade"],
         "worst_trade": execution["worst_trade"],
         "max_capital_drawdown": execution["max_capital_drawdown"],
@@ -6359,6 +6933,14 @@ def evaluate_compact(rows, predictions, threshold, fee, slippage, compute_auc=Tr
         "fold_trade_limit_blocked": execution["fold_trade_limit_blocked"],
         "daily_loss_limit_blocked": execution["daily_loss_limit_blocked"],
         "daily_drawdown_limit_blocked": execution["daily_drawdown_limit_blocked"],
+        "min_order_notional_blocked": execution.get("min_order_notional_blocked", 0),
+        "max_open_positions_blocked": execution.get("max_open_positions_blocked", 0),
+        "daily_loss_fraction_blocked": execution.get("daily_loss_fraction_blocked", 0),
+        "cooldown_after_loss_blocked": execution.get("cooldown_after_loss_blocked", 0),
+        "lot_size_adjusted": execution.get("lot_size_adjusted", 0),
+        "tick_size_adjusted": execution.get("tick_size_adjusted", 0),
+        "partial_fill_adjusted": execution.get("partial_fill_adjusted", 0),
+        "latency_penalty_adjusted": execution.get("latency_penalty_adjusted", 0),
         "blocked_trades_total": execution["blocked_trades_total"],
         "blocked_by_trade_frequency": execution["blocked_by_trade_frequency"],
         "blocked_by_drawdown": execution["blocked_by_drawdown"],
@@ -6371,9 +6953,13 @@ def evaluate_compact(rows, predictions, threshold, fee, slippage, compute_auc=Tr
         "worst_day_profit": execution["worst_day_profit"],
         "best_day_profit": execution["best_day_profit"],
         "normalized_microsecond_open_times": NORMALIZED_MICROSECOND_OPEN_TIMES,
+        "brier_score": calibration_report.get("brier_score", 0.0),
+        "expected_calibration_error": calibration_report.get("expected_calibration_error", 0.0),
+        "max_calibration_error": calibration_report.get("max_calibration_error", 0.0),
     }
     metrics.update(raw_metrics)
     metrics.update(execution_frequency_metrics(execution))
+    metrics["calibration_report"] = calibration_report
     return metrics
 
 
@@ -6528,6 +7114,7 @@ def evaluate(rows, predictions, threshold, fee, slippage, compute_auc=True, init
     accuracy = float(tp + tn) / total if total else 0.0
     f1 = 2.0 * precision * recall / (precision + recall) if precision + recall else 0.0
     trade_count = float(predicted_trades) if predicted_trades else 1.0
+    calibration_report = calibration_report_for_rows(rows, bundle, threshold)
 
     metrics = {
         "rows": total,
@@ -6563,8 +7150,12 @@ def evaluate(rows, predictions, threshold, fee, slippage, compute_auc=True, init
         "ending_capital": execution["ending_capital"],
         "portfolio_profit": execution["portfolio_profit"],
         "portfolio_return": execution["portfolio_return"],
+        "applied_fee": execution.get("applied_fee", fee),
+        "position_sizing_mode": execution.get("position_sizing_mode", getattr(hybrid_runtime_args, "position_sizing_mode", "fixed_fraction") if hybrid_runtime_args is not None else "fixed_fraction"),
         "average_position_size": execution["average_position_size"],
         "median_position_size": execution["median_position_size"],
+        "min_position_size": execution.get("min_position_size", 0.0),
+        "max_position_size": execution.get("max_position_size", 0.0),
         "average_profit_per_trade": execution["average_profit_per_trade"],
         "worst_trade": execution["worst_trade"],
         "max_capital_drawdown": execution["max_capital_drawdown"],
@@ -6573,6 +7164,14 @@ def evaluate(rows, predictions, threshold, fee, slippage, compute_auc=True, init
         "fold_trade_limit_blocked": execution["fold_trade_limit_blocked"],
         "daily_loss_limit_blocked": execution["daily_loss_limit_blocked"],
         "daily_drawdown_limit_blocked": execution["daily_drawdown_limit_blocked"],
+        "min_order_notional_blocked": execution.get("min_order_notional_blocked", 0),
+        "max_open_positions_blocked": execution.get("max_open_positions_blocked", 0),
+        "daily_loss_fraction_blocked": execution.get("daily_loss_fraction_blocked", 0),
+        "cooldown_after_loss_blocked": execution.get("cooldown_after_loss_blocked", 0),
+        "lot_size_adjusted": execution.get("lot_size_adjusted", 0),
+        "tick_size_adjusted": execution.get("tick_size_adjusted", 0),
+        "partial_fill_adjusted": execution.get("partial_fill_adjusted", 0),
+        "latency_penalty_adjusted": execution.get("latency_penalty_adjusted", 0),
         "blocked_trades_total": execution["blocked_trades_total"],
         "blocked_by_trade_frequency": execution["blocked_by_trade_frequency"],
         "blocked_by_drawdown": execution["blocked_by_drawdown"],
@@ -6585,10 +7184,112 @@ def evaluate(rows, predictions, threshold, fee, slippage, compute_auc=True, init
         "worst_day_profit": execution["worst_day_profit"],
         "best_day_profit": execution["best_day_profit"],
         "normalized_microsecond_open_times": NORMALIZED_MICROSECOND_OPEN_TIMES,
+        "brier_score": calibration_report.get("brier_score", 0.0),
+        "expected_calibration_error": calibration_report.get("expected_calibration_error", 0.0),
+        "max_calibration_error": calibration_report.get("max_calibration_error", 0.0),
     }
     metrics.update(raw_metrics)
     metrics.update(execution_frequency_metrics(execution))
+    metrics["calibration_report"] = calibration_report
     return metrics
+
+
+def rows_label_values(rows):
+    if is_compact_rows(rows):
+        values = rows.labels_array()
+        if np is not None and isinstance(values, np.ndarray):
+            return values.astype(np.float32, copy=False)
+        return [float(value) for value in values]
+    return [float(row.label) for row in rows]
+
+
+def calibration_report_for_rows(rows, bundle, threshold, bin_count=10):
+    labels = rows_label_values(rows)
+    forward_returns = actual_forward_returns(rows)
+    trade_returns = actual_trade_returns(rows)
+    sources = []
+    if bundle.get("probability") is not None:
+        sources.append(("raw_probability", bundle.get("probability")))
+    if bundle.get("calibrated_probability") is not None:
+        sources.append(("calibrated_probability", bundle.get("calibrated_probability")))
+    report = {"sources": {}, "preferred_source": ""}
+    preferred_metrics = {
+        "brier_score": 0.0,
+        "expected_calibration_error": 0.0,
+        "max_calibration_error": 0.0,
+    }
+    for source_name, values in sources:
+        buckets = []
+        for bucket_index in range(bin_count):
+            lower = bucket_index / float(bin_count)
+            upper = (bucket_index + 1) / float(bin_count)
+            buckets.append({
+                "probability_source": source_name,
+                "probability_bucket": "{:.2f}-{:.2f}".format(lower, upper),
+                "rows": 0,
+                "trades_if_thresholded": 0,
+                "mean_predicted_probability": 0.0,
+                "actual_positive_rate": 0.0,
+                "avg_forward_return": 0.0,
+                "avg_trade_return": 0.0,
+                "total_trade_return": 0.0,
+                "_sum_probability": 0.0,
+                "_sum_label": 0.0,
+                "_sum_forward": 0.0,
+                "_sum_trade": 0.0,
+            })
+        brier_total = 0.0
+        count = 0
+        for index in range(len(rows)):
+            probability = max(0.0, min(1.0, float(values[index])))
+            bucket_index = min(bin_count - 1, int(probability * bin_count))
+            bucket = buckets[bucket_index]
+            label = float(labels[index])
+            bucket["rows"] += 1
+            bucket["_sum_probability"] += probability
+            bucket["_sum_label"] += label
+            bucket["_sum_forward"] += float(forward_returns[index])
+            if probability >= row_probability_threshold(threshold, index):
+                bucket["trades_if_thresholded"] += 1
+                bucket["_sum_trade"] += float(trade_returns[index])
+            brier_total += (probability - label) ** 2
+            count += 1
+        ece = 0.0
+        max_error = 0.0
+        for bucket in buckets:
+            if bucket["rows"] > 0:
+                rows_count = float(bucket["rows"])
+                bucket["mean_predicted_probability"] = bucket["_sum_probability"] / rows_count
+                bucket["actual_positive_rate"] = bucket["_sum_label"] / rows_count
+                bucket["avg_forward_return"] = bucket["_sum_forward"] / rows_count
+                if bucket["trades_if_thresholded"] > 0:
+                    thresholded = float(bucket["trades_if_thresholded"])
+                    bucket["avg_trade_return"] = bucket["_sum_trade"] / thresholded
+                    bucket["total_trade_return"] = bucket["_sum_trade"]
+                gap = abs(bucket["mean_predicted_probability"] - bucket["actual_positive_rate"])
+                ece += gap * (rows_count / float(max(1, count)))
+                max_error = max(max_error, gap)
+            del bucket["_sum_probability"]
+            del bucket["_sum_label"]
+            del bucket["_sum_forward"]
+            del bucket["_sum_trade"]
+        source_report = {
+            "rows": count,
+            "brier_score": brier_total / float(count) if count else 0.0,
+            "expected_calibration_error": ece,
+            "max_calibration_error": max_error,
+            "buckets": buckets,
+        }
+        report["sources"][source_name] = source_report
+        if source_name == "calibrated_probability" or not report["preferred_source"]:
+            report["preferred_source"] = source_name
+            preferred_metrics = {
+                "brier_score": source_report["brier_score"],
+                "expected_calibration_error": source_report["expected_calibration_error"],
+                "max_calibration_error": source_report["max_calibration_error"],
+            }
+    report.update(preferred_metrics)
+    return report
 
 
 def fit_symbol_validation_filter(rows, predictions, threshold, args, trade_score_name):
@@ -8979,6 +9680,13 @@ def write_predictions(path, rows, predictions, threshold, model_name,
                 "effective_hybrid_min_score",
                 "dynamic_threshold_mode",
                 "regime_bucket",
+                "btc_return_60m",
+                "btc_return_240m",
+                "btc_volatility_60m",
+                "rolling_volatility_60m",
+                "rolling_quote_volume_zscore_60m",
+                "market_breadth_up_60m",
+                "market_average_return_60m",
                 "raw_signal",
                 "predicted",
                 "position_size",
@@ -9115,6 +9823,13 @@ def write_predictions(path, rows, predictions, threshold, model_name,
                     "{:.12g}".format(effective_threshold),
                     dynamic_hybrid_mode,
                     regime_bucket,
+                    "{:.12g}".format(feature_value(rows, index, "btc_return_60m", 0.0)),
+                    "{:.12g}".format(feature_value(rows, index, "btc_return_240m", 0.0)),
+                    "{:.12g}".format(feature_value(rows, index, "btc_volatility_60m", 0.0)),
+                    "{:.12g}".format(feature_value(rows, index, "rolling_volatility_60m", 0.0)),
+                    "{:.12g}".format(feature_value(rows, index, "rolling_quote_volume_zscore_60m", 0.0)),
+                    "{:.12g}".format(feature_value(rows, index, "market_breadth_up_60m", 0.0)),
+                    "{:.12g}".format(feature_value(rows, index, "market_average_return_60m", 0.0)),
                     1 if raw_signal else 0,
                     1 if predicted else 0,
                     "{:.12g}".format(executed.get(index, 0.0)),
@@ -9217,6 +9932,13 @@ def write_predictions(path, rows, predictions, threshold, model_name,
                 "{:.12g}".format(effective_threshold),
                 dynamic_hybrid_mode,
                 regime_bucket,
+                "{:.12g}".format(feature_value(rows, index, "btc_return_60m", 0.0)),
+                "{:.12g}".format(feature_value(rows, index, "btc_return_240m", 0.0)),
+                "{:.12g}".format(feature_value(rows, index, "btc_volatility_60m", 0.0)),
+                "{:.12g}".format(feature_value(rows, index, "rolling_volatility_60m", 0.0)),
+                "{:.12g}".format(feature_value(rows, index, "rolling_quote_volume_zscore_60m", 0.0)),
+                "{:.12g}".format(feature_value(rows, index, "market_breadth_up_60m", 0.0)),
+                "{:.12g}".format(feature_value(rows, index, "market_average_return_60m", 0.0)),
                 1 if raw_signal else 0,
                 1 if predicted else 0,
                 "{:.12g}".format(executed.get(index, 0.0)),
@@ -9489,6 +10211,45 @@ METRIC_COLUMNS = [
     "failed_acceptance_checks",
     "rejection_reason",
     "strategy_strength",
+    "walkforward_folds_total",
+    "walkforward_folds_active",
+    "walkforward_folds_profitable",
+    "walkforward_worst_fold_return",
+    "walkforward_worst_fold_drawdown",
+    "walkforward_acceptance_passed",
+    "walkforward_acceptance_reasons",
+    "embargo_minutes",
+    "embargo_train_rows_removed",
+    "embargo_validation_rows_removed",
+    "embargo_test_rows_removed",
+    "applied_fee",
+    "position_sizing_mode",
+    "min_position_size",
+    "max_position_size",
+    "min_order_notional_blocked",
+    "max_open_positions_blocked",
+    "daily_loss_fraction_blocked",
+    "cooldown_after_loss_blocked",
+    "lot_size_adjusted",
+    "tick_size_adjusted",
+    "partial_fill_adjusted",
+    "latency_penalty_adjusted",
+    "brier_score",
+    "expected_calibration_error",
+    "max_calibration_error",
+    "best_regime_by_avg_trade_return",
+    "worst_regime_by_avg_trade_return",
+    "best_regime_by_profit",
+    "worst_regime_by_profit",
+    "profitable_symbols",
+    "losing_symbols",
+    "symbol_profit_concentration_top1",
+    "symbol_profit_concentration_top3",
+    "best_symbol",
+    "worst_symbol",
+    "top_stable_features",
+    "model_vs_best_baseline_return_delta",
+    "model_vs_best_baseline_profit_delta",
     "max_rss_gb_observed",
 ]
 
@@ -9766,6 +10527,13 @@ def run_fixed_split(rows, feature_names, args, kind, model_name):
         train_rows = select_month_range(rows, 0, train_end)
         validation_rows = select_month_range(rows, train_end, validation_end)
         test_rows = select_month_range(rows, validation_end, test_end)
+    train_rows, validation_rows, test_rows, embargo_summary = apply_split_embargo(
+        train_rows,
+        validation_rows,
+        test_rows,
+        getattr(args, "embargo_minutes", 0),
+    )
+    args._fixed_embargo_summary = dict(embargo_summary)
     finish_profile_stage(
         split_token,
         rows_processed=len(rows),
@@ -9827,6 +10595,7 @@ def run_fixed_split(rows, feature_names, args, kind, model_name):
         symbol_filter_info=selected.get("symbol_filter_info"),
     )
     test_metrics["calibration_info"] = selected.get("calibration_info") or {}
+    accumulate_baseline_context(args, test_rows, test_metrics)
     prediction_write_token = start_profile_stage("prediction_output_write", args.predictions_out)
     write_predictions(
         args.predictions_out,
@@ -9878,6 +10647,7 @@ def run_fixed_split(rows, feature_names, args, kind, model_name):
         selected["validation_metrics"],
         selected.get("score", 0.0),
     )
+    record.update(embargo_summary)
     symbol_filter_records = build_symbol_filter_diagnostic_records(
         selected.get("symbol_filter_info"),
         "fixed_split_validation",
@@ -10102,8 +10872,14 @@ def run_walk_forward(rows, feature_names, args, kind, model_name):
             break
         train_rows = select_month_range(rows, train_start, train_end)
         validation_rows = select_month_range(rows, validation_start, validation_end)
-        final_train_rows = select_month_range(rows, train_start, test_month)
         test_rows = select_month_range(rows, test_month, test_month + 1)
+        train_rows, validation_rows, test_rows, embargo_summary = apply_split_embargo(
+            train_rows,
+            validation_rows,
+            test_rows,
+            getattr(args, "embargo_minutes", 0),
+        )
+        final_train_rows = concatenate_row_views(train_rows, validation_rows)
         if not train_rows or not validation_rows or not final_train_rows or not test_rows:
             continue
 
@@ -10239,6 +11015,7 @@ def run_walk_forward(rows, feature_names, args, kind, model_name):
             )
         )
         metrics["calibration_info"] = final_selected.get("calibration_info") or {}
+        accumulate_baseline_context(args, test_rows, metrics)
         fold_output_token = start_profile_stage("walkforward_fold_{}_prediction_output".format(fold_index), args.walk_predictions_out)
         write_predictions(
             args.walk_predictions_out,
@@ -10296,6 +11073,8 @@ def run_walk_forward(rows, feature_names, args, kind, model_name):
             selected["validation_metrics"],
             selected.get("score", 0.0),
         )
+        record.update(embargo_summary)
+        collect_feature_stability(args, final_selected, feature_names, fold_index)
         fold_records.append(record)
         diagnostic_records.append(
             build_walkforward_diagnostic_record(
@@ -10310,6 +11089,7 @@ def run_walk_forward(rows, feature_names, args, kind, model_name):
                 final_selected.get("calibration_info") or {},
                 selected.get("validation_metrics", {}),
                 args,
+                embargo_summary,
             )
         )
         fold_cleanup_token = start_profile_stage("walkforward_fold_{}_cleanup".format(fold_index))
@@ -10363,14 +11143,746 @@ def metric_float(record, key):
         return 0.0
 
 
+def write_optional_csv_report(path, fieldnames, rows):
+    def write_one(output_path):
+        with open(output_path, "w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(row)
+    atomic_write_path(path, write_one)
+
+
+def skipped_report_row(reason, **extra):
+    row = {"available": 0, "skipped_reason": reason}
+    row.update(extra)
+    return row
+
+
+def prediction_report_source_path(args, walk_records):
+    candidate = getattr(args, "walk_predictions_out", "") if walk_records else getattr(args, "predictions_out", "")
+    if candidate and os.path.exists(candidate) and os.path.getsize(candidate) > 0:
+        return candidate
+    fallback = getattr(args, "predictions_out", "")
+    if fallback and os.path.exists(fallback) and os.path.getsize(fallback) > 0:
+        return fallback
+    return ""
+
+
+def iter_prediction_report_rows(path):
+    if not path or not os.path.exists(path):
+        return
+    with open(path, newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            yield row
+
+
+def derived_regime_pairs(row, args):
+    pairs = []
+    regime_bucket = str(row.get("regime_bucket", "")).strip()
+    if regime_bucket:
+        pairs.append(("dynamic_regime_bucket", regime_bucket))
+    btc_return = safe_float(row.get("btc_return_240m", 0.0), safe_float(row.get("btc_return_60m", 0.0), 0.0))
+    if btc_return != 0.0:
+        pairs.append(("btc_direction", "positive" if btc_return > 0.0 else "negative"))
+    volatility = safe_float(row.get("rolling_volatility_60m", 0.0), safe_float(row.get("btc_volatility_60m", 0.0), 0.0))
+    if volatility != 0.0:
+        pairs.append(("volatility_regime", "high" if volatility >= getattr(args, "volatility_high_threshold", 0.02) else "low"))
+    volume_signal = safe_float(row.get("rolling_quote_volume_zscore_60m", 0.0), 0.0)
+    if volume_signal != 0.0:
+        pairs.append(("volume_regime", "high" if volume_signal > 0.0 else "low"))
+    breadth = safe_float(row.get("market_breadth_up_60m", 0.0), 0.0)
+    if breadth != 0.0:
+        pairs.append(("breadth_regime", "positive" if breadth >= 0.5 else "negative"))
+    market_return = safe_float(row.get("market_average_return_60m", 0.0), 0.0)
+    if market_return != 0.0:
+        pairs.append(("market_return_regime", "positive" if market_return > 0.0 else "negative"))
+    return pairs
+
+
+def calibration_report_from_predictions(path):
+    fieldnames = [
+        "probability_source",
+        "probability_bucket",
+        "rows",
+        "trades_if_thresholded",
+        "mean_predicted_probability",
+        "actual_positive_rate",
+        "avg_forward_return",
+        "avg_trade_return",
+        "total_trade_return",
+        "skipped_reason",
+    ]
+    if not path:
+        return [skipped_report_row("prediction_output_missing")], {"brier_score": 0.0, "expected_calibration_error": 0.0, "max_calibration_error": 0.0}
+    bucket_state = {}
+    summary_by_source = {}
+    for row in iter_prediction_report_rows(path):
+        threshold = safe_float(row.get("selected_threshold", 0.0), 0.0)
+        label = safe_float(row.get("label", 0.0), 0.0)
+        forward_return = safe_float(row.get("forward_return", 0.0), 0.0)
+        trade_return = safe_float(row.get("trade_return", 0.0), 0.0)
+        for source_name, key in (("raw_probability", "probability"), ("calibrated_probability", "calibrated_probability")):
+            value_text = row.get(key, "")
+            if value_text in (None, ""):
+                continue
+            probability = max(0.0, min(1.0, safe_float(value_text, 0.0)))
+            bucket_index = min(9, int(probability * 10.0))
+            bucket_key = (source_name, bucket_index)
+            stats = bucket_state.setdefault(bucket_key, {
+                "probability_source": source_name,
+                "probability_bucket": "{:.2f}-{:.2f}".format(bucket_index / 10.0, (bucket_index + 1) / 10.0),
+                "rows": 0,
+                "trades_if_thresholded": 0,
+                "sum_probability": 0.0,
+                "sum_label": 0.0,
+                "sum_forward_return": 0.0,
+                "sum_trade_return": 0.0,
+            })
+            stats["rows"] += 1
+            stats["sum_probability"] += probability
+            stats["sum_label"] += label
+            stats["sum_forward_return"] += forward_return
+            if probability >= threshold:
+                stats["trades_if_thresholded"] += 1
+                stats["sum_trade_return"] += trade_return
+            source_summary = summary_by_source.setdefault(source_name, {"rows": 0, "brier_sum": 0.0})
+            source_summary["rows"] += 1
+            source_summary["brier_sum"] += (probability - label) ** 2
+    if not bucket_state:
+        return [skipped_report_row("prediction_output_empty")], {"brier_score": 0.0, "expected_calibration_error": 0.0, "max_calibration_error": 0.0}
+    rows = []
+    summary = {"brier_score": 0.0, "expected_calibration_error": 0.0, "max_calibration_error": 0.0}
+    preferred_source = "calibrated_probability" if "calibrated_probability" in summary_by_source else "raw_probability"
+    ece_by_source = {}
+    max_error_by_source = {}
+    for source_name in summary_by_source:
+        ece_by_source[source_name] = 0.0
+        max_error_by_source[source_name] = 0.0
+    for source_name in sorted(summary_by_source):
+        for bucket_index in range(10):
+            stats = bucket_state.get((source_name, bucket_index), {
+                "probability_source": source_name,
+                "probability_bucket": "{:.2f}-{:.2f}".format(bucket_index / 10.0, (bucket_index + 1) / 10.0),
+                "rows": 0,
+                "trades_if_thresholded": 0,
+                "sum_probability": 0.0,
+                "sum_label": 0.0,
+                "sum_forward_return": 0.0,
+                "sum_trade_return": 0.0,
+            })
+            row_count = float(stats["rows"]) if stats["rows"] else 0.0
+            mean_probability = stats["sum_probability"] / row_count if row_count else 0.0
+            actual_rate = stats["sum_label"] / row_count if row_count else 0.0
+            gap = abs(mean_probability - actual_rate)
+            if row_count:
+                ece_by_source[source_name] += gap * (row_count / float(max(1, summary_by_source[source_name]["rows"])))
+                max_error_by_source[source_name] = max(max_error_by_source[source_name], gap)
+            rows.append({
+                "probability_source": source_name,
+                "probability_bucket": stats["probability_bucket"],
+                "rows": stats["rows"],
+                "trades_if_thresholded": stats["trades_if_thresholded"],
+                "mean_predicted_probability": mean_probability,
+                "actual_positive_rate": actual_rate,
+                "avg_forward_return": stats["sum_forward_return"] / row_count if row_count else 0.0,
+                "avg_trade_return": stats["sum_trade_return"] / float(stats["trades_if_thresholded"]) if stats["trades_if_thresholded"] else 0.0,
+                "total_trade_return": stats["sum_trade_return"],
+                "skipped_reason": "",
+            })
+    preferred = summary_by_source.get(preferred_source, {"rows": 0, "brier_sum": 0.0})
+    if preferred["rows"] > 0:
+        summary["brier_score"] = preferred["brier_sum"] / float(preferred["rows"])
+        summary["expected_calibration_error"] = ece_by_source.get(preferred_source, 0.0)
+        summary["max_calibration_error"] = max_error_by_source.get(preferred_source, 0.0)
+    return rows, summary
+
+
+def symbol_report_from_predictions(path, args):
+    fieldnames = [
+        "symbol",
+        "rows",
+        "predicted_trades",
+        "actual_positive_rows",
+        "win_rate",
+        "avg_forward_return",
+        "avg_trade_return",
+        "total_profit_after_fee",
+        "total_profit_after_fee_and_slippage",
+        "profit_factor",
+        "avg_position_size",
+        "portfolio_profit_contribution",
+        "skipped_reason",
+    ]
+    if not path:
+        return [skipped_report_row("prediction_output_missing", symbol="")], {}
+    applied_fee = resolve_execution_fee(args.fee, args)
+    effective_slippage = args.slippage * getattr(args, "test_slippage_multiplier", 1.0)
+    latency_penalty = max(0.0, float(getattr(args, "latency_penalty_bps", 0.0))) / 10000.0
+    by_symbol = {}
+    for row in iter_prediction_report_rows(path):
+        symbol = row.get("symbol", "")
+        stats = by_symbol.setdefault(symbol, {
+            "symbol": symbol,
+            "rows": 0,
+            "predicted_trades": 0,
+            "actual_positive_rows": 0,
+            "sum_forward_return": 0.0,
+            "sum_trade_return": 0.0,
+            "sum_profit_after_fee": 0.0,
+            "sum_profit_after_fee_and_slippage": 0.0,
+            "gross_profit": 0.0,
+            "gross_loss": 0.0,
+            "win_count": 0,
+            "sum_position_size": 0.0,
+            "portfolio_profit_contribution": 0.0,
+        })
+        stats["rows"] += 1
+        label = int(safe_float(row.get("label", 0.0), 0.0))
+        stats["actual_positive_rows"] += label
+        stats["sum_forward_return"] += safe_float(row.get("forward_return", 0.0), 0.0)
+        if int(safe_float(row.get("predicted", 0.0), 0.0)) <= 0:
+            continue
+        trade_return = safe_float(row.get("trade_return", 0.0), 0.0)
+        position_size = safe_float(row.get("position_size", 0.0), 0.0)
+        net_after_fee = trade_return - applied_fee
+        net_after_costs = trade_return - applied_fee - effective_slippage - latency_penalty
+        stats["predicted_trades"] += 1
+        stats["sum_trade_return"] += trade_return
+        stats["sum_profit_after_fee"] += net_after_fee
+        stats["sum_profit_after_fee_and_slippage"] += net_after_costs
+        stats["sum_position_size"] += position_size
+        stats["portfolio_profit_contribution"] += position_size * net_after_costs
+        if trade_return > 0.0:
+            stats["win_count"] += 1
+        if net_after_costs >= 0.0:
+            stats["gross_profit"] += net_after_costs
+        else:
+            stats["gross_loss"] += -net_after_costs
+    if not by_symbol:
+        return [skipped_report_row("prediction_output_empty", symbol="")], {}
+    rows = []
+    contributions = []
+    for symbol in sorted(by_symbol):
+        stats = by_symbol[symbol]
+        predicted = stats["predicted_trades"]
+        rows.append({
+            "symbol": symbol,
+            "rows": stats["rows"],
+            "predicted_trades": predicted,
+            "actual_positive_rows": stats["actual_positive_rows"],
+            "win_rate": float(stats["win_count"]) / float(predicted) if predicted else 0.0,
+            "avg_forward_return": stats["sum_forward_return"] / float(stats["rows"]) if stats["rows"] else 0.0,
+            "avg_trade_return": stats["sum_trade_return"] / float(predicted) if predicted else 0.0,
+            "total_profit_after_fee": stats["sum_profit_after_fee"],
+            "total_profit_after_fee_and_slippage": stats["sum_profit_after_fee_and_slippage"],
+            "profit_factor": stats["gross_profit"] / stats["gross_loss"] if stats["gross_loss"] else (float("inf") if stats["gross_profit"] else 0.0),
+            "avg_position_size": stats["sum_position_size"] / float(predicted) if predicted else 0.0,
+            "portfolio_profit_contribution": stats["portfolio_profit_contribution"],
+            "skipped_reason": "",
+        })
+        contributions.append(max(0.0, stats["portfolio_profit_contribution"]))
+    contributions.sort(reverse=True)
+    contribution_total = sum(contributions)
+    summary = {
+        "profitable_symbols": sum(1 for row in rows if row["portfolio_profit_contribution"] > 0.0),
+        "losing_symbols": sum(1 for row in rows if row["portfolio_profit_contribution"] < 0.0),
+        "symbol_profit_concentration_top1": contributions[0] / contribution_total if contribution_total > 0.0 and contributions else 0.0,
+        "symbol_profit_concentration_top3": sum(contributions[:3]) / contribution_total if contribution_total > 0.0 else 0.0,
+        "best_symbol": max(rows, key=lambda row: row["portfolio_profit_contribution"])["symbol"],
+        "worst_symbol": min(rows, key=lambda row: row["portfolio_profit_contribution"])["symbol"],
+    }
+    return rows, summary
+
+
+def regime_report_from_predictions(path, args):
+    fieldnames = [
+        "regime_type",
+        "regime_value",
+        "rows",
+        "predicted_trades",
+        "win_rate",
+        "avg_trade_return",
+        "total_profit_after_fee_and_slippage",
+        "portfolio_return_if_isolated",
+        "max_drawdown_if_isolated",
+        "profit_factor",
+        "skipped_reason",
+    ]
+    if not path:
+        return [skipped_report_row("prediction_output_missing", regime_type="", regime_value="")], {}
+    applied_fee = resolve_execution_fee(args.fee, args)
+    effective_slippage = args.slippage * getattr(args, "test_slippage_multiplier", 1.0)
+    latency_penalty = max(0.0, float(getattr(args, "latency_penalty_bps", 0.0))) / 10000.0
+    by_regime = {}
+    for row in iter_prediction_report_rows(path):
+        pairs = derived_regime_pairs(row, args)
+        if not pairs:
+            continue
+        predicted = int(safe_float(row.get("predicted", 0.0), 0.0)) > 0
+        trade_return = safe_float(row.get("trade_return", 0.0), 0.0)
+        position_size = safe_float(row.get("position_size", 0.0), 0.0)
+        net_pnl = position_size * (trade_return - applied_fee - effective_slippage - latency_penalty)
+        for regime_type, regime_value in pairs:
+            stats = by_regime.setdefault((regime_type, regime_value), {
+                "regime_type": regime_type,
+                "regime_value": regime_value,
+                "rows": 0,
+                "predicted_trades": 0,
+                "win_count": 0,
+                "sum_trade_return": 0.0,
+                "profit": 0.0,
+                "gross_profit": 0.0,
+                "gross_loss": 0.0,
+                "equity": 0.0,
+                "peak": 0.0,
+                "max_drawdown": 0.0,
+            })
+            stats["rows"] += 1
+            if not predicted:
+                continue
+            stats["predicted_trades"] += 1
+            stats["sum_trade_return"] += trade_return
+            stats["profit"] += net_pnl
+            if trade_return > 0.0:
+                stats["win_count"] += 1
+            if net_pnl >= 0.0:
+                stats["gross_profit"] += net_pnl
+            else:
+                stats["gross_loss"] += -net_pnl
+            stats["equity"] += net_pnl
+            stats["peak"] = max(stats["peak"], stats["equity"])
+            stats["max_drawdown"] = max(stats["max_drawdown"], stats["peak"] - stats["equity"])
+    if not by_regime:
+        return [skipped_report_row("regime_features_unavailable", regime_type="", regime_value="")], {}
+    rows = []
+    for key in sorted(by_regime):
+        stats = by_regime[key]
+        predicted = stats["predicted_trades"]
+        rows.append({
+            "regime_type": stats["regime_type"],
+            "regime_value": stats["regime_value"],
+            "rows": stats["rows"],
+            "predicted_trades": predicted,
+            "win_rate": float(stats["win_count"]) / float(predicted) if predicted else 0.0,
+            "avg_trade_return": stats["sum_trade_return"] / float(predicted) if predicted else 0.0,
+            "total_profit_after_fee_and_slippage": stats["profit"],
+            "portfolio_return_if_isolated": stats["profit"] / float(args.initial_capital) if args.initial_capital else 0.0,
+            "max_drawdown_if_isolated": stats["max_drawdown"],
+            "profit_factor": stats["gross_profit"] / stats["gross_loss"] if stats["gross_loss"] else (float("inf") if stats["gross_profit"] else 0.0),
+            "skipped_reason": "",
+        })
+    summary = {
+        "best_regime_by_avg_trade_return": max(rows, key=lambda row: row["avg_trade_return"])["regime_type"] + ":" + max(rows, key=lambda row: row["avg_trade_return"])["regime_value"],
+        "worst_regime_by_avg_trade_return": min(rows, key=lambda row: row["avg_trade_return"])["regime_type"] + ":" + min(rows, key=lambda row: row["avg_trade_return"])["regime_value"],
+        "best_regime_by_profit": max(rows, key=lambda row: row["total_profit_after_fee_and_slippage"])["regime_type"] + ":" + max(rows, key=lambda row: row["total_profit_after_fee_and_slippage"])["regime_value"],
+        "worst_regime_by_profit": min(rows, key=lambda row: row["total_profit_after_fee_and_slippage"])["regime_type"] + ":" + min(rows, key=lambda row: row["total_profit_after_fee_and_slippage"])["regime_value"],
+    }
+    return rows, summary
+
+
+def feature_importance_snapshot(model, feature_names):
+    rows = []
+    if isinstance(model, dict):
+        if model.get("ensemble_members"):
+            for member in model.get("ensemble_members", []):
+                rows.extend(feature_importance_snapshot(member, feature_names))
+        for part in (model.get("classification_model"), model.get("regression_model")):
+            if part is None:
+                continue
+            rows.extend(part.feature_importance(feature_names))
+    elif model is not None:
+        rows.extend(model.feature_importance(feature_names))
+    return rows
+
+
+def collect_feature_stability(args, model, feature_names, fold_index):
+    rows = feature_importance_snapshot(model, feature_names)
+    if not rows:
+        return
+    state = getattr(args, "_feature_stability_rows", None)
+    if state is None:
+        state = []
+        args._feature_stability_rows = state
+    ordered = sorted(rows, key=lambda item: float(item[1]), reverse=True)
+    for rank, item in enumerate(ordered, 1):
+        feature, importance, fraction = item
+        state.append({
+            "feature": feature,
+            "importance": float(importance),
+            "fraction": float(fraction),
+            "rank": rank,
+            "fold_index": fold_index,
+        })
+
+
+def feature_stability_report(args):
+    fieldnames = [
+        "feature",
+        "mean_importance",
+        "std_importance",
+        "min_rank",
+        "max_rank",
+        "mean_rank",
+        "folds_present",
+        "stability_score",
+        "skipped_reason",
+    ]
+    rows = getattr(args, "_feature_stability_rows", None) or []
+    if not rows:
+        return [skipped_report_row("feature_importance_unavailable", feature="")], {"top_stable_features": ""}
+    by_feature = {}
+    for row in rows:
+        stats = by_feature.setdefault(row["feature"], {"importance": [], "rank": [], "folds": set()})
+        stats["importance"].append(float(row["importance"]))
+        stats["rank"].append(int(row["rank"]))
+        stats["folds"].add(int(row["fold_index"]))
+    report_rows = []
+    for feature in sorted(by_feature):
+        stats = by_feature[feature]
+        importance_values = stats["importance"]
+        rank_values = stats["rank"]
+        mean_importance = sum(importance_values) / float(len(importance_values))
+        variance = sum((value - mean_importance) ** 2 for value in importance_values) / float(len(importance_values))
+        std_importance = math.sqrt(variance)
+        report_rows.append({
+            "feature": feature,
+            "mean_importance": mean_importance,
+            "std_importance": std_importance,
+            "min_rank": min(rank_values),
+            "max_rank": max(rank_values),
+            "mean_rank": sum(rank_values) / float(len(rank_values)),
+            "folds_present": len(stats["folds"]),
+            "stability_score": mean_importance / (1.0 + std_importance),
+            "skipped_reason": "",
+        })
+    report_rows.sort(key=lambda row: (-row["stability_score"], row["mean_rank"]))
+    summary = {"top_stable_features": ", ".join(row["feature"] for row in report_rows[:5])}
+    return report_rows, summary
+
+
+def probability_bundle_from_selected_indices(row_count, selected_indices):
+    if np is not None:
+        values = np.zeros(row_count, dtype=np.float32)
+        if selected_indices:
+            values[np.asarray(sorted(selected_indices), dtype=np.int32)] = 1.0
+        return build_prediction_bundle(probability=values, calibrated_probability=values)
+    values = [0.0] * row_count
+    for index in selected_indices:
+        values[int(index)] = 1.0
+    return build_prediction_bundle(probability=values, calibrated_probability=values)
+
+
+def baseline_metric_row(name, available, skipped_reason, metrics):
+    return {
+        "baseline_name": name,
+        "available": 1 if available else 0,
+        "skipped_reason": skipped_reason,
+        "trades": int(metrics.get("predicted_trades", 0)) if metrics else 0,
+        "win_rate": metrics.get("win_rate", 0.0) if metrics else 0.0,
+        "avg_trade_return": metrics.get("average_trade_return", 0.0) if metrics else 0.0,
+        "total_profit_after_fee_and_slippage": metrics.get("total_profit_after_fee_and_slippage", 0.0) if metrics else 0.0,
+        "portfolio_return": metrics.get("portfolio_return", 0.0) if metrics else 0.0,
+        "max_drawdown": metrics.get("max_capital_drawdown", 0.0) if metrics else 0.0,
+        "profit_factor": metrics.get("profit_factor", 0.0) if metrics else 0.0,
+    }
+
+
+def accumulate_baseline_context(args, rows, model_metrics):
+    target_trades = int((model_metrics or {}).get("predicted_trades", 0))
+    state = getattr(args, "_baseline_context_rows", None)
+    if state is None:
+        state = []
+        args._baseline_context_rows = state
+    state.append(baseline_metric_row("no_trade", True, "", {}))
+    if target_trades <= 0 or len(rows) <= 0:
+        state.append(baseline_metric_row("random_trade", False, "model_selected_no_trades", None))
+        state.append(baseline_metric_row("simple_momentum", False, "model_selected_no_trades", None))
+        state.append(baseline_metric_row("volume_spike", False, "model_selected_no_trades", None))
+        return
+
+    max_candidates = min(len(rows), target_trades)
+    rng = random.Random(1337 + len(state))
+    random_indices = sorted(rng.sample(range(len(rows)), max_candidates))
+    random_bundle = probability_bundle_from_selected_indices(len(rows), random_indices)
+    state.append(baseline_metric_row(
+        "random_trade",
+        True,
+        "",
+        evaluate(rows, random_bundle, 0.5, args.fee, args.slippage * getattr(args, "test_slippage_multiplier", 1.0),
+                 compute_auc=False, initial_capital=args.initial_capital,
+                 max_position_fraction=args.max_position_fraction, max_volume_fraction=args.max_volume_fraction,
+                 max_trades_per_period=args.max_trades_per_period, trade_period_minutes=args.trade_period_minutes,
+                 holding_period_minutes=args.holding_period_minutes, threshold_objective=args.threshold_objective,
+                 trade_selection=args.trade_selection, top_k_per_minute=args.top_k_per_minute,
+                 upside_target=args.upside_target, downside_stop=args.downside_stop, ev_safety_margin=args.ev_safety_margin,
+                 objective_mode="classification", trade_score_name="probability",
+                 min_predicted_net_return=args.min_predicted_net_return, hybrid_min_score=args.hybrid_min_score,
+                 max_trades_per_day=args.max_trades_per_day, max_trades_per_fold=args.max_trades_per_fold,
+                 max_losing_trades_per_day=args.max_losing_trades_per_day, max_daily_drawdown=args.max_daily_drawdown,
+                 pause_after_drawdown_minutes=args.pause_after_drawdown_minutes, hybrid_runtime_args=args),
+    ))
+    momentum_values = row_feature_array(rows, "ret_5m")
+    if momentum_values is None:
+        momentum_values = row_feature_array(rows, "ret_15m")
+    if momentum_values is None:
+        momentum_values = row_feature_array(rows, "ret_60m")
+    if momentum_values is None:
+        state.append(baseline_metric_row("simple_momentum", False, "momentum_features_unavailable", None))
+    else:
+        ordered = sorted(range(len(rows)), key=lambda index: float(momentum_values[index]), reverse=True)[:max_candidates]
+        momentum_bundle = probability_bundle_from_selected_indices(len(rows), ordered)
+        state.append(baseline_metric_row(
+            "simple_momentum",
+            True,
+            "",
+            evaluate(rows, momentum_bundle, 0.5, args.fee, args.slippage * getattr(args, "test_slippage_multiplier", 1.0),
+                     compute_auc=False, initial_capital=args.initial_capital,
+                     max_position_fraction=args.max_position_fraction, max_volume_fraction=args.max_volume_fraction,
+                     max_trades_per_period=args.max_trades_per_period, trade_period_minutes=args.trade_period_minutes,
+                     holding_period_minutes=args.holding_period_minutes, threshold_objective=args.threshold_objective,
+                     trade_selection=args.trade_selection, top_k_per_minute=args.top_k_per_minute,
+                     upside_target=args.upside_target, downside_stop=args.downside_stop, ev_safety_margin=args.ev_safety_margin,
+                     objective_mode="classification", trade_score_name="probability",
+                     min_predicted_net_return=args.min_predicted_net_return, hybrid_min_score=args.hybrid_min_score,
+                     max_trades_per_day=args.max_trades_per_day, max_trades_per_fold=args.max_trades_per_fold,
+                     max_losing_trades_per_day=args.max_losing_trades_per_day, max_daily_drawdown=args.max_daily_drawdown,
+                     pause_after_drawdown_minutes=args.pause_after_drawdown_minutes, hybrid_runtime_args=args),
+        ))
+    volume_values = row_feature_array(rows, "rolling_quote_volume_zscore_60m")
+    if volume_values is None:
+        if is_compact_rows(rows):
+            volume_values = [feature_value(rows, index, "log_quote_volume", 0.0) for index in range(len(rows))]
+        else:
+            volume_values = [safe_float(getattr(row, "quote_volume", 0.0), 0.0) for row in rows]
+    if volume_values is None:
+        state.append(baseline_metric_row("volume_spike", False, "volume_features_unavailable", None))
+    else:
+        ordered = sorted(range(len(rows)), key=lambda index: float(volume_values[index]), reverse=True)[:max_candidates]
+        volume_bundle = probability_bundle_from_selected_indices(len(rows), ordered)
+        state.append(baseline_metric_row(
+            "volume_spike",
+            True,
+            "",
+            evaluate(rows, volume_bundle, 0.5, args.fee, args.slippage * getattr(args, "test_slippage_multiplier", 1.0),
+                     compute_auc=False, initial_capital=args.initial_capital,
+                     max_position_fraction=args.max_position_fraction, max_volume_fraction=args.max_volume_fraction,
+                     max_trades_per_period=args.max_trades_per_period, trade_period_minutes=args.trade_period_minutes,
+                     holding_period_minutes=args.holding_period_minutes, threshold_objective=args.threshold_objective,
+                     trade_selection=args.trade_selection, top_k_per_minute=args.top_k_per_minute,
+                     upside_target=args.upside_target, downside_stop=args.downside_stop, ev_safety_margin=args.ev_safety_margin,
+                     objective_mode="classification", trade_score_name="probability",
+                     min_predicted_net_return=args.min_predicted_net_return, hybrid_min_score=args.hybrid_min_score,
+                     max_trades_per_day=args.max_trades_per_day, max_trades_per_fold=args.max_trades_per_fold,
+                     max_losing_trades_per_day=args.max_losing_trades_per_day, max_daily_drawdown=args.max_daily_drawdown,
+                     pause_after_drawdown_minutes=args.pause_after_drawdown_minutes, hybrid_runtime_args=args),
+        ))
+
+
+def baseline_report(args):
+    fieldnames = [
+        "baseline_name",
+        "available",
+        "skipped_reason",
+        "trades",
+        "win_rate",
+        "avg_trade_return",
+        "total_profit_after_fee_and_slippage",
+        "portfolio_return",
+        "max_drawdown",
+        "profit_factor",
+    ]
+    rows = getattr(args, "_baseline_context_rows", None) or []
+    if not rows:
+        rows = [
+            baseline_metric_row("no_trade", True, "", {}),
+            baseline_metric_row("random_trade", False, "baseline_context_missing", None),
+            baseline_metric_row("simple_momentum", False, "baseline_context_missing", None),
+            baseline_metric_row("volume_spike", False, "baseline_context_missing", None),
+        ]
+    logistic = read_logistic_metric(getattr(args, "logistic_metrics_in", ""))
+    rows.append(
+        baseline_metric_row(
+            "logistic_baseline",
+            logistic is not None,
+            "" if logistic is not None else "logistic_metrics_unavailable",
+            {
+                "predicted_trades": metric_float(logistic, "predicted_trades"),
+                "win_rate": metric_float(logistic, "win_rate"),
+                "average_trade_return": metric_float(logistic, "average_trade_return"),
+                "total_profit_after_fee_and_slippage": metric_float(logistic, "total_profit_after_fee_and_slippage"),
+                "portfolio_return": metric_float(logistic, "portfolio_return"),
+                "max_capital_drawdown": metric_float(logistic, "max_capital_drawdown"),
+                "profit_factor": metric_float(logistic, "profit_factor"),
+            } if logistic is not None else None,
+        )
+    )
+    rows.append(baseline_metric_row("buy_and_hold_btc", False, "continuous_price_path_unavailable", None))
+    rows.append(baseline_metric_row("equal_weight_buy_and_hold", False, "continuous_price_path_unavailable", None))
+    by_name = {}
+    for row in rows:
+        stats = by_name.setdefault(row["baseline_name"], {
+            "baseline_name": row["baseline_name"],
+            "available": 0,
+            "skipped_reason": [],
+            "trades": 0,
+            "win_trade_weight": 0.0,
+            "trade_return_weight": 0.0,
+            "total_profit_after_fee_and_slippage": 0.0,
+            "portfolio_return_sum": 0.0,
+            "portfolio_return_count": 0,
+            "max_drawdown": 0.0,
+            "profit_factor_sum": 0.0,
+            "profit_factor_count": 0,
+        })
+        if row["available"]:
+            stats["available"] = 1
+            stats["trades"] += int(row["trades"])
+            stats["win_trade_weight"] += float(row["win_rate"]) * float(row["trades"])
+            stats["trade_return_weight"] += float(row["avg_trade_return"]) * float(row["trades"])
+            stats["total_profit_after_fee_and_slippage"] += float(row["total_profit_after_fee_and_slippage"])
+            stats["portfolio_return_sum"] += float(row["portfolio_return"])
+            stats["portfolio_return_count"] += 1
+            stats["max_drawdown"] = max(stats["max_drawdown"], float(row["max_drawdown"]))
+            if math.isfinite(float(row["profit_factor"])):
+                stats["profit_factor_sum"] += float(row["profit_factor"])
+                stats["profit_factor_count"] += 1
+        elif row["skipped_reason"]:
+            stats["skipped_reason"].append(row["skipped_reason"])
+    aggregated_rows = []
+    for name in sorted(by_name):
+        stats = by_name[name]
+        aggregated_rows.append({
+            "baseline_name": name,
+            "available": stats["available"],
+            "skipped_reason": "; ".join(sorted(set(stats["skipped_reason"]))) if not stats["available"] else "",
+            "trades": stats["trades"],
+            "win_rate": stats["win_trade_weight"] / float(stats["trades"]) if stats["trades"] else 0.0,
+            "avg_trade_return": stats["trade_return_weight"] / float(stats["trades"]) if stats["trades"] else 0.0,
+            "total_profit_after_fee_and_slippage": stats["total_profit_after_fee_and_slippage"],
+            "portfolio_return": stats["portfolio_return_sum"] / float(stats["portfolio_return_count"]) if stats["portfolio_return_count"] else 0.0,
+            "max_drawdown": stats["max_drawdown"],
+            "profit_factor": stats["profit_factor_sum"] / float(stats["profit_factor_count"]) if stats["profit_factor_count"] else 0.0,
+        })
+    available_rows = [row for row in aggregated_rows if row["available"]]
+    best = max(available_rows, key=lambda row: row["portfolio_return"]) if available_rows else None
+    summary = {
+        "best_baseline_name": best["baseline_name"] if best else "",
+        "best_baseline_portfolio_return": best["portfolio_return"] if best else 0.0,
+        "best_baseline_total_profit": best["total_profit_after_fee_and_slippage"] if best else 0.0,
+    }
+    return aggregated_rows, summary
+
+
+def write_experiment_report(path, summary):
+    lines = [
+        "# CoinPredictor Experiment Report",
+        "",
+        "## Dataset Summary",
+        "- Input: `{}`".format(summary.get("input_csv", "")),
+        "- Rows: `{}`".format(summary.get("input_csv_rows", 0)),
+        "- Features: `{}`".format(summary.get("feature_count", 0)),
+        "- Symbols: `{}`".format(", ".join(summary.get("symbols", [])) or "n/a"),
+        "- Months: `{}`".format(summary.get("month_range", "n/a")),
+        "",
+        "## Split Settings",
+        "- Split mode: `{}`".format(summary.get("split_mode", "")),
+        "- Walk-forward enabled: `{}`".format(int(bool(summary.get("walk_forward_enabled", False)))),
+        "- Embargo minutes: `{}`".format(summary.get("embargo_minutes", 0)),
+        "",
+        "## Model Settings",
+        "- Model kind: `{}`".format(summary.get("model_kind", "")),
+        "- Objective mode: `{}`".format(summary.get("objective_mode", "")),
+        "- Threshold objective: `{}`".format(summary.get("threshold_objective", "")),
+        "- Position sizing mode: `{}`".format(summary.get("position_sizing_mode", "fixed_fraction")),
+        "",
+        "## Execution Settings",
+        "- Fee mode: `{}`".format(summary.get("fee_mode", "fixed")),
+        "- Fee: `{:.6f}`".format(summary.get("applied_fee", 0.0)),
+        "- Slippage: `{:.6f}`".format(summary.get("slippage", 0.0)),
+        "- Latency penalty bps: `{:.2f}`".format(summary.get("latency_penalty_bps", 0.0)),
+        "- Max open positions: `{}`".format(summary.get("max_open_positions", 0)),
+        "",
+        "## Walk-Forward Summary",
+        "- Folds total: `{}`".format(summary.get("walkforward_folds_total", 0)),
+        "- Folds active: `{}`".format(summary.get("walkforward_folds_active", 0)),
+        "- Profitable fold rate: `{:.4f}`".format(summary.get("walkforward_profitable_fold_rate", 0.0)),
+        "- Median fold return: `{:.4f}`".format(summary.get("walkforward_median_portfolio_return", 0.0)),
+        "- Worst fold drawdown: `{:.4f}`".format(summary.get("walkforward_worst_fold_drawdown", 0.0)),
+        "",
+        "## Calibration Summary",
+        "- Brier score: `{:.6f}`".format(summary.get("brier_score", 0.0)),
+        "- Expected calibration error: `{:.6f}`".format(summary.get("expected_calibration_error", 0.0)),
+        "- Max calibration error: `{:.6f}`".format(summary.get("max_calibration_error", 0.0)),
+        "",
+        "## Regime Summary",
+        "- Best regime by avg trade return: `{}`".format(summary.get("best_regime_by_avg_trade_return", "")),
+        "- Worst regime by avg trade return: `{}`".format(summary.get("worst_regime_by_avg_trade_return", "")),
+        "- Best regime by profit: `{}`".format(summary.get("best_regime_by_profit", "")),
+        "- Worst regime by profit: `{}`".format(summary.get("worst_regime_by_profit", "")),
+        "",
+        "## Symbol Robustness Summary",
+        "- Profitable symbols: `{}`".format(summary.get("profitable_symbols", 0)),
+        "- Losing symbols: `{}`".format(summary.get("losing_symbols", 0)),
+        "- Top-1 concentration: `{:.4f}`".format(summary.get("symbol_profit_concentration_top1", 0.0)),
+        "- Top-3 concentration: `{:.4f}`".format(summary.get("symbol_profit_concentration_top3", 0.0)),
+        "- Best symbol: `{}`".format(summary.get("best_symbol", "")),
+        "- Worst symbol: `{}`".format(summary.get("worst_symbol", "")),
+        "",
+        "## Feature Stability Summary",
+        "- Top stable features: `{}`".format(summary.get("top_stable_features", "")),
+        "",
+        "## Baseline Comparison",
+        "- Best baseline: `{}`".format(summary.get("best_baseline_name", "")),
+        "- Model vs best baseline return delta: `{:.4f}`".format(summary.get("model_vs_best_baseline_return_delta", 0.0)),
+        "- Model vs best baseline profit delta: `{:.4f}`".format(summary.get("model_vs_best_baseline_profit_delta", 0.0)),
+        "",
+        "## Main Risks / Limitations",
+        "- Buy-and-hold style baselines are skipped unless a continuous price path is available in the evaluation dataset.",
+        "- Regime summaries are derived only from columns available at prediction time.",
+        "- Execution realism is still approximate because the dataset does not include full exchange microstructure.",
+        "",
+        "## Conclusion",
+        "- Walk-forward acceptance passed: `{}`".format(summary.get("walkforward_acceptance_passed", 0)),
+        "- Acceptance reasons: `{}`".format(summary.get("walkforward_acceptance_reasons", "")),
+    ]
+    def write_one(output_path):
+        with open(output_path, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(lines) + "\n")
+    atomic_write_path(path, write_one)
+
+
 def describe_cache_files(paths):
     rows = []
-    for name, path in sorted(paths.items()):
-        if not isinstance(path, str):
-            continue
-        exists = os.path.exists(path)
-        size_bytes = os.path.getsize(path) if exists and os.path.isfile(path) else 0
-        rows.append((name, path, exists, size_bytes))
+
+    def path_size_bytes(path):
+        if not os.path.exists(path):
+            return 0
+        if os.path.isfile(path):
+            return os.path.getsize(path)
+        total = 0
+        for root, _, files in os.walk(path):
+            for name in files:
+                file_path = os.path.join(root, name)
+                try:
+                    total += os.path.getsize(file_path)
+                except OSError:
+                    pass
+        return total
+
+    def visit(prefix, value):
+        if isinstance(value, dict):
+            for key, item in sorted(value.items()):
+                next_prefix = "{}.{}".format(prefix, key) if prefix else key
+                visit(next_prefix, item)
+            return
+        if not isinstance(value, str):
+            return
+        exists = os.path.exists(value)
+        rows.append((prefix, value, exists, path_size_bytes(value)))
+
+    visit("", paths)
     return rows
 
 
@@ -10443,11 +11955,88 @@ def inspect_cache(args, training_manifest=None, manifest_path=None):
     return 0
 
 
+def cache_report(args, training_manifest=None, manifest_path=None):
+    if args.feature_storage not in ("memmap32", "memmap64"):
+        raise ValueError("--cache-report requires --feature-storage memmap32 or memmap64")
+    dtype = np.float32 if args.feature_storage == "memmap32" else np.float64
+    resolved_cache_dir = resolve_cache_dir(args.input, args.cache_dir or None)
+    print("Cache report", flush=True)
+    print("cache_dir={}".format(resolved_cache_dir), flush=True)
+    if os.path.isdir(args.input):
+        shards = discover_sharded_dataset_shards(args.input, training_manifest)
+        aggregate_paths = sharded_dataset_cache_paths(args.input, resolved_cache_dir, dtype)
+        aggregate_manifest, _ = load_cache_manifest_file(aggregate_paths["manifest"])
+        aggregate_valid = bool(
+            aggregate_manifest and sharded_aggregate_manifest_matches(
+                aggregate_manifest, args.input, dtype, aggregate_paths, training_manifest, shards
+            )
+        )
+        print("dataset_type=sharded", flush=True)
+        print("aggregate_cache_valid={}".format(int(aggregate_valid)), flush=True)
+        print("shard_count={}".format(len(shards)), flush=True)
+        shard_hits = 0
+        shard_rebuild_needed = 0
+        shard_rows = 0
+        for shard in shards:
+            shard_rows += int(shard.get("row_count", 0))
+            shard_paths = shard_cache_paths(shard["csv_path"], aggregate_paths["shard_cache_dir"], dtype)
+            shard_manifest, _ = load_cache_manifest_file(shard_paths["manifest"])
+            shard_valid = bool(
+                shard_manifest and cache_manifest_matches(
+                    shard_manifest,
+                    shard["csv_path"],
+                    dtype,
+                    shard_paths,
+                    training_manifest,
+                    training_manifest_path(args.input),
+                    manifest_compatibility_signature(training_manifest),
+                )
+            )
+            if shard_valid:
+                shard_hits += 1
+            else:
+                shard_rebuild_needed += 1
+            print(
+                "shard_cache symbol={} month={} valid={} compression={} rows={} path={}".format(
+                    shard.get("symbol", ""),
+                    shard.get("month", ""),
+                    int(shard_valid),
+                    shard.get("compression", ""),
+                    int(shard.get("row_count", 0)),
+                    shard_paths["manifest"],
+                ),
+                flush=True,
+            )
+        print("shard_rows={}".format(shard_rows), flush=True)
+        print("shard_cache_hits={}".format(shard_hits), flush=True)
+        print("shard_cache_rebuild_needed={}".format(shard_rebuild_needed), flush=True)
+        paths = aggregate_paths
+    else:
+        paths = cache_paths(args.input, resolved_cache_dir, dtype)
+        manifest, _ = load_cache_manifest_file(paths["manifest"])
+        valid = bool(
+            manifest and cache_manifest_matches(
+                manifest, args.input, dtype, paths, training_manifest, manifest_path
+            )
+        )
+        print("dataset_type=monolithic", flush=True)
+        print("cache_valid={}".format(int(valid)), flush=True)
+    total_size = 0
+    for name, path, exists, size_bytes in describe_cache_files(paths):
+        total_size += size_bytes
+        print("cache_file {} exists={} size_bytes={} path={}".format(name, int(exists), size_bytes, path), flush=True)
+    print("cache_total_size_gb={:.6f}".format(total_size / float(1024 ** 3)), flush=True)
+    return 0
+
+
 def cache_cleanup(args):
     cache_dir = resolve_cache_dir(args.input, args.cache_dir or None)
     if not os.path.exists(cache_dir):
         print("Cache directory does not exist: {}".format(cache_dir), flush=True)
         return 0
+    current_manifest_path = training_manifest_path(args.input)
+    protected_files = set()
+    protected_dirs = set()
     candidates = []
     for root, _, files in os.walk(cache_dir):
         for name in files:
@@ -10457,19 +12046,30 @@ def cache_cleanup(args):
             except OSError:
                 size_bytes = 0
             reason = "other"
-            if name.endswith(".manifest.json"):
+            if name.endswith(".manifest.json") or name == "shard_cache_manifest.json":
                 manifest, _ = load_cache_manifest_file(path)
                 if manifest is None:
                     reason = "invalid_manifest"
-                elif manifest.get("source_csv_path") != os.path.abspath(args.input) and manifest.get("dataset_path") != os.path.abspath(args.input):
+                elif not cache_manifest_targets_input(manifest, args.input, current_manifest_path):
                     reason = "different_input"
                 else:
                     reason = "current_input"
+                    related = cache_manifest_related_paths(path)
+                    protected_files.update(os.path.abspath(item) for item in related["files"])
+                    protected_dirs.update(os.path.abspath(item) for item in related["directories"])
             candidates.append({
-                "path": path,
+                "path": os.path.abspath(path),
                 "size_bytes": size_bytes,
                 "reason": reason,
             })
+    for item in candidates:
+        if item["path"] in protected_files:
+            item["reason"] = "current_input"
+            continue
+        for directory in protected_dirs:
+            if item["path"].startswith(directory + os.sep):
+                item["reason"] = "current_input"
+                break
     removable = [item for item in candidates if item["reason"] != "current_input"]
     print("Cache cleanup review", flush=True)
     for item in sorted(removable, key=lambda row: row["size_bytes"], reverse=True):
@@ -10636,17 +12236,65 @@ def git_commit():
 
 
 def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_record, walk_records):
+    for name in output_path_args():
+        if not hasattr(args, name):
+            setattr(args, name, DEFAULT_REPORT_FILENAMES.get(name, ""))
+    apply_default_report_paths(args)
     aggregate = walk_records[-1] if walk_records and walk_records[-1].get("split") == "walkforward_average" else None
     walkforward_summary = walkforward_acceptance_summary(walk_records, args) if walk_records else walkforward_acceptance_summary([], args)
     run_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     effective_upside_target = getattr(args, "effective_upside_target", getattr(args, "upside_target", 0.05))
     effective_downside_stop = getattr(args, "effective_downside_stop", getattr(args, "downside_stop", 0.02))
+    prediction_report_path = prediction_report_source_path(args, walk_records)
+    calibration_rows, calibration_summary = calibration_report_from_predictions(prediction_report_path)
+    regime_rows, regime_summary = regime_report_from_predictions(prediction_report_path, args)
+    symbol_rows, symbol_summary = symbol_report_from_predictions(prediction_report_path, args)
+    feature_stability_rows, feature_stability_summary = feature_stability_report(args)
+    baseline_rows, baseline_summary = baseline_report(args)
+    write_optional_csv_report(
+        args.calibration_report_out,
+        ["probability_source", "probability_bucket", "rows", "trades_if_thresholded", "mean_predicted_probability", "actual_positive_rate", "avg_forward_return", "avg_trade_return", "total_trade_return", "skipped_reason"],
+        calibration_rows,
+    )
+    write_optional_csv_report(
+        args.regime_report_out,
+        ["regime_type", "regime_value", "rows", "predicted_trades", "win_rate", "avg_trade_return", "total_profit_after_fee_and_slippage", "portfolio_return_if_isolated", "max_drawdown_if_isolated", "profit_factor", "skipped_reason"],
+        regime_rows,
+    )
+    write_optional_csv_report(
+        args.symbol_report_out,
+        ["symbol", "rows", "predicted_trades", "actual_positive_rows", "win_rate", "avg_forward_return", "avg_trade_return", "total_profit_after_fee", "total_profit_after_fee_and_slippage", "profit_factor", "avg_position_size", "portfolio_profit_contribution", "skipped_reason"],
+        symbol_rows,
+    )
+    write_optional_csv_report(
+        args.feature_stability_out,
+        ["feature", "mean_importance", "std_importance", "min_rank", "max_rank", "mean_rank", "folds_present", "stability_score", "skipped_reason"],
+        feature_stability_rows,
+    )
+    write_optional_csv_report(
+        args.baseline_report_out,
+        ["baseline_name", "available", "skipped_reason", "trades", "win_rate", "avg_trade_return", "total_profit_after_fee_and_slippage", "portfolio_return", "max_drawdown", "profit_factor"],
+        baseline_rows,
+    )
+    model_reference = aggregate if aggregate else fixed_record
+    model_vs_best_baseline_return_delta = float(model_reference.get("portfolio_return", 0.0)) - float(baseline_summary.get("best_baseline_portfolio_return", 0.0))
+    model_vs_best_baseline_profit_delta = float(model_reference.get("total_profit_after_fee_and_slippage", model_reference.get("portfolio_profit", 0.0))) - float(baseline_summary.get("best_baseline_total_profit", 0.0))
+    symbols = sorted(set(row_symbol_name(rows, index) for index in range(len(rows)))) if rows else []
+    month_start, month_end = month_range_bounds(rows)
+    embargo_summary = {
+        "embargo_minutes": getattr(args, "embargo_minutes", 0),
+        "embargo_train_rows_removed": fixed_record.get("embargo_train_rows_removed", getattr(args, "_fixed_embargo_summary", {}).get("embargo_train_rows_removed", 0)),
+        "embargo_validation_rows_removed": fixed_record.get("embargo_validation_rows_removed", getattr(args, "_fixed_embargo_summary", {}).get("embargo_validation_rows_removed", 0)),
+        "embargo_test_rows_removed": fixed_record.get("embargo_test_rows_removed", getattr(args, "_fixed_embargo_summary", {}).get("embargo_test_rows_removed", 0)),
+    }
     summary = {
         "run_at_utc": run_at,
         "git_commit": git_commit(),
         "args": json_safe(vars(args)),
         "input_csv": os.path.abspath(args.input),
         "input_csv_rows": len(rows),
+        "symbols": symbols,
+        "month_range": "{} to {}".format(month_start, month_end) if month_start or month_end else "",
         "feature_count": len(feature_names),
         "feature_names": feature_names,
         "model_kind": kind,
@@ -10685,9 +12333,32 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
         "fixed_metrics": fixed_record,
         "walk_forward_aggregate_metrics": aggregate,
         "walk_forward_summary": walkforward_summary,
+        "report_inputs": {
+            "prediction_report_source": prediction_report_path,
+            "calibration_report_out": args.calibration_report_out,
+            "regime_report_out": args.regime_report_out,
+            "symbol_report_out": args.symbol_report_out,
+            "feature_stability_out": args.feature_stability_out,
+            "baseline_report_out": args.baseline_report_out,
+            "experiment_report_out": args.experiment_report_out,
+        },
+        "calibration_summary": calibration_summary,
+        "regime_summary": regime_summary,
+        "symbol_summary": symbol_summary,
+        "feature_stability_summary": feature_stability_summary,
+        "baseline_summary": baseline_summary,
+        "model_vs_best_baseline_return_delta": model_vs_best_baseline_return_delta,
+        "model_vs_best_baseline_profit_delta": model_vs_best_baseline_profit_delta,
         "max_rss_gb_observed": MAX_RSS_GIB_OBSERVED,
         "max_rss_stage": MAX_RSS_STAGE,
     }
+    summary.update(embargo_summary)
+    summary.update(calibration_summary)
+    summary.update(regime_summary)
+    summary.update(symbol_summary)
+    summary.update(feature_stability_summary)
+    summary.update(baseline_summary)
+    summary.update(walkforward_summary)
     def write_one(output_path):
         with open(output_path, "w", encoding="utf-8") as handle:
             json.dump(summary, handle, indent=2, sort_keys=True)
@@ -10755,6 +12426,28 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
         "failed_acceptance_checks",
         "rejection_reason",
         "strategy_strength",
+        "walkforward_acceptance_passed",
+        "walkforward_acceptance_reasons",
+        "brier_score",
+        "expected_calibration_error",
+        "max_calibration_error",
+        "best_regime_by_avg_trade_return",
+        "worst_regime_by_avg_trade_return",
+        "best_regime_by_profit",
+        "worst_regime_by_profit",
+        "profitable_symbols",
+        "losing_symbols",
+        "symbol_profit_concentration_top1",
+        "symbol_profit_concentration_top3",
+        "best_symbol",
+        "worst_symbol",
+        "top_stable_features",
+        "model_vs_best_baseline_return_delta",
+        "model_vs_best_baseline_profit_delta",
+        "embargo_minutes",
+        "embargo_train_rows_removed",
+        "embargo_validation_rows_removed",
+        "embargo_test_rows_removed",
         "ev_upside_target_source",
         "ev_downside_stop_source",
         "manifest_upside_target",
@@ -10833,6 +12526,28 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
         "failed_acceptance_checks": walkforward_summary.get("failed_acceptance_checks", ""),
         "rejection_reason": walkforward_summary.get("rejection_reason", ""),
         "strategy_strength": walkforward_summary.get("strategy_strength", "not_checked"),
+        "walkforward_acceptance_passed": walkforward_summary.get("walkforward_acceptance_passed", 0),
+        "walkforward_acceptance_reasons": walkforward_summary.get("walkforward_acceptance_reasons", ""),
+        "brier_score": calibration_summary.get("brier_score", 0.0),
+        "expected_calibration_error": calibration_summary.get("expected_calibration_error", 0.0),
+        "max_calibration_error": calibration_summary.get("max_calibration_error", 0.0),
+        "best_regime_by_avg_trade_return": regime_summary.get("best_regime_by_avg_trade_return", ""),
+        "worst_regime_by_avg_trade_return": regime_summary.get("worst_regime_by_avg_trade_return", ""),
+        "best_regime_by_profit": regime_summary.get("best_regime_by_profit", ""),
+        "worst_regime_by_profit": regime_summary.get("worst_regime_by_profit", ""),
+        "profitable_symbols": symbol_summary.get("profitable_symbols", 0),
+        "losing_symbols": symbol_summary.get("losing_symbols", 0),
+        "symbol_profit_concentration_top1": symbol_summary.get("symbol_profit_concentration_top1", 0.0),
+        "symbol_profit_concentration_top3": symbol_summary.get("symbol_profit_concentration_top3", 0.0),
+        "best_symbol": symbol_summary.get("best_symbol", ""),
+        "worst_symbol": symbol_summary.get("worst_symbol", ""),
+        "top_stable_features": feature_stability_summary.get("top_stable_features", ""),
+        "model_vs_best_baseline_return_delta": model_vs_best_baseline_return_delta,
+        "model_vs_best_baseline_profit_delta": model_vs_best_baseline_profit_delta,
+        "embargo_minutes": embargo_summary["embargo_minutes"],
+        "embargo_train_rows_removed": embargo_summary["embargo_train_rows_removed"],
+        "embargo_validation_rows_removed": embargo_summary["embargo_validation_rows_removed"],
+        "embargo_test_rows_removed": embargo_summary["embargo_test_rows_removed"],
         "ev_upside_target_source": getattr(args, "ev_upside_target_source", "default"),
         "ev_downside_stop_source": getattr(args, "ev_downside_stop_source", "default"),
         "manifest_upside_target": getattr(args, "manifest_upside_target", 0.0),
@@ -10847,9 +12562,9 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
         ),
         "max_rss_gb_observed": MAX_RSS_GIB_OBSERVED,
         "max_rss_stage": MAX_RSS_STAGE,
-        "feature_storage": args.feature_storage,
-        "max_train_rows": args.max_train_rows,
-        "prediction_batch_rows": args.prediction_batch_rows,
+        "feature_storage": getattr(args, "feature_storage", ""),
+        "max_train_rows": getattr(args, "max_train_rows", 0),
+        "prediction_batch_rows": getattr(args, "prediction_batch_rows", 0),
         "best_params": json.dumps(fixed_selected.get("params", {}), sort_keys=True),
     }
     write_header = not os.path.exists(args.experiment_summary_out) or os.path.getsize(args.experiment_summary_out) == 0
@@ -10858,6 +12573,20 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
         if write_header:
             writer.writeheader()
         writer.writerow(experiment)
+    report_summary = dict(summary)
+    report_summary.update({
+        "split_mode": getattr(args, "split_mode", ""),
+        "walk_forward_enabled": bool(getattr(args, "walk_forward", False)),
+        "objective_mode": getattr(args, "objective_mode", ""),
+        "threshold_objective": getattr(args, "threshold_objective", ""),
+        "position_sizing_mode": getattr(args, "position_sizing_mode", "fixed_fraction"),
+        "fee_mode": getattr(args, "fee_mode", "fixed"),
+        "applied_fee": resolve_execution_fee(getattr(args, "fee", 0.0), args),
+        "slippage": getattr(args, "slippage", 0.0) * getattr(args, "test_slippage_multiplier", 1.0),
+        "latency_penalty_bps": getattr(args, "latency_penalty_bps", 0.0),
+        "max_open_positions": getattr(args, "max_open_positions", 0),
+    })
+    write_experiment_report(args.experiment_report_out, report_summary)
     log_memory("Run summaries written")
 
 
@@ -10879,6 +12608,7 @@ def build_parser():
     parser.add_argument("--slippage", type=float, default=0.0005)
     parser.add_argument("--validation-slippage-multiplier", type=float, default=1.0)
     parser.add_argument("--test-slippage-multiplier", type=float, default=1.0)
+    parser.add_argument("--embargo-minutes", type=int, default=0)
     parser.add_argument("--execution-delay-minutes", type=int, default=0)
     parser.add_argument("--min-validation-trades", type=int, default=5)
     parser.add_argument("--max-validation-trades", type=int, default=250)
@@ -10893,8 +12623,20 @@ def build_parser():
     parser.add_argument("--max-losing-trades-per-day", type=int, default=0)
     parser.add_argument("--max-daily-drawdown", type=float, default=0.0)
     parser.add_argument("--pause-after-drawdown-minutes", type=int, default=0)
+    parser.add_argument("--min-order-notional", type=float, default=0.0)
+    parser.add_argument("--lot-size-step", type=float, default=0.0)
+    parser.add_argument("--tick-size", type=float, default=0.0)
+    parser.add_argument("--maker-fee", type=float, default=None)
+    parser.add_argument("--taker-fee", type=float, default=None)
+    parser.add_argument("--fee-mode", choices=["fixed", "maker", "taker"], default="fixed")
+    parser.add_argument("--latency-penalty-bps", type=float, default=0.0)
+    parser.add_argument("--partial-fill-mode", choices=["none", "volume_fraction"], default="none")
+    parser.add_argument("--max-open-positions", type=int, default=0)
+    parser.add_argument("--max-daily-loss-fraction", type=float, default=0.0)
+    parser.add_argument("--cooldown-after-loss-minutes", type=int, default=0)
     parser.add_argument("--trade-period-minutes", type=int, default=60)
     parser.add_argument("--holding-period-minutes", type=int, default=5)
+    parser.add_argument("--position-sizing-mode", choices=["fixed_fraction", "confidence_weighted", "volatility_adjusted", "ev_weighted"], default="fixed_fraction")
     parser.add_argument("--trade-selection", choices=["threshold", "topk_ev", "topk_score"], default="threshold")
     parser.add_argument("--trade-score", choices=["auto", "probability", "ev", "predicted_return", "hybrid"], default="auto")
     parser.add_argument("--top-k-per-minute", type=int, default=3)
@@ -10987,6 +12729,7 @@ def build_parser():
     parser.add_argument("--cache-only", action="store_true")
     parser.add_argument("--smoke-test-cache", action="store_true")
     parser.add_argument("--inspect-cache", action="store_true")
+    parser.add_argument("--cache-report", action="store_true")
     parser.add_argument("--cache-cleanup", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--confirm-delete", action="store_true")
@@ -11009,8 +12752,8 @@ def build_parser():
     parser.add_argument("--walk-validation-months", type=int, default=1)
     parser.add_argument("--walk-forward-final-model", choices=["selected", "refit"], default="selected")
     parser.add_argument("--require-positive-walkforward", action="store_true")
-    parser.add_argument("--min-profitable-fold-rate", type=float, default=0.55)
-    parser.add_argument("--min-median-fold-return", type=float, default=0.0)
+    parser.add_argument("--min-profitable-fold-rate", type=float, default=0.0)
+    parser.add_argument("--min-median-fold-return", type=float, default=-999.0)
     parser.add_argument("--min-mean-fold-return", type=float, default=0.0)
     parser.add_argument("--max-worst-fold-drawdown", type=float, default=1.0)
     parser.add_argument("--acceptance-tier", choices=["none", "exploration", "research", "strong"], default="none")
@@ -11022,6 +12765,12 @@ def build_parser():
     parser.add_argument("--symbol-filter-diagnostics-out", default="kline_growth_symbol_filter_diagnostics.csv")
     parser.add_argument("--walk-predictions-out", default="kline_growth_predictions_gbdt_walkforward.csv")
     parser.add_argument("--feature-importance-out", default="kline_growth_feature_importance.csv")
+    parser.add_argument("--calibration-report-out", default="")
+    parser.add_argument("--regime-report-out", default="")
+    parser.add_argument("--symbol-report-out", default="")
+    parser.add_argument("--feature-stability-out", default="")
+    parser.add_argument("--baseline-report-out", default="")
+    parser.add_argument("--experiment-report-out", default="")
     parser.add_argument("--logistic-metrics-in", default="kline_growth_metrics_logistic.csv")
     parser.add_argument("--run-summary-out", default="kline_growth_run_summary.json")
     parser.add_argument("--experiment-summary-out", default="kline_growth_experiment_summary.csv")
@@ -11058,6 +12807,8 @@ def main(argv):
         raise ValueError("--validation-slippage-multiplier cannot be negative")
     if args.test_slippage_multiplier < 0.0:
         raise ValueError("--test-slippage-multiplier cannot be negative")
+    if args.embargo_minutes < 0:
+        raise ValueError("--embargo-minutes cannot be negative")
     if args.initial_capital <= 0.0:
         raise ValueError("--initial-capital must be positive")
     if not 0.0 < args.max_position_fraction <= 1.0:
@@ -11076,6 +12827,20 @@ def main(argv):
         raise ValueError("--max-losing-trades-per-day cannot be negative")
     if args.max_daily_drawdown < 0.0:
         raise ValueError("--max-daily-drawdown cannot be negative")
+    if args.min_order_notional < 0.0:
+        raise ValueError("--min-order-notional cannot be negative")
+    if args.lot_size_step < 0.0:
+        raise ValueError("--lot-size-step cannot be negative")
+    if args.tick_size < 0.0:
+        raise ValueError("--tick-size cannot be negative")
+    if args.latency_penalty_bps < 0.0:
+        raise ValueError("--latency-penalty-bps cannot be negative")
+    if args.max_open_positions < 0:
+        raise ValueError("--max-open-positions cannot be negative")
+    if not 0.0 <= args.max_daily_loss_fraction <= 1.0:
+        raise ValueError("--max-daily-loss-fraction must be between 0 and 1")
+    if args.cooldown_after_loss_minutes < 0:
+        raise ValueError("--cooldown-after-loss-minutes cannot be negative")
     if args.min_free_disk_gb < 0.0:
         raise ValueError("--min-free-disk-gb cannot be negative")
     if args.max_cache_size_gb < 0.0:
@@ -11088,6 +12853,10 @@ def main(argv):
         raise ValueError("--holding-period-minutes must be positive")
     if args.top_k_per_minute < 0:
         raise ValueError("--top-k-per-minute cannot be negative")
+    if not 0.0 <= args.min_profitable_fold_rate <= 1.0:
+        raise ValueError("--min-profitable-fold-rate must be between 0 and 1")
+    if args.max_worst_fold_drawdown < 0.0:
+        raise ValueError("--max-worst-fold-drawdown cannot be negative")
     if args.upside_target <= 0.0:
         raise ValueError("--upside-target must be positive")
     if args.downside_stop <= 0.0:
@@ -11268,6 +13037,10 @@ def main(argv):
         print("Cache-only mode enabled: using existing compatible binary cache", flush=True)
     if args.inspect_cache:
         inspect_cache(args, training_manifest_for_args, training_manifest_path(args.input))
+        write_pipeline_profile(args.profile_out)
+        return 0
+    if args.cache_report:
+        cache_report(args, training_manifest_for_args, training_manifest_path(args.input))
         write_pipeline_profile(args.profile_out)
         return 0
     if args.cache_cleanup:

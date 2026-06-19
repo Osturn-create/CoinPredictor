@@ -6,7 +6,7 @@
 // validation month, then writes predictions for a held-out test month.
 //
 // Build standalone:
-//   g++ -std=c++11 -DDATASCRAPER_STANDALONE DataScraper.cpp -o data_scraper
+//   g++ -std=c++11 -DDATASCRAPER_STANDALONE DataScraper.cpp -o data_scraper -lz
 //
 // Run:
 //   ./data_scraper BTCUSDT --months 8
@@ -33,6 +33,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <zlib.h>
 
 #ifdef _WIN32
 #include <direct.h>
@@ -145,6 +146,7 @@ struct ScraperOptions {
           marketRegimeFeatures(false),
           marketBreadthFeatures(false),
           marketBreadthMinSymbols(kDefaultMarketBreadthMinSymbols),
+          compressShards("none"),
           shardOutputDir(""),
           skipCombinedOutput(false),
           generateOnly(false),
@@ -209,6 +211,7 @@ struct ScraperOptions {
     bool marketRegimeFeatures;
     bool marketBreadthFeatures;
     int marketBreadthMinSymbols;
+    std::string compressShards;
     std::string shardOutputDir;
     bool skipCombinedOutput;
     bool generateOnly;
@@ -739,6 +742,7 @@ void printUsage() {
         << "  --test-ratio X             Ratio split test fraction (default 0.15).\n"
         << "  --generate-only            Write kline_growth_training.csv and skip in-memory C++ logistic training.\n"
         << "  --shard-output-dir DIR     Also write symbol/month shard CSVs and manifests under DIR.\n"
+        << "  --compress-shards MODE     Shard CSV compression: gzip or none (default none).\n"
         << "  --skip-combined-output     Skip rewriting kline_growth_training.csv when using shard output.\n"
         << "  --self-test                Run fast offline label sanity checks and exit.\n"
         << "  --train-months N           Training months for C++ logistic split (default 6).\n"
@@ -806,6 +810,8 @@ bool parseArguments(
             options.generateOnly = true;
         } else if (arg == "--shard-output-dir" || startsWith(arg, "--shard-output-dir=")) {
             options.shardOutputDir = optionValue(args, i, "--shard-output-dir", arg);
+        } else if (arg == "--compress-shards" || startsWith(arg, "--compress-shards=")) {
+            options.compressShards = optionValue(args, i, "--compress-shards", arg);
         } else if (arg == "--skip-combined-output") {
             options.skipCombinedOutput = true;
         } else if (arg == "--self-test") {
@@ -899,6 +905,9 @@ bool parseArguments(
     if (options.splitMode != "fixed" && options.splitMode != "ratio") {
         throw std::runtime_error("--split-mode must be fixed or ratio");
     }
+    if (options.compressShards != "none" && options.compressShards != "gzip") {
+        throw std::runtime_error("--compress-shards must be gzip or none");
+    }
     if (options.trainRatio <= 0.0 || options.validationRatio <= 0.0 || options.testRatio <= 0.0) {
         throw std::runtime_error("--train-ratio, --validation-ratio, and --test-ratio must be positive");
     }
@@ -947,9 +956,6 @@ bool parseArguments(
     }
     if (options.labelMode == "target_stop" && options.upsideTarget - options.fee - options.slippage < options.minNetReturn) {
         throw std::runtime_error("--upside-target minus fee and slippage must be at least --min-net-return");
-    }
-    if (options.marketBreadthFeatures && !options.marketRegimeFeatures) {
-        options.marketRegimeFeatures = true;
     }
     if (options.skipCombinedOutput && options.shardOutputDir.empty()) {
         throw std::runtime_error("--skip-combined-output requires --shard-output-dir");
@@ -2320,12 +2326,76 @@ std::string shardSymbolDir(const std::string &baseDir, const std::string &symbol
     return pathJoin(shardRootDir(baseDir), symbol);
 }
 
-std::string shardCsvPath(const std::string &baseDir, const std::string &symbol, const std::string &month) {
-    return pathJoin(shardSymbolDir(baseDir, symbol), month + ".csv");
+std::string shardCompressionSuffix(const ScraperOptions &options) {
+    if (options.compressShards == "gzip") {
+        return ".csv.gz";
+    }
+    return ".csv";
+}
+
+std::string shardRelativeCsvPath(const ScraperOptions &options, const std::string &symbol, const std::string &month) {
+    return pathJoin(pathJoin("shards", symbol), month + shardCompressionSuffix(options));
+}
+
+std::string shardCsvPath(const ScraperOptions &options, const std::string &baseDir, const std::string &symbol, const std::string &month) {
+    return pathJoin(baseDir, shardRelativeCsvPath(options, symbol, month));
 }
 
 std::string shardManifestPath(const std::string &baseDir, const std::string &symbol, const std::string &month) {
     return pathJoin(shardSymbolDir(baseDir, symbol), month + ".meta.json");
+}
+
+void writeTextFile(const std::string &path, const std::string &content) {
+    std::ofstream out(path.c_str(), std::ios::binary);
+    if (!out) {
+        throw std::runtime_error("Unable to open file for writing: " + path);
+    }
+    out.write(content.data(), static_cast<std::streamsize>(content.size()));
+    out.close();
+    if (!out) {
+        throw std::runtime_error("Unable to finish writing file: " + path);
+    }
+}
+
+void writeGzipFile(const std::string &path, const std::string &content) {
+    gzFile out = gzopen(path.c_str(), "wb");
+    if (out == NULL) {
+        throw std::runtime_error("Unable to open gzip file for writing: " + path);
+    }
+    const char *data = content.data();
+    size_t remaining = content.size();
+    while (remaining > 0) {
+        const unsigned int chunk = remaining > static_cast<size_t>(INT_MAX)
+            ? static_cast<unsigned int>(INT_MAX)
+            : static_cast<unsigned int>(remaining);
+        const int written = gzwrite(out, data, chunk);
+        if (written <= 0 || static_cast<unsigned int>(written) != chunk) {
+            const char *message = gzerror(out, NULL);
+            gzclose(out);
+            throw std::runtime_error(
+                "Unable to finish writing gzip file " + path + ": " + (message ? message : "unknown error")
+            );
+        }
+        data += written;
+        remaining -= static_cast<size_t>(written);
+    }
+    if (gzclose(out) != Z_OK) {
+        throw std::runtime_error("Unable to close gzip file cleanly: " + path);
+    }
+}
+
+void writeShardCsvFile(
+    const std::string &path,
+    const ScraperOptions &options,
+    const std::vector<Sample> &samples) {
+    std::ostringstream buffer;
+    writeTrainingCsvHeader(buffer, options);
+    writeTrainingCsvRows(buffer, samples);
+    if (options.compressShards == "gzip") {
+        writeGzipFile(path, buffer.str());
+        return;
+    }
+    writeTextFile(path, buffer.str());
 }
 
 void writeCommonTrainingManifestFields(
@@ -2377,6 +2447,8 @@ void writeShardManifestFile(
     out << "  \"generator_build\": \"" << jsonEscape(std::string(__DATE__) + " " + std::string(__TIME__)) << "\",\n";
     out << "  \"symbol\": \"" << jsonEscape(symbol) << "\",\n";
     out << "  \"month\": \"" << jsonEscape(month) << "\",\n";
+    out << "  \"csv_path\": \"" << jsonEscape(shardRelativeCsvPath(options, symbol, month)) << "\",\n";
+    out << "  \"compression\": \"" << jsonEscape(options.compressShards) << "\",\n";
     out << "  \"row_count\": " << rowsWritten << ",\n";
     writeCommonTrainingManifestFields(out, options, names);
     out << "\n}\n";
@@ -2401,19 +2473,17 @@ public:
     void write(const std::string &symbol, const std::string &month, const std::vector<Sample> &samples) {
         const std::string symbolDir = shardSymbolDir(baseDir_, symbol);
         ensureDirectoryRecursive(symbolDir);
-        const std::string csvPath = shardCsvPath(baseDir_, symbol, month);
-        std::ofstream out(csvPath.c_str());
-        if (!out) {
-            throw std::runtime_error("Unable to open shard CSV for writing: " + csvPath);
-        }
-        writeTrainingCsvHeader(out, options_);
-        writeTrainingCsvRows(out, samples);
-        out.close();
-        if (!out) {
-            throw std::runtime_error("Unable to finish writing shard CSV: " + csvPath);
-        }
+        const std::string csvPath = shardCsvPath(options_, baseDir_, symbol, month);
+        writeShardCsvFile(csvPath, options_, samples);
         writeShardManifestFile(shardManifestPath(baseDir_, symbol, month), options_, symbol, month, samples.size());
         rowsWritten_ += samples.size();
+        ShardRecord record;
+        record.symbol = symbol;
+        record.month = month;
+        record.csvPath = shardRelativeCsvPath(options_, symbol, month);
+        record.compression = options_.compressShards;
+        record.rowCount = samples.size();
+        shardRecords_.push_back(record);
     }
 
     void writeDatasetManifest(const std::vector<std::string> &symbols) const {
@@ -2434,6 +2504,19 @@ public:
         out << "  \"current_run_requested_symbols\": ";
         writeJsonStringArray(out, symbols);
         out << ",\n";
+        out << "  \"shards\": [\n";
+        for (size_t i = 0; i < shardRecords_.size(); ++i) {
+            out << "    {\"symbol\": \"" << jsonEscape(shardRecords_[i].symbol)
+                << "\", \"month\": \"" << jsonEscape(shardRecords_[i].month)
+                << "\", \"csv_path\": \"" << jsonEscape(shardRecords_[i].csvPath)
+                << "\", \"compression\": \"" << jsonEscape(shardRecords_[i].compression)
+                << "\", \"row_count\": " << shardRecords_[i].rowCount << "}";
+            if (i + 1 < shardRecords_.size()) {
+                out << ',';
+            }
+            out << '\n';
+        }
+        out << "  ],\n";
         writeCommonTrainingManifestFields(out, options_, names);
         out << "\n}\n";
         out.close();
@@ -2452,9 +2535,18 @@ public:
     }
 
 private:
+    struct ShardRecord {
+        std::string symbol;
+        std::string month;
+        std::string csvPath;
+        std::string compression;
+        size_t rowCount;
+    };
+
     const ScraperOptions &options_;
     std::string baseDir_;
     size_t rowsWritten_;
+    std::vector<ShardRecord> shardRecords_;
 };
 
 void writeTrainingManifest(

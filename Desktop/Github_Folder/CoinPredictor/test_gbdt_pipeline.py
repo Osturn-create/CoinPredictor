@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import csv
 import gzip
+import io
 import json
 import os
 import tempfile
@@ -56,7 +57,8 @@ def write_training_manifest(path, label_mode="target_stop", growth_threshold=0.0
     return manifest_path
 
 
-def shard_dataset_manifest(feature_names=None, upside_target=0.02, downside_stop=0.02):
+def shard_dataset_manifest(feature_names=None, upside_target=0.02, downside_stop=0.02,
+                           market_breadth_min_symbols=5, shards=None):
     names = feature_names or ["log_quote_volume", "ret_1m"]
     return {
         "version": 1,
@@ -82,12 +84,27 @@ def shard_dataset_manifest(feature_names=None, upside_target=0.02, downside_stop
         "test_months": 1,
         "market_regime_features": False,
         "market_breadth_features": False,
+        "market_breadth_min_symbols": market_breadth_min_symbols,
+        "shards": list(shards or []),
     }
 
 
-def write_sharded_dataset(dataset_dir, shards):
+def write_sharded_dataset(dataset_dir, shards, compression="none"):
     os.makedirs(os.path.join(dataset_dir, "shards"), exist_ok=True)
-    manifest = shard_dataset_manifest()
+    manifest = shard_dataset_manifest(shards=[
+        {
+            "symbol": shard["symbol"],
+            "month": shard["month"],
+            "csv_path": "shards/{}/{}{}".format(
+                shard["symbol"],
+                shard["month"],
+                ".csv.gz" if compression == "gzip" else ".csv",
+            ),
+            "compression": compression,
+            "row_count": len(shard["rows"]),
+        }
+        for shard in shards
+    ])
     with open(os.path.join(dataset_dir, "kline_growth_dataset.meta.json"), "w", encoding="utf-8") as handle:
         json.dump(manifest, handle, indent=2, sort_keys=True)
     for shard in shards:
@@ -96,18 +113,28 @@ def write_sharded_dataset(dataset_dir, shards):
         rows = shard["rows"]
         symbol_dir = os.path.join(dataset_dir, "shards", symbol)
         os.makedirs(symbol_dir, exist_ok=True)
-        csv_path = os.path.join(symbol_dir, "{}.csv".format(month))
-        with open(csv_path, "w", newline="") as handle:
-            writer = csv.writer(handle)
-            writer.writerow(HEADER)
-            for item in rows:
-                writer.writerow(item)
+        csv_name = "{}{}".format(month, ".csv.gz" if compression == "gzip" else ".csv")
+        csv_path = os.path.join(symbol_dir, csv_name)
+        if compression == "gzip":
+            with gzip.open(csv_path, "wt", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(HEADER)
+                for item in rows:
+                    writer.writerow(item)
+        else:
+            with open(csv_path, "w", newline="") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(HEADER)
+                for item in rows:
+                    writer.writerow(item)
         shard_manifest = dict(manifest)
         shard_manifest.update({
             "version": 1,
             "kind": "symbol_month_shard",
             "symbol": symbol,
             "month": month,
+            "csv_path": "shards/{}/{}".format(symbol, csv_name),
+            "compression": compression,
             "row_count": len(rows),
         })
         with open(os.path.join(symbol_dir, "{}.meta.json".format(month)), "w", encoding="utf-8") as handle:
@@ -240,6 +267,25 @@ class PipelineTests(unittest.TestCase):
         rows.cleanup()
 
     @unittest.skipUnless(pipeline.np is not None, "requires numpy-backed compact cache")
+    def test_gzip_sharded_dataset_loads_without_decompressing_first(self):
+        dataset_dir = os.path.join(self.temp.name, "dataset")
+        write_sharded_dataset(dataset_dir, [
+            {
+                "symbol": "AAAUSDT",
+                "month": "2020-01",
+                "rows": [
+                    self.shard_row("AAAUSDT", "2020-01", 0, 1600000000000, 1, 0.02, 100000.0),
+                    self.shard_row("AAAUSDT", "2020-01", 0, 1600000060000, 0, -0.01, 100500.0),
+                ],
+            },
+        ], compression="gzip")
+        rows, features, has_returns = pipeline.load_rows(dataset_dir, "memmap32", cache_dir=os.path.join(self.temp.name, "cache"))
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(features, ["log_quote_volume", "ret_1m"])
+        self.assertTrue(has_returns)
+        rows.cleanup()
+
+    @unittest.skipUnless(pipeline.np is not None, "requires numpy-backed compact cache")
     def test_cache_rebuilds_when_csv_timestamp_changes(self):
         cache_dir = os.path.join(self.temp.name, "cache")
         rows, _, _ = pipeline.load_rows(self.csv_path, "memmap32", cache_dir=cache_dir)
@@ -253,7 +299,7 @@ class PipelineTests(unittest.TestCase):
     @unittest.skipUnless(pipeline.np is not None, "requires numpy-backed compact cache")
     def test_sharded_dataset_cache_reuses_existing_shards_when_adding_new_one(self):
         dataset_dir = os.path.join(self.temp.name, "dataset")
-        write_sharded_dataset(dataset_dir, [
+        existing_shards = [
             {
                 "symbol": "AAAUSDT",
                 "month": "2020-01",
@@ -269,7 +315,8 @@ class PipelineTests(unittest.TestCase):
                     self.shard_row("BBBUSDT", "2020-01", 0, 1600000000000, 0, -0.005, 200000.0),
                 ],
             },
-        ])
+        ]
+        write_sharded_dataset(dataset_dir, existing_shards)
         cache_dir = os.path.join(self.temp.name, "cache")
         rows, features, _ = pipeline.load_rows(dataset_dir, "memmap32", cache_dir=cache_dir)
         self.assertEqual(len(rows), 3)
@@ -277,16 +324,17 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(pipeline.CACHE_LOAD_INFO["status"], "rebuilt")
         shard_cache_dir = pipeline.CACHE_LOAD_INFO["paths"]["shard_cache_dir"]
         shard_manifests = sorted(
-            os.path.join(shard_cache_dir, name)
-            for name in os.listdir(shard_cache_dir)
-            if name.endswith(".manifest.json")
+            os.path.join(root, name)
+            for root, _, files in os.walk(shard_cache_dir)
+            for name in files
+            if name == "shard_cache_manifest.json"
         )
         self.assertEqual(len(shard_manifests), 2)
         first_manifest = shard_manifests[0]
         first_stat = os.stat(first_manifest)
         rows.cleanup()
 
-        write_sharded_dataset(dataset_dir, [
+        write_sharded_dataset(dataset_dir, existing_shards + [
             {
                 "symbol": "CCCUSDT",
                 "month": "2020-01",
@@ -300,6 +348,39 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(pipeline.CACHE_LOAD_INFO["status"], "rebuilt")
         second_stat = os.stat(first_manifest)
         self.assertEqual(first_stat.st_mtime_ns, second_stat.st_mtime_ns)
+        rows.cleanup()
+
+    @unittest.skipUnless(pipeline.np is not None, "requires numpy-backed compact cache")
+    def test_sharded_dataset_manifest_inventory_ignores_stale_unlisted_shards(self):
+        dataset_dir = os.path.join(self.temp.name, "dataset")
+        write_sharded_dataset(dataset_dir, [
+            {
+                "symbol": "AAAUSDT",
+                "month": "2020-01",
+                "rows": [
+                    self.shard_row("AAAUSDT", "2020-01", 0, 1600000000000, 1, 0.02, 100000.0),
+                ],
+            },
+        ])
+        stale_symbol_dir = os.path.join(dataset_dir, "shards", "STALEUSDT")
+        os.makedirs(stale_symbol_dir, exist_ok=True)
+        with open(os.path.join(stale_symbol_dir, "2020-01.csv"), "w", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(HEADER)
+            writer.writerow(self.shard_row("STALEUSDT", "2020-01", 0, 1600000060000, 0, -0.01, 50000.0))
+        stale_manifest = shard_dataset_manifest()
+        stale_manifest.update({
+            "version": 1,
+            "kind": "symbol_month_shard",
+            "symbol": "STALEUSDT",
+            "month": "2020-01",
+            "row_count": 1,
+        })
+        with open(os.path.join(stale_symbol_dir, "2020-01.meta.json"), "w", encoding="utf-8") as handle:
+            json.dump(stale_manifest, handle, indent=2, sort_keys=True)
+        rows, _, _ = pipeline.load_rows(dataset_dir, "memmap32", cache_dir=os.path.join(self.temp.name, "cache"))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows.table.symbols, ["AAAUSDT"])
         rows.cleanup()
 
     @unittest.skipUnless(pipeline.np is not None, "requires numpy-backed compact cache")
@@ -482,6 +563,117 @@ class PipelineTests(unittest.TestCase):
             ])
         self.assertEqual(status, 0)
 
+    @unittest.skipUnless(pipeline.np is not None, "requires numpy-backed compact cache")
+    def test_cache_report_lists_split_metadata_arrays_for_sharded_dataset(self):
+        dataset_dir = os.path.join(self.temp.name, "dataset")
+        write_sharded_dataset(dataset_dir, [
+            {
+                "symbol": "AAAUSDT",
+                "month": "2020-01",
+                "rows": [
+                    self.shard_row("AAAUSDT", "2020-01", 0, 1600000000000, 1, 0.02, 100000.0),
+                ],
+            },
+        ])
+        cache_dir = os.path.join(self.temp.name, "cache")
+        rows, _, _ = pipeline.load_rows(dataset_dir, "memmap32", cache_dir=cache_dir)
+        rows.cleanup()
+        parser = pipeline.build_parser()
+        args = parser.parse_args([
+            "--input", dataset_dir,
+            "--feature-storage", "memmap32",
+            "--cache-dir", cache_dir,
+        ])
+        output = io.StringIO()
+        with mock.patch("sys.stdout", output):
+            status = pipeline.cache_report(
+                args,
+                *pipeline.load_training_manifest(dataset_dir)
+            )
+        self.assertEqual(status, 0)
+        text = output.getvalue()
+        self.assertIn("dataset_type=sharded", text)
+        self.assertIn("shard_cache_hits=1", text)
+        self.assertIn("metadata_arrays.symbol_codes", text)
+
+    @unittest.skipUnless(pipeline.np is not None, "requires numpy-backed compact cache")
+    def test_cache_cleanup_preserves_active_monolithic_cache_files(self):
+        cache_dir = os.path.join(self.temp.name, "cache")
+        rows, _, _ = pipeline.load_rows(self.csv_path, "memmap32", cache_dir=cache_dir)
+        paths = dict(pipeline.CACHE_LOAD_INFO["paths"])
+        rows.cleanup()
+        status = pipeline.cache_cleanup(SimpleNamespace(
+            input=self.csv_path,
+            cache_dir=cache_dir,
+            dry_run=False,
+            confirm_delete=True,
+        ))
+        self.assertEqual(status, 0)
+        self.assertTrue(os.path.exists(paths["features"]))
+        self.assertTrue(all(os.path.exists(path) for path in paths["metadata_arrays"].values()))
+        self.assertTrue(os.path.exists(paths["manifest"]))
+
+    @unittest.skipUnless(pipeline.np is not None, "requires numpy-backed compact cache")
+    def test_cache_cleanup_preserves_active_sharded_cache_files(self):
+        dataset_dir = os.path.join(self.temp.name, "dataset")
+        write_sharded_dataset(dataset_dir, [
+            {
+                "symbol": "AAAUSDT",
+                "month": "2020-01",
+                "rows": [
+                    self.shard_row("AAAUSDT", "2020-01", 0, 1600000000000, 1, 0.02, 100000.0),
+                ],
+            },
+        ])
+        cache_dir = os.path.join(self.temp.name, "cache")
+        rows, _, _ = pipeline.load_rows(dataset_dir, "memmap32", cache_dir=cache_dir)
+        paths = dict(pipeline.CACHE_LOAD_INFO["paths"])
+        shard_cache_dir = paths["shard_cache_dir"]
+        shard_cache_files = sorted(
+            os.path.join(shard_cache_dir, name)
+            for name in os.listdir(shard_cache_dir)
+        )
+        rows.cleanup()
+        status = pipeline.cache_cleanup(SimpleNamespace(
+            input=dataset_dir,
+            cache_dir=cache_dir,
+            dry_run=False,
+            confirm_delete=True,
+        ))
+        self.assertEqual(status, 0)
+        self.assertTrue(os.path.exists(paths["features"]))
+        self.assertTrue(all(os.path.exists(path) for path in paths["metadata_arrays"].values()))
+        self.assertTrue(os.path.exists(paths["manifest"]))
+        self.assertTrue(os.path.isdir(shard_cache_dir))
+        self.assertTrue(all(os.path.exists(path) for path in shard_cache_files))
+
+    @unittest.skipUnless(pipeline.np is not None, "requires numpy-backed compact cache")
+    def test_monolithic_cache_rebuild_clears_stale_sharded_state(self):
+        dataset_dir = os.path.join(self.temp.name, "dataset")
+        write_sharded_dataset(dataset_dir, [
+            {
+                "symbol": "AAAUSDT",
+                "month": "2020-01",
+                "rows": [
+                    self.shard_row("AAAUSDT", "2020-01", 0, 1600000000000, 1, 0.02, 100000.0),
+                ],
+            },
+        ])
+        sharded_cache_dir = os.path.join(self.temp.name, "sharded-cache")
+        rows, _, _ = pipeline.load_rows(dataset_dir, "memmap32", cache_dir=sharded_cache_dir)
+        rows.cleanup()
+        self.assertTrue(pipeline.CACHE_LOAD_INFO.get("sharded_dataset"))
+        monolithic_cache_dir = os.path.join(self.temp.name, "monolithic-cache")
+        rows, _, _ = pipeline.load_rows(
+            self.csv_path,
+            "memmap32",
+            cache_dir=monolithic_cache_dir,
+            rebuild_cache=True,
+        )
+        self.assertEqual(pipeline.CACHE_LOAD_INFO["status"], "rebuilt")
+        self.assertNotIn("sharded_dataset", pipeline.CACHE_LOAD_INFO)
+        rows.cleanup()
+
     def test_missing_liquidity_column_fails_clearly(self):
         path = os.path.join(self.temp.name, "missing-liquidity.csv")
         with open(path, "w", newline="") as handle:
@@ -535,6 +727,78 @@ class PipelineTests(unittest.TestCase):
         with mock.patch.object(pipeline.os, "getcwd", return_value=self.temp.name):
             recovered = pipeline.discover_recoverable_default_dataset(requested_path)
         self.assertIsNone(recovered)
+
+    def test_manifest_compatibility_signature_includes_market_breadth_min_symbols(self):
+        left = shard_dataset_manifest(market_breadth_min_symbols=5)
+        right = shard_dataset_manifest(market_breadth_min_symbols=10)
+        self.assertNotEqual(
+            pipeline.manifest_compatibility_signature(left),
+            pipeline.manifest_compatibility_signature(right),
+        )
+
+    def test_default_input_recovery_skips_invalid_local_shard_manifest(self):
+        requested_path = os.path.join(self.temp.name, "kline_growth_training.csv")
+        invalid_dir = os.path.join(self.temp.name, "invalid_dataset")
+        os.makedirs(invalid_dir, exist_ok=True)
+        with open(os.path.join(invalid_dir, pipeline.SHARDED_DATASET_MANIFEST), "w", encoding="utf-8") as handle:
+            json.dump({"version": 999, "kind": "old_layout"}, handle)
+        valid_dir = os.path.join(self.temp.name, "valid_dataset")
+        os.makedirs(valid_dir, exist_ok=True)
+        with open(os.path.join(valid_dir, pipeline.SHARDED_DATASET_MANIFEST), "w", encoding="utf-8") as handle:
+            json.dump(shard_dataset_manifest(), handle)
+        with mock.patch.object(pipeline.os, "getcwd", return_value=self.temp.name):
+            recovered = pipeline.discover_recoverable_default_dataset(requested_path)
+        self.assertIsNotNone(recovered)
+        self.assertEqual(recovered["input_path"], os.path.abspath(valid_dir))
+
+    @unittest.skipUnless(pipeline.np is not None, "requires numpy-backed compact rows")
+    def test_monolithic_csv_reindexes_month_indices_globally(self):
+        path = os.path.join(self.temp.name, "mixed.csv")
+        with open(path, "w", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(HEADER)
+            writer.writerow([
+                "AAAUSDT", "2020-01", 0, 1600000000000, 1,
+                0.01, 0.01, 0.02, -0.01, 100000.0, pipeline.math.log1p(100000.0), 0.0,
+            ])
+            writer.writerow([
+                "BBBUSDT", "2020-03", 0, 1605000000000, 0,
+                -0.01, -0.01, 0.01, -0.02, 120000.0, pipeline.math.log1p(120000.0), 0.0,
+            ])
+        rows, _, _ = pipeline.load_rows(path, "memmap32", disable_cache=True, memmap_dir=self.temp.name)
+        observed = {}
+        for position in range(len(rows.table.labels)):
+            month_name = rows.table.months[int(rows.table.month_codes[position])]
+            observed[month_name] = int(rows.table.month_indices[position])
+        self.assertEqual(observed["2020-01"], 0)
+        self.assertEqual(observed["2020-03"], 1)
+        rows.cleanup()
+
+    def test_sharded_object_rows_reindex_months_globally_without_cache(self):
+        dataset_dir = os.path.join(self.temp.name, "dataset")
+        write_sharded_dataset(dataset_dir, [
+            {
+                "symbol": "AAAUSDT",
+                "month": "2020-01",
+                "rows": [
+                    self.shard_row("AAAUSDT", "2020-01", 0, 1600000000000, 1, 0.02, 100000.0),
+                ],
+            },
+            {
+                "symbol": "BBBUSDT",
+                "month": "2020-03",
+                "rows": [
+                    self.shard_row("BBBUSDT", "2020-03", 0, 1605000000000, 0, -0.01, 120000.0),
+                ],
+            },
+        ])
+        rows, _, _ = pipeline.load_rows(dataset_dir, "float32", disable_cache=True)
+        observed = {
+            row.month: row.month_index
+            for row in rows
+        }
+        self.assertEqual(observed["2020-01"], 0)
+        self.assertEqual(observed["2020-03"], 1)
 
     def test_target_stop_manifest_rejects_uncapped_trade_returns(self):
         path = os.path.join(self.temp.name, "kline_growth_training.csv")
@@ -2495,6 +2759,79 @@ class PipelineTests(unittest.TestCase):
                 matched = True
                 break
         self.assertTrue(matched)
+
+    def test_apply_split_embargo_removes_boundary_rows(self):
+        train_rows = [row(0), row(4 * 60 * 1000), row(8 * 60 * 1000)]
+        validation_rows = [row(20 * 60 * 1000), row(24 * 60 * 1000), row(28 * 60 * 1000)]
+        test_rows = [row(40 * 60 * 1000), row(44 * 60 * 1000), row(48 * 60 * 1000)]
+        train_rows, validation_rows, test_rows, summary = pipeline.apply_split_embargo(
+            train_rows,
+            validation_rows,
+            test_rows,
+            5,
+        )
+        self.assertEqual(len(train_rows), 3)
+        self.assertEqual(len(validation_rows), 1)
+        self.assertEqual(len(test_rows), 1)
+        self.assertEqual(summary["embargo_minutes"], 5)
+        self.assertEqual(summary["embargo_validation_rows_removed"], 2)
+        self.assertEqual(summary["embargo_test_rows_removed"], 2)
+
+    def test_calibration_report_from_predictions_prefers_calibrated_probability(self):
+        path = os.path.join(self.temp.name, "predictions.csv")
+        with open(path, "w", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow([
+                "symbol", "month", "month_index", "open_time", "label",
+                "probability", "calibrated_probability", "selected_threshold",
+                "forward_return", "trade_return", "predicted",
+            ])
+            writer.writerow(["BTCUSDT", "2020-01", 0, 0, 1, 0.9, 0.8, 0.5, 0.02, 0.01, 1])
+            writer.writerow(["BTCUSDT", "2020-01", 0, 60000, 0, 0.2, 0.3, 0.5, -0.01, -0.02, 0])
+        rows, summary = pipeline.calibration_report_from_predictions(path)
+        self.assertEqual(len(rows), 20)
+        self.assertIn("brier_score", summary)
+        self.assertGreaterEqual(summary["expected_calibration_error"], 0.0)
+        self.assertTrue(any(row["probability_source"] == "calibrated_probability" for row in rows))
+
+    def test_portfolio_execution_blocks_symbol_during_loss_cooldown(self):
+        base_time = 1600000000000
+        rows = [
+            symbol_row("BTCUSDT", base_time, label=0, trade_return=-0.10),
+            symbol_row("BTCUSDT", base_time + 2 * 60 * 1000, label=1, trade_return=0.05),
+            symbol_row("BTCUSDT", base_time + 20 * 60 * 1000, label=1, trade_return=0.05),
+        ]
+        args = SimpleNamespace(
+            fee_mode="fixed",
+            position_sizing_mode="fixed_fraction",
+            min_order_notional=0.0,
+            lot_size_step=0.0,
+            tick_size=0.0,
+            latency_penalty_bps=0.0,
+            partial_fill_mode="none",
+            max_open_positions=0,
+            max_daily_loss_fraction=0.0,
+            cooldown_after_loss_minutes=10,
+            meta_filter="none",
+            volatility_high_threshold=0.02,
+            upside_target=0.05,
+        )
+        execution = pipeline.portfolio_execution(
+            rows,
+            pipeline.build_prediction_bundle(probability=[1.0, 1.0, 1.0], calibrated_probability=[1.0, 1.0, 1.0]),
+            0.5,
+            0.0,
+            0.0,
+            100.0,
+            1.0,
+            1.0,
+            0,
+            60,
+            1,
+            hybrid_runtime_args=args,
+        )
+        self.assertEqual(len(execution["executed"]), 2)
+        self.assertEqual(execution["cooldown_after_loss_blocked"], 1)
 
     def test_summary_output_includes_new_fields(self):
         args = SimpleNamespace(
