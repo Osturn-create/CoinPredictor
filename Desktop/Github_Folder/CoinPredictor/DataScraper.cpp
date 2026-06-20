@@ -1725,6 +1725,11 @@ public:
             }
         }
         cache_[key] = buildMarketBreadthDataFromReferences(references, minimumBreadthSymbols_);
+        // The finished breadth summary is all later symbols need for this month.
+        // Keeping every symbol-month reference alive across the whole run causes
+        // --months all to grow into multiple gigabytes and the OS can kill the
+        // process mid-generation without a catchable C++ exception.
+        std::map<std::string, RegimeReferenceData>().swap(references_);
         return &cache_[key];
     }
 
