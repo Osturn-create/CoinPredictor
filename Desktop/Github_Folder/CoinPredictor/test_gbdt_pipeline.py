@@ -866,14 +866,30 @@ class PipelineTests(unittest.TestCase):
         args = parser.parse_args([])
         self.assertEqual(args.walk_forward_final_model, "selected")
         self.assertEqual(args.walk_validation_months, 1)
+        self.assertEqual(args.walk_test_months, 1)
 
     def test_walk_forward_split_bounds_use_full_train_window(self):
-        train_start, train_end, validation_start, validation_end, test_month = (
+        train_start, train_end, validation_start, validation_end, test_start, test_end = (
             pipeline.walk_forward_split_bounds(0, 6, 1)
         )
         self.assertEqual((train_start, train_end), (0, 6))
         self.assertEqual((validation_start, validation_end), (6, 7))
-        self.assertEqual(test_month, 7)
+        self.assertEqual((test_start, test_end), (7, 8))
+
+    def test_walk_forward_split_bounds_support_multi_month_test_windows(self):
+        train_start, train_end, validation_start, validation_end, test_start, test_end = (
+            pipeline.walk_forward_split_bounds(0, 24, 4, 4)
+        )
+        self.assertEqual((train_start, train_end), (0, 24))
+        self.assertEqual((validation_start, validation_end), (24, 28))
+        self.assertEqual((test_start, test_end), (28, 32))
+
+    def test_single_month_label_uses_range_for_multi_month_windows(self):
+        rows = [
+            symbol_row("TESTUSDT", 1600000000000),
+            pipeline.DataRow("TESTUSDT", "2020-02", 1, 1602688400000, 0, 0.01, 0.01, 0.01, 0.0, 1000000.0, [0.0, 0.0]),
+        ]
+        self.assertEqual(pipeline.single_month_label(rows), "2020-01..2020-02")
 
     def test_inactive_fold_blocker_check_identifies_probability_threshold(self):
         rows = [
@@ -1094,6 +1110,34 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(threshold, 0.75)
         self.assertEqual(metrics["predicted_trades"], 2)
 
+    def test_threshold_diagnostics_capture_rejection_reasons(self):
+        base = 1600000000000
+        rows = [row(base + index * 60000, label=1 if index < 2 else 0) for index in range(4)]
+        selection = pipeline.tune_threshold(
+            rows,
+            [0.9, 0.8, 0.7, 0.6],
+            [0.5, 0.75],
+            "precision",
+            0.0,
+            0.0,
+            1,
+            1,
+            0.75,
+            "explore",
+            10000.0,
+            0.10,
+            0.01,
+            10,
+            60,
+            5,
+        )
+        metrics = selection["validation_metrics"]
+        self.assertEqual(metrics["candidate_threshold_count"], 2)
+        self.assertEqual(metrics["rejected_over_max_trades_count"], 2)
+        self.assertEqual(metrics["rejected_under_min_precision_count"], 1)
+        self.assertEqual(metrics["admissible_candidate_count"], 0)
+        self.assertEqual(metrics["selected_threshold_tie_rank_reason"], "no_trade_fallback")
+
     def test_threshold_selection_matches_simple_reference(self):
         base = 1600000000000
         rows = [row(base + index * 60000, label=1 if index < 2 else 0, trade_return=0.01 if index < 2 else -0.01) for index in range(4)]
@@ -1222,6 +1266,181 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(metrics["selected_validation_trade_count"], 0)
         self.assertEqual(metrics["predicted_trades"], 0)
         self.assertFalse(pipeline.math.isfinite(metrics["selected_objective_score"]))
+
+    def test_select_threshold_for_bundle_retries_hybrid_expected_return_after_no_trade_fallback(self):
+        rows = [row(1600000000000, trade_return=0.01, quote_volume=1000000000.0)]
+        bundle = pipeline.build_prediction_bundle(
+            probability=[0.6],
+            calibrated_probability=[0.6],
+            predicted_trade_return=[0.02],
+        )
+        args = SimpleNamespace(
+            threshold_objective="avg_profit",
+            fee=0.0,
+            slippage=0.0,
+            validation_slippage_multiplier=1.0,
+            min_validation_trades=1,
+            max_validation_trades=0,
+            min_validation_precision=0.0,
+            profit_safety="explore",
+            initial_capital=10000.0,
+            max_position_fraction=0.10,
+            max_volume_fraction=0.01,
+            max_trades_per_period=10,
+            trade_period_minutes=60,
+            holding_period_minutes=5,
+            trade_selection="topk_score",
+            top_k_per_minute=1,
+            upside_target=0.05,
+            downside_stop=0.02,
+            ev_safety_margin=0.0,
+            objective_mode="hybrid",
+            min_predicted_net_return=0.0,
+            hybrid_min_score=0.0,
+            max_trades_per_day=0,
+            max_losing_trades_per_day=0,
+            max_daily_drawdown=0.0,
+            pause_after_drawdown_minutes=0,
+            threshold_drawdown_penalty=0.0,
+            threshold_trade_count_penalty=0.0,
+            target_validation_trades=0,
+            threshold_tiebreaker="fewer_trades",
+            threshold_tie_epsilon=1e-9,
+            threshold_target_trades=0,
+            threshold_target_active_days=0,
+            hybrid_return_combination="expected_return",
+            hybrid_min_probability=0.5,
+        )
+        bundle["hybrid_return_context"] = pipeline.fit_hybrid_return_context(rows, bundle, args)
+        initial_selection = {
+            "threshold": 1.01,
+            "objective_score": -float("inf"),
+            "penalized_objective_score": -float("inf"),
+            "tie_rank_reason": "no_trade_fallback",
+            "validation_metrics": {
+                "predicted_trades": 0,
+                "portfolio_profit": 0.0,
+                "precision": 0.0,
+                "active_days": 0,
+                "selected_threshold_tie_rank_reason": "no_trade_fallback",
+            },
+        }
+        retry_selection = {
+            "threshold": 0.01,
+            "objective_score": 0.25,
+            "penalized_objective_score": 0.25,
+            "tie_rank_reason": "higher_objective_score",
+            "validation_metrics": {
+                "predicted_trades": 3,
+                "portfolio_profit": 0.75,
+                "precision": 0.5,
+                "active_days": 1,
+                "selected_threshold_tie_rank_reason": "higher_objective_score",
+            },
+        }
+        with mock.patch.object(
+            pipeline,
+            "selected_thresholds_for_bundle",
+            return_value=([0.1], None, None),
+        ), mock.patch.object(
+            pipeline,
+            "tune_threshold",
+            side_effect=[initial_selection, retry_selection],
+        ) as mocked_tune:
+            selection = pipeline.select_threshold_for_bundle(rows, bundle, args, "hybrid")
+        self.assertEqual(selection["validation_metrics"]["predicted_trades"], 3)
+        self.assertTrue(selection["hybrid_return_selection_fallback_used"])
+        self.assertEqual(bundle["hybrid_return_context"]["hybrid_return_combination"], "probability_times_return")
+        self.assertEqual(bundle["hybrid_return_context"]["hybrid_return_combination_fallback_from"], "expected_return")
+        self.assertEqual(selection["validation_metrics"]["hybrid_return_combination_requested"], "expected_return")
+        self.assertEqual(selection["validation_metrics"]["hybrid_return_combination_selected"], "probability_times_return")
+        self.assertEqual(mocked_tune.call_count, 2)
+        self.assertEqual(mocked_tune.call_args_list[1].args[-1].hybrid_return_combination, "probability_times_return")
+
+    def test_select_threshold_for_bundle_keeps_expected_return_when_retry_does_not_improve(self):
+        rows = [row(1600000000000, trade_return=0.01, quote_volume=1000000000.0)]
+        bundle = pipeline.build_prediction_bundle(
+            probability=[0.6],
+            calibrated_probability=[0.6],
+            predicted_trade_return=[0.02],
+        )
+        args = SimpleNamespace(
+            threshold_objective="avg_profit",
+            fee=0.0,
+            slippage=0.0,
+            validation_slippage_multiplier=1.0,
+            min_validation_trades=1,
+            max_validation_trades=0,
+            min_validation_precision=0.0,
+            profit_safety="explore",
+            initial_capital=10000.0,
+            max_position_fraction=0.10,
+            max_volume_fraction=0.01,
+            max_trades_per_period=10,
+            trade_period_minutes=60,
+            holding_period_minutes=5,
+            trade_selection="topk_score",
+            top_k_per_minute=1,
+            upside_target=0.05,
+            downside_stop=0.02,
+            ev_safety_margin=0.0,
+            objective_mode="hybrid",
+            min_predicted_net_return=0.0,
+            hybrid_min_score=0.0,
+            max_trades_per_day=0,
+            max_losing_trades_per_day=0,
+            max_daily_drawdown=0.0,
+            pause_after_drawdown_minutes=0,
+            threshold_drawdown_penalty=0.0,
+            threshold_trade_count_penalty=0.0,
+            target_validation_trades=0,
+            threshold_tiebreaker="fewer_trades",
+            threshold_tie_epsilon=1e-9,
+            threshold_target_trades=0,
+            threshold_target_active_days=0,
+            hybrid_return_combination="expected_return",
+            hybrid_min_probability=0.5,
+        )
+        bundle["hybrid_return_context"] = pipeline.fit_hybrid_return_context(rows, bundle, args)
+        original_context = dict(bundle["hybrid_return_context"])
+        initial_selection = {
+            "threshold": 1.01,
+            "objective_score": -float("inf"),
+            "penalized_objective_score": -float("inf"),
+            "tie_rank_reason": "no_trade_fallback",
+            "validation_metrics": {
+                "predicted_trades": 0,
+                "portfolio_profit": 0.0,
+                "precision": 0.0,
+                "active_days": 0,
+                "selected_threshold_tie_rank_reason": "no_trade_fallback",
+            },
+        }
+        retry_selection = {
+            "threshold": 1.01,
+            "objective_score": -float("inf"),
+            "penalized_objective_score": -float("inf"),
+            "tie_rank_reason": "no_trade_fallback",
+            "validation_metrics": {
+                "predicted_trades": 0,
+                "portfolio_profit": 0.0,
+                "precision": 0.0,
+                "active_days": 0,
+                "selected_threshold_tie_rank_reason": "no_trade_fallback",
+            },
+        }
+        with mock.patch.object(
+            pipeline,
+            "selected_thresholds_for_bundle",
+            return_value=([0.1], None, None),
+        ), mock.patch.object(
+            pipeline,
+            "tune_threshold",
+            side_effect=[initial_selection, retry_selection],
+        ):
+            selection = pipeline.select_threshold_for_bundle(rows, bundle, args, "hybrid")
+        self.assertIs(selection, initial_selection)
+        self.assertEqual(bundle["hybrid_return_context"], original_context)
 
     def test_penalties_can_change_selected_candidate(self):
         low_trade_metrics = {
@@ -2059,6 +2278,48 @@ class PipelineTests(unittest.TestCase):
         self.assertGreater(len(thresholds), 1)
         self.assertIn(0.001, thresholds)
         self.assertTrue(all(value >= 0.001 for value in thresholds))
+
+    def test_selected_thresholds_for_bundle_topk_classification_falls_back_to_adaptive_grid(self):
+        rows = [row(1600000000000 + index * 60000, label=1 if index % 2 == 0 else 0) for index in range(12)]
+        bundle = pipeline.build_prediction_bundle(
+            probability=[0.011, 0.012, 0.013, 0.014, 0.015, 0.016, 0.017, 0.018, 0.019, 0.021, 0.024, 0.03],
+            calibrated_probability=[0.011, 0.012, 0.013, 0.014, 0.015, 0.016, 0.017, 0.018, 0.019, 0.021, 0.024, 0.03],
+        )
+        args = SimpleNamespace(
+            objective_mode="classification",
+            thresholds=[0.001, 0.005, 0.01, 0.02, 0.05],
+            disable_adaptive_thresholds=False,
+            min_validation_trades=5,
+            adaptive_threshold_sample_rows=1000000,
+            min_selected_threshold=0.05,
+            trade_selection="topk_score",
+        )
+        thresholds, fixed_threshold, score_values = pipeline.selected_thresholds_for_bundle(bundle, rows, args)
+        self.assertIsNone(fixed_threshold)
+        self.assertIs(score_values, bundle["calibrated_probability"])
+        self.assertGreaterEqual(len(thresholds), 1)
+        self.assertNotEqual(thresholds, [1.01])
+        self.assertLessEqual(max(thresholds), 0.03)
+
+    def test_selected_thresholds_for_bundle_threshold_classification_still_uses_no_trade_fallback(self):
+        rows = [row(1600000000000 + index * 60000, label=1 if index % 2 == 0 else 0) for index in range(12)]
+        bundle = pipeline.build_prediction_bundle(
+            probability=[0.011, 0.012, 0.013, 0.014, 0.015, 0.016, 0.017, 0.018, 0.019, 0.021, 0.024, 0.03],
+            calibrated_probability=[0.011, 0.012, 0.013, 0.014, 0.015, 0.016, 0.017, 0.018, 0.019, 0.021, 0.024, 0.03],
+        )
+        args = SimpleNamespace(
+            objective_mode="classification",
+            thresholds=[0.001, 0.005, 0.01, 0.02, 0.05],
+            disable_adaptive_thresholds=False,
+            min_validation_trades=5,
+            adaptive_threshold_sample_rows=1000000,
+            min_selected_threshold=0.05,
+            trade_selection="threshold",
+        )
+        thresholds, fixed_threshold, score_values = pipeline.selected_thresholds_for_bundle(bundle, rows, args)
+        self.assertIsNone(fixed_threshold)
+        self.assertIs(score_values, bundle["calibrated_probability"])
+        self.assertEqual(thresholds, [0.05])
 
     def test_adaptive_score_thresholds_respect_base_floor(self):
         thresholds = pipeline.adaptive_score_thresholds(
@@ -2966,6 +3227,123 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("hybrid_return_combination", rows[0])
         self.assertIn("hybrid_min_probability", rows[0])
         self.assertIn("conditional_payoff_source", rows[0])
+
+    def test_fixed_split_summary_does_not_inherit_walkforward_rejection(self):
+        args = SimpleNamespace(
+            split_mode="fixed",
+            walk_forward=False,
+            train_ratio=0.7,
+            validation_ratio=0.15,
+            test_ratio=0.15,
+            initial_capital=10000.0,
+            max_position_fraction=0.1,
+            max_volume_fraction=0.01,
+            max_trades_per_period=0,
+            trade_period_minutes=60,
+            holding_period_minutes=5,
+            min_validation_trades=5,
+            max_validation_trades=250,
+            min_validation_precision=0.25,
+            min_selected_threshold=0.9,
+            min_predicted_net_return=0.0,
+            hybrid_min_score=0.0,
+            hybrid_return_combination="expected_return",
+            hybrid_min_probability=0.1,
+            conditional_payoff_min_positive_rows=25,
+            conditional_payoff_min_negative_rows=25,
+            conditional_payoff_max_rows=500000,
+            profit_safety="explore",
+            disable_adaptive_thresholds=False,
+            trade_selection="topk_ev",
+            top_k_per_minute=0,
+            trade_score="auto",
+            objective_mode="classification",
+            ev_safety_margin=0.002,
+            threshold_objective="ev",
+            ev_upside_target_source="manifest",
+            ev_downside_stop_source="manifest",
+            manifest_upside_target=0.02,
+            manifest_downside_stop=0.02,
+            effective_upside_target=0.02,
+            effective_downside_stop=0.02,
+            market_regime_features=True,
+            market_breadth_features=False,
+            max_trades_per_day=0,
+            max_trades_per_fold=0,
+            max_losing_trades_per_day=0,
+            max_daily_drawdown=0.0,
+            pause_after_drawdown_minutes=0,
+            threshold_drawdown_penalty=0.0,
+            threshold_trade_count_penalty=0.0,
+            target_validation_trades=0,
+            overactive_trade_threshold=150,
+            require_positive_walkforward=True,
+            min_profitable_fold_rate=0.55,
+            min_median_fold_return=0.0,
+            min_mean_fold_return=0.0,
+            max_worst_fold_drawdown=1.0,
+            acceptance_tier="exploration",
+            feature_storage="memmap32",
+            memmap_dir="",
+            cache_dir=".gbdt_cache",
+            max_train_rows=1500000,
+            max_validation_rows=750000,
+            max_final_train_rows=1500000,
+            prediction_batch_rows=200000,
+            max_bin=63,
+            subsample_for_bin=100000,
+            lightgbm_histogram_pool_mb=128.0,
+            n_jobs=2,
+            memory_budget_gb=7.8,
+            max_rss_gb=7.8,
+            input=self.csv_path,
+            run_summary_out=os.path.join(self.temp.name, "fixed_summary.json"),
+            experiment_summary_out=os.path.join(self.temp.name, "fixed_summary.csv"),
+            experiment_report_out=os.path.join(self.temp.name, "fixed_report.md"),
+            calibration_report_out=os.path.join(self.temp.name, "fixed_calibration.csv"),
+            results_dir=self.temp.name,
+            _explicit_flags={"memory_budget_gb", "max_rss_gb"},
+        )
+        fixed_record = {
+            "selected_threshold": 1.01,
+            "portfolio_profit": 0.0,
+            "portfolio_return": 0.0,
+            "precision": 0.0,
+            "recall": 0.0,
+            "raw_precision": 0.0,
+            "raw_recall": 0.0,
+            "accepted": 1,
+            "failed_acceptance_checks": "",
+            "rejection_reason": "",
+            "strategy_strength": "not_checked",
+            "brier_score": 0.125,
+            "expected_calibration_error": 0.05,
+            "max_calibration_error": 0.08,
+        }
+        pipeline.write_run_summaries(
+            args,
+            [row(1600000000000)],
+            ["ret_1m"],
+            "lightgbm",
+            {"params": {}, "best_iteration": None},
+            fixed_record,
+            [],
+        )
+        with open(args.run_summary_out, encoding="utf-8") as handle:
+            summary = json.load(handle)
+        self.assertEqual(summary["accepted"], 1)
+        self.assertEqual(summary["rejection_reason"], "")
+        self.assertEqual(summary["walk_forward_summary"]["rejection_reason"], "")
+        self.assertAlmostEqual(summary["brier_score"], 0.125)
+        with open(args.experiment_summary_out, newline="") as handle:
+            rows = list(csv.DictReader(handle))
+        self.assertEqual(rows[0]["accepted"], "1")
+        self.assertEqual(rows[0]["rejection_reason"], "")
+        self.assertEqual(rows[0]["brier_score"], "0.125")
+        with open(args.experiment_report_out, encoding="utf-8") as handle:
+            report = handle.read()
+        self.assertIn("Walk-forward acceptance: `n/a (disabled)`", report)
+        self.assertNotIn("no_walkforward_folds", report)
 
 
 if __name__ == "__main__":

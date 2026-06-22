@@ -1,7 +1,7 @@
 # CoinPredictor Experiment Report
 
 ## Dataset Summary
-- Input: `/tmp/tmprra_u7fb/synthetic.csv`
+- Input: `/tmp/tmpfbm6h9fr/synthetic.csv`
 - Rows: `1`
 - Features: `1`
 - Symbols: `TESTUSDT`
@@ -65,5 +65,6 @@
 - Execution realism is still approximate because the dataset does not include full exchange microstructure.
 
 ## Conclusion
-- Walk-forward acceptance passed: `1`
-- Acceptance reasons: ``
+- Overall accepted: `1`
+- Rejection reason: ``
+- Walk-forward acceptance: `n/a (disabled)`

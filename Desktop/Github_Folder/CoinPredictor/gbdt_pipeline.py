@@ -2450,7 +2450,8 @@ def compact_signal_indices_for_bundle(rows, bundle, threshold, objective_mode="c
                                       hybrid_uncertainty_penalty=0.0,
                                       effective_hybrid_thresholds=None,
                                       ev_context=None,
-                                      hybrid_context=None):
+                                      hybrid_context=None,
+                                      hybrid_runtime_args=None):
     if np is None:
         raise ValueError("compact signal selection requires numpy")
 
@@ -5161,13 +5162,14 @@ def ratio_split_counts(month_count, train_ratio, validation_ratio, test_ratio):
     return train_count, validation_count, test_count
 
 
-def walk_forward_split_bounds(fold_start, walk_train_months, walk_validation_months):
+def walk_forward_split_bounds(fold_start, walk_train_months, walk_validation_months, walk_test_months=1):
     train_start = int(fold_start)
     train_end = train_start + int(walk_train_months)
     validation_start = train_end
     validation_end = validation_start + int(walk_validation_months)
-    test_month = validation_end
-    return train_start, train_end, validation_start, validation_end, test_month
+    test_start = validation_end
+    test_end = test_start + int(walk_test_months)
+    return train_start, train_end, validation_start, validation_end, test_start, test_end
 
 
 def select_ratio_split(rows, args):
@@ -5596,6 +5598,48 @@ def walkforward_acceptance_summary(records, args):
     return summary
 
 
+def resolved_walkforward_summary(walk_records, args):
+    summary = walkforward_acceptance_summary(walk_records, args) if walk_records else walkforward_acceptance_summary([], args)
+    if not getattr(args, "walk_forward", False):
+        summary["accepted"] = 1
+        summary["rejection_reason"] = ""
+        summary["failed_acceptance_checks"] = ""
+        summary["strategy_strength"] = "not_checked"
+        summary["walkforward_acceptance_reasons"] = ""
+    return summary
+
+
+def resolved_run_acceptance(fixed_record, walkforward_summary, args):
+    source = walkforward_summary if getattr(args, "walk_forward", False) else (fixed_record or {})
+    return {
+        "acceptance_tier": source.get("acceptance_tier", getattr(args, "acceptance_tier", "none")),
+        "accepted": int(source.get("accepted", 1)),
+        "failed_acceptance_checks": source.get("failed_acceptance_checks", ""),
+        "rejection_reason": source.get("rejection_reason", ""),
+        "strategy_strength": source.get("strategy_strength", "not_checked"),
+    }
+
+
+def resolved_calibration_summary(calibration_rows, calibration_summary, fixed_record, aggregate=None):
+    skipped_reason = ""
+    if len(calibration_rows) == 1:
+        skipped_reason = str(calibration_rows[0].get("skipped_reason", "")).strip()
+    if skipped_reason not in ("prediction_output_missing", "prediction_output_empty"):
+        return calibration_summary
+    source = aggregate or fixed_record or {}
+    return {
+        "brier_score": safe_float(source.get("brier_score"), calibration_summary.get("brier_score", 0.0)),
+        "expected_calibration_error": safe_float(
+            source.get("expected_calibration_error"),
+            calibration_summary.get("expected_calibration_error", 0.0),
+        ),
+        "max_calibration_error": safe_float(
+            source.get("max_calibration_error"),
+            calibration_summary.get("max_calibration_error", 0.0),
+        ),
+    }
+
+
 def row_month_pairs(rows):
     if not rows:
         return []
@@ -5628,7 +5672,9 @@ def single_month_label(rows):
     months = row_month_pairs(rows)
     if not months:
         return ""
-    return months[0]
+    if len(months) == 1:
+        return months[0]
+    return "{}..{}".format(months[0], months[-1])
 
 
 WALKFORWARD_DIAGNOSTIC_COLUMNS = [
@@ -6439,6 +6485,7 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
                 effective_hybrid_thresholds=effective_hybrid_thresholds,
                 ev_context=ev_context,
                 hybrid_context=hybrid_context,
+                hybrid_runtime_args=hybrid_runtime_args,
             )
             if rows.indices is None:
                 absolute_positions = signal_indices
@@ -6719,6 +6766,7 @@ def raw_classification_metrics(rows, predictions, threshold, batch_size=1000000,
             classification_ev_from_trade_score=True,
             ev_context=ev_context,
             hybrid_context=hybrid_context,
+            hybrid_runtime_args=hybrid_runtime_args,
         )
         raw_trades = int(len(signal_indices))
         if raw_trades:
@@ -8179,6 +8227,29 @@ def tune_threshold(rows, predictions, thresholds, objective, fee, slippage,
     zero_trade_profit_score = 0.0 if strict_profit else -float("inf")
     fallback_result = None
     selected_score_name = "probability" if objective_mode == "classification" else trade_score_name
+    rejection_summary = {
+        "candidate_threshold_count": len(thresholds),
+        "rejected_under_min_trades_count": 0,
+        "rejected_over_max_trades_count": 0,
+        "rejected_under_min_precision_count": 0,
+        "rejected_mixed_constraints_count": 0,
+        "admissible_candidate_count": 0,
+        "fallback_candidate_count": 0,
+        "min_candidate_threshold": float(thresholds[0]) if thresholds else 0.0,
+        "max_candidate_threshold": float(thresholds[-1]) if thresholds else 0.0,
+        "lowest_trade_count_seen": 0,
+        "highest_trade_count_seen": 0,
+        "best_precision_seen": 0.0,
+        "best_precision_threshold": 0.0,
+        "closest_over_max_trades_count": 0,
+        "closest_over_max_threshold": 0.0,
+        "closest_over_max_precision": 0.0,
+        "closest_under_min_precision": 0.0,
+        "closest_under_min_precision_threshold": 0.0,
+        "closest_under_min_precision_trades": 0,
+    }
+    closest_over_max_gap = None
+    closest_under_precision_gap = None
     if strict_profit:
         best_metrics = evaluate(
             rows,
@@ -8267,13 +8338,43 @@ def tune_threshold(rows, predictions, thresholds, objective, fee, slippage,
             min_validation_trades,
             max_validation_trades,
         )
+        trade_count = int(metrics.get("predicted_trades", 0))
+        precision = float(metrics.get("precision", 0.0))
+        if rejection_summary["lowest_trade_count_seen"] == 0 or trade_count < rejection_summary["lowest_trade_count_seen"]:
+            rejection_summary["lowest_trade_count_seen"] = trade_count
+        if trade_count > rejection_summary["highest_trade_count_seen"]:
+            rejection_summary["highest_trade_count_seen"] = trade_count
+        if trade_count > 0 and precision > rejection_summary["best_precision_seen"]:
+            rejection_summary["best_precision_seen"] = precision
+            rejection_summary["best_precision_threshold"] = float(threshold)
         too_few = metrics["predicted_trades"] < min_validation_trades
         too_many = max_validation_trades > 0 and metrics["predicted_trades"] > max_validation_trades
         too_imprecise = metrics["predicted_trades"] > 0 and metrics["precision"] < min_validation_precision
+        if too_few:
+            rejection_summary["rejected_under_min_trades_count"] += 1
+        if too_many:
+            rejection_summary["rejected_over_max_trades_count"] += 1
+            over_gap = int(metrics["predicted_trades"]) - int(max_validation_trades)
+            if closest_over_max_gap is None or over_gap < closest_over_max_gap:
+                closest_over_max_gap = over_gap
+                rejection_summary["closest_over_max_trades_count"] = int(metrics["predicted_trades"])
+                rejection_summary["closest_over_max_threshold"] = float(threshold)
+                rejection_summary["closest_over_max_precision"] = precision
+        if too_imprecise:
+            rejection_summary["rejected_under_min_precision_count"] += 1
+            precision_gap = float(min_validation_precision) - precision
+            if closest_under_precision_gap is None or precision_gap < closest_under_precision_gap:
+                closest_under_precision_gap = precision_gap
+                rejection_summary["closest_under_min_precision"] = precision
+                rejection_summary["closest_under_min_precision_threshold"] = float(threshold)
+                rejection_summary["closest_under_min_precision_trades"] = int(metrics["predicted_trades"])
+        if sum(1 for flag in (too_few, too_many, too_imprecise) if flag) > 1:
+            rejection_summary["rejected_mixed_constraints_count"] += 1
         if too_many or too_imprecise:
             continue
         if too_few:
             if metrics["predicted_trades"] > 0:
+                rejection_summary["fallback_candidate_count"] += 1
                 better, reason = compare_threshold_results(
                     result,
                     fallback_result,
@@ -8293,6 +8394,7 @@ def tune_threshold(rows, predictions, thresholds, objective, fee, slippage,
                     result["validation_metrics"]["selected_threshold_tie_rank_reason"] = reason
                     fallback_result = result
             continue
+        rejection_summary["admissible_candidate_count"] += 1
         better, reason = compare_threshold_results(
             result,
             best_result,
@@ -8361,6 +8463,8 @@ def tune_threshold(rows, predictions, thresholds, objective, fee, slippage,
             best_result["validation_metrics"]["selected_threshold_tie_rank_reason"] = "no_trade_fallback"
     elif not best_result["validation_metrics"].get("selected_threshold_tie_rank_reason"):
         best_result["validation_metrics"]["selected_threshold_tie_rank_reason"] = best_result.get("tie_rank_reason", "higher_objective_score")
+    if best_result is not None:
+        best_result["validation_metrics"].update(rejection_summary)
     return best_result
 
 
@@ -8954,7 +9058,39 @@ def selected_thresholds_for_bundle(bundle, validation_rows, args):
             args.min_validation_trades,
             args.adaptive_threshold_sample_rows,
         )
-    thresholds = sorted(set(float(threshold) for threshold in thresholds if threshold >= args.min_selected_threshold))
+    max_probability = 0.0
+    if probabilities is not None:
+        if np is not None and isinstance(probabilities, np.ndarray):
+            valid_probabilities = probabilities[(probabilities >= 0.0) & (probabilities <= 1.0)]
+            if valid_probabilities.size:
+                max_probability = float(np.max(valid_probabilities))
+        else:
+            valid_probabilities = [float(value) for value in probabilities if 0.0 <= float(value) <= 1.0]
+            if valid_probabilities:
+                max_probability = max(valid_probabilities)
+    adaptive_threshold_grid = sorted(
+        set(float(threshold) for threshold in thresholds if 0.0 <= float(threshold) <= 1.0)
+    )
+    supported_threshold_grid = [
+        float(threshold) for threshold in adaptive_threshold_grid
+        if float(threshold) <= max_probability + 1e-12
+    ]
+    thresholds = sorted(
+        set(float(threshold) for threshold in adaptive_threshold_grid if threshold >= args.min_selected_threshold)
+    )
+    if (
+        getattr(args, "trade_selection", "threshold") in ("topk_score", "topk_ev")
+        and (not thresholds or min(thresholds) > max_probability + 1e-12)
+    ):
+        # Ranked selection can still be useful even when calibrated probabilities
+        # sit below the configured floor, so fall back to the adaptive grid instead
+        # of forcing a guaranteed no-trade 1.01 threshold.
+        thresholds = list(supported_threshold_grid)
+        if thresholds:
+            warn_once(
+                "classification-topk-threshold-floor-fallback",
+                "Warning: min-selected-threshold removed every classification candidate threshold; using adaptive ranked thresholds for top-k selection.",
+            )
     if not thresholds:
         thresholds = [1.01]
     return thresholds, None, probabilities
@@ -9007,6 +9143,114 @@ def predict_probabilities(model, rows, kind, args, stage="prediction"):
     return predict_model_values(model, rows, kind, args, stage)
 
 
+def selection_is_no_trade_fallback(selection):
+    metrics = (selection or {}).get("validation_metrics") or {}
+    tie_reason = str(
+        (selection or {}).get("tie_rank_reason")
+        or metrics.get("selected_threshold_tie_rank_reason")
+        or ""
+    )
+    threshold = float((selection or {}).get("threshold", metrics.get("selected_threshold", 0.0)))
+    predicted_trades = int(metrics.get("predicted_trades", 0))
+    return predicted_trades <= 0 and (
+        tie_reason == "no_trade_fallback" or threshold >= 1.01 - 1e-12
+    )
+
+
+def tune_threshold_for_bundle(rows, bundle, args, trade_score_name):
+    thresholds, fixed_threshold, ignored = selected_thresholds_for_bundle(bundle, rows, args)
+    del fixed_threshold, ignored
+    return tune_threshold(
+        rows,
+        bundle,
+        thresholds,
+        args.threshold_objective,
+        args.fee,
+        args.slippage * args.validation_slippage_multiplier,
+        args.min_validation_trades,
+        args.max_validation_trades,
+        args.min_validation_precision,
+        args.profit_safety,
+        args.initial_capital,
+        args.max_position_fraction,
+        args.max_volume_fraction,
+        args.max_trades_per_period,
+        args.trade_period_minutes,
+        args.holding_period_minutes,
+        args.trade_selection,
+        args.top_k_per_minute,
+        args.upside_target,
+        args.downside_stop,
+        args.ev_safety_margin,
+        args.objective_mode,
+        trade_score_name,
+        args.min_predicted_net_return,
+        args.hybrid_min_score,
+        args.max_trades_per_day,
+        0,
+        args.max_losing_trades_per_day,
+        args.max_daily_drawdown,
+        args.pause_after_drawdown_minutes,
+        args.threshold_drawdown_penalty,
+        args.threshold_trade_count_penalty,
+        args.target_validation_trades,
+        args,
+    )
+
+
+def maybe_retry_hybrid_no_trade_selection(rows, bundle, selection, args, trade_score_name):
+    if getattr(args, "objective_mode", "classification") != "hybrid":
+        return selection
+    active_context = bundle.get("hybrid_return_context") or {}
+    active_combination = active_context.get(
+        "hybrid_return_combination",
+        getattr(args, "hybrid_return_combination", "probability_times_return"),
+    )
+    if active_combination != "expected_return" or not selection_is_no_trade_fallback(selection):
+        return selection
+
+    retry_args = argparse.Namespace(**vars(args))
+    retry_args.hybrid_return_combination = "probability_times_return"
+    original_context = dict(active_context)
+    fallback_context = fit_hybrid_return_context(rows, bundle, retry_args)
+    fallback_reason = str(
+        selection.get("tie_rank_reason")
+        or (selection.get("validation_metrics") or {}).get("selected_threshold_tie_rank_reason")
+        or "no_trade_fallback"
+    )
+    fallback_context["hybrid_return_combination_requested"] = active_combination
+    fallback_context["hybrid_return_combination_fallback_from"] = active_combination
+    fallback_context["hybrid_return_selection_fallback_reason"] = fallback_reason
+    bundle["hybrid_return_context"] = fallback_context
+    retry_selection = tune_threshold_for_bundle(rows, bundle, retry_args, trade_score_name)
+    better, _ = compare_threshold_results(
+        retry_selection,
+        selection,
+        retry_args,
+        retry_args.min_validation_trades,
+        retry_args.max_validation_trades,
+    )
+    if not better:
+        bundle["hybrid_return_context"] = original_context
+        return selection
+
+    retry_metrics = retry_selection.get("validation_metrics") or {}
+    retry_selection["hybrid_return_selection_fallback_used"] = True
+    retry_metrics["hybrid_return_selection_fallback_used"] = 1
+    retry_metrics["hybrid_return_combination_requested"] = active_combination
+    retry_metrics["hybrid_return_combination_selected"] = fallback_context.get(
+        "hybrid_return_combination",
+        "probability_times_return",
+    )
+    retry_metrics["hybrid_return_selection_fallback_reason"] = fallback_reason
+    return retry_selection
+
+
+def select_threshold_for_bundle(rows, bundle, args, trade_score_name):
+    selection = tune_threshold_for_bundle(rows, bundle, args, trade_score_name)
+    return maybe_retry_hybrid_no_trade_selection(rows, bundle, selection, args, trade_score_name)
+
+
 def fit_select_model(train_rows, validation_rows, feature_names, args, kind):
     if getattr(args, "ensemble_window_list", None):
         member_args = argparse.Namespace(**vars(args))
@@ -9034,44 +9278,7 @@ def fit_select_model(train_rows, validation_rows, feature_names, args, kind):
         )
         bundle["ev_context"] = fit_ev_payoff_context(validation_rows, bundle, args)
         bundle["hybrid_return_context"] = fit_hybrid_return_context(validation_rows, bundle, args)
-        thresholds, fixed_threshold, ignored = selected_thresholds_for_bundle(bundle, validation_rows, args)
-        del fixed_threshold, ignored
-        selection = tune_threshold(
-            validation_rows,
-            bundle,
-            thresholds,
-            args.threshold_objective,
-            args.fee,
-            args.slippage * args.validation_slippage_multiplier,
-            args.min_validation_trades,
-            args.max_validation_trades,
-            args.min_validation_precision,
-            args.profit_safety,
-            args.initial_capital,
-            args.max_position_fraction,
-            args.max_volume_fraction,
-            args.max_trades_per_period,
-            args.trade_period_minutes,
-            args.holding_period_minutes,
-            args.trade_selection,
-            args.top_k_per_minute,
-            args.upside_target,
-            args.downside_stop,
-            args.ev_safety_margin,
-            args.objective_mode,
-            score_name_for_args(args),
-            args.min_predicted_net_return,
-            args.hybrid_min_score,
-            args.max_trades_per_day,
-            0,
-            args.max_losing_trades_per_day,
-            args.max_daily_drawdown,
-            args.pause_after_drawdown_minutes,
-            args.threshold_drawdown_penalty,
-            args.threshold_trade_count_penalty,
-            args.target_validation_trades,
-            args,
-        )
+        selection = select_threshold_for_bundle(validation_rows, bundle, args, score_name_for_args(args))
         meta_filter_info = fit_meta_filter(validation_rows, bundle, selection["threshold"], args)
         meta_filter_info, selection = recalibrate_meta_filter_validation(
             validation_rows,
@@ -9285,44 +9492,7 @@ def fit_select_model(train_rows, validation_rows, feature_names, args, kind):
         )
         bundle["ev_context"] = fit_ev_payoff_context(fit_validation_rows, bundle, args)
         bundle["hybrid_return_context"] = fit_hybrid_return_context(fit_validation_rows, bundle, args)
-        thresholds, fixed_threshold, ignored = selected_thresholds_for_bundle(bundle, fit_validation_rows, args)
-        del fixed_threshold, ignored
-        selection = tune_threshold(
-            fit_validation_rows,
-            bundle,
-            thresholds,
-            args.threshold_objective,
-            args.fee,
-            args.slippage * args.validation_slippage_multiplier,
-            args.min_validation_trades,
-            args.max_validation_trades,
-            args.min_validation_precision,
-            args.profit_safety,
-            args.initial_capital,
-            args.max_position_fraction,
-            args.max_volume_fraction,
-            args.max_trades_per_period,
-            args.trade_period_minutes,
-            args.holding_period_minutes,
-            args.trade_selection,
-            args.top_k_per_minute,
-            args.upside_target,
-            args.downside_stop,
-            args.ev_safety_margin,
-            args.objective_mode,
-            score_name,
-            args.min_predicted_net_return,
-            args.hybrid_min_score,
-            args.max_trades_per_day,
-            0,
-            args.max_losing_trades_per_day,
-            args.max_daily_drawdown,
-            args.pause_after_drawdown_minutes,
-            args.threshold_drawdown_penalty,
-            args.threshold_trade_count_penalty,
-            args.target_validation_trades,
-            args,
-        )
+        selection = select_threshold_for_bundle(fit_validation_rows, bundle, args, score_name)
         threshold = selection["threshold"]
         metrics = selection["validation_metrics"]
         zero_trade_score = 0.0 if args.threshold_objective in ("profit", "profit_balanced", "avg_profit", "ev") and args.profit_safety == "strict" else -float("inf")
@@ -9402,44 +9572,7 @@ def fit_select_model(train_rows, validation_rows, feature_names, args, kind):
         bundle = prediction_bundle_for_models(best, validation_rows, kind, args, "full validation retune")
         bundle["ev_context"] = fit_ev_payoff_context(validation_rows, bundle, args)
         bundle["hybrid_return_context"] = fit_hybrid_return_context(validation_rows, bundle, args)
-        thresholds, fixed_threshold, ignored = selected_thresholds_for_bundle(bundle, validation_rows, args)
-        del fixed_threshold, ignored
-        selection = tune_threshold(
-            validation_rows,
-            bundle,
-            thresholds,
-            args.threshold_objective,
-            args.fee,
-            args.slippage * args.validation_slippage_multiplier,
-            args.min_validation_trades,
-            args.max_validation_trades,
-            args.min_validation_precision,
-            args.profit_safety,
-            args.initial_capital,
-            args.max_position_fraction,
-            args.max_volume_fraction,
-            args.max_trades_per_period,
-            args.trade_period_minutes,
-            args.holding_period_minutes,
-            args.trade_selection,
-            args.top_k_per_minute,
-            args.upside_target,
-            args.downside_stop,
-            args.ev_safety_margin,
-            args.objective_mode,
-            score_name,
-            args.min_predicted_net_return,
-            args.hybrid_min_score,
-            args.max_trades_per_day,
-            0,
-            args.max_losing_trades_per_day,
-            args.max_daily_drawdown,
-            args.pause_after_drawdown_minutes,
-            args.threshold_drawdown_penalty,
-            args.threshold_trade_count_penalty,
-            args.target_validation_trades,
-            args,
-        )
+        selection = select_threshold_for_bundle(validation_rows, bundle, args, score_name)
         best["threshold"] = selection["threshold"]
         metrics = selection["validation_metrics"]
         best["validation_metrics"] = metrics
@@ -10003,6 +10136,23 @@ METRIC_COLUMNS = [
     "selected_validation_average_profit_after_fee_and_slippage",
     "selected_validation_total_profit_after_fee_and_slippage",
     "selected_threshold_tie_rank_reason",
+    "candidate_threshold_count",
+    "rejected_under_min_trades_count",
+    "rejected_over_max_trades_count",
+    "rejected_under_min_precision_count",
+    "rejected_mixed_constraints_count",
+    "admissible_candidate_count",
+    "fallback_candidate_count",
+    "lowest_trade_count_seen",
+    "highest_trade_count_seen",
+    "best_precision_seen",
+    "best_precision_threshold",
+    "closest_over_max_trades_count",
+    "closest_over_max_threshold",
+    "closest_over_max_precision",
+    "closest_under_min_precision",
+    "closest_under_min_precision_threshold",
+    "closest_under_min_precision_trades",
     "train_rows",
     "validation_rows",
     "test_rows",
@@ -10294,6 +10444,23 @@ def metrics_record(model_name, split, objective, threshold, train_rows, validati
             0.0,
         ),
         "selected_threshold_tie_rank_reason": validation_metrics.get("selected_threshold_tie_rank_reason", ""),
+        "candidate_threshold_count": validation_metrics.get("candidate_threshold_count", 0),
+        "rejected_under_min_trades_count": validation_metrics.get("rejected_under_min_trades_count", 0),
+        "rejected_over_max_trades_count": validation_metrics.get("rejected_over_max_trades_count", 0),
+        "rejected_under_min_precision_count": validation_metrics.get("rejected_under_min_precision_count", 0),
+        "rejected_mixed_constraints_count": validation_metrics.get("rejected_mixed_constraints_count", 0),
+        "admissible_candidate_count": validation_metrics.get("admissible_candidate_count", 0),
+        "fallback_candidate_count": validation_metrics.get("fallback_candidate_count", 0),
+        "lowest_trade_count_seen": validation_metrics.get("lowest_trade_count_seen", 0),
+        "highest_trade_count_seen": validation_metrics.get("highest_trade_count_seen", 0),
+        "best_precision_seen": validation_metrics.get("best_precision_seen", 0.0),
+        "best_precision_threshold": validation_metrics.get("best_precision_threshold", 0.0),
+        "closest_over_max_trades_count": validation_metrics.get("closest_over_max_trades_count", 0),
+        "closest_over_max_threshold": validation_metrics.get("closest_over_max_threshold", 0.0),
+        "closest_over_max_precision": validation_metrics.get("closest_over_max_precision", 0.0),
+        "closest_under_min_precision": validation_metrics.get("closest_under_min_precision", 0.0),
+        "closest_under_min_precision_threshold": validation_metrics.get("closest_under_min_precision_threshold", 0.0),
+        "closest_under_min_precision_trades": validation_metrics.get("closest_under_min_precision_trades", 0),
         "selected_objective_finite_folds": 1 if math.isfinite(float(resolved_selected_objective_score)) else 0,
         "selected_objective_nonfinite_folds": 0 if math.isfinite(float(resolved_selected_objective_score)) else 1,
         "selected_no_trade_folds": 1 if int(validation_metrics.get("selected_validation_trade_count", 0)) <= 0 else 0,
@@ -10861,18 +11028,19 @@ def run_walk_forward(rows, feature_names, args, kind, model_name):
         hybrid_runtime_args=args,
     )
     finish_profile_stage(init_prediction_token, rows_processed=0, extra_info=args.walk_predictions_out)
-    max_fold_start = max_month - args.walk_train_months - args.walk_validation_months + 1
+    max_fold_start = max_month - args.walk_train_months - args.walk_validation_months - args.walk_test_months + 2
     for fold_start in range(0, max(0, max_fold_start)):
-        train_start, train_end, validation_start, validation_end, test_month = walk_forward_split_bounds(
+        train_start, train_end, validation_start, validation_end, test_start, test_end = walk_forward_split_bounds(
             fold_start,
             args.walk_train_months,
             args.walk_validation_months,
+            args.walk_test_months,
         )
-        if test_month > max_month:
+        if test_end > max_month + 1:
             break
         train_rows = select_month_range(rows, train_start, train_end)
         validation_rows = select_month_range(rows, validation_start, validation_end)
-        test_rows = select_month_range(rows, test_month, test_month + 1)
+        test_rows = select_month_range(rows, test_start, test_end)
         train_rows, validation_rows, test_rows, embargo_summary = apply_split_embargo(
             train_rows,
             validation_rows,
@@ -10884,7 +11052,10 @@ def run_walk_forward(rows, feature_names, args, kind, model_name):
             continue
 
         fold_index = len(fold_records) + 1
-        fold_split_token = start_profile_stage("walkforward_fold_{}_split".format(fold_index), "test_month={}".format(test_month))
+        fold_split_token = start_profile_stage(
+            "walkforward_fold_{}_split".format(fold_index),
+            "test_months={}-{}".format(test_start, test_end - 1),
+        )
         memory_checkpoint("Walk-forward fold {} split created: train={:,} validation={:,} test={:,}".format(
             fold_index, len(train_rows), len(validation_rows), len(test_rows)), args)
         finish_profile_stage(
@@ -11052,7 +11223,11 @@ def run_walk_forward(rows, feature_names, args, kind, model_name):
             symbol_filter_info=final_selected.get("symbol_filter_info"),
         )
         finish_profile_stage(fold_output_token, rows_processed=len(test_rows), extra_info=args.walk_predictions_out)
-        split_name = "walkforward_fold_{}_test_month_{}".format(fold_index, test_month + 1)
+        split_name = "walkforward_fold_{}_test_months_{}_{}".format(
+            fold_index,
+            test_start + 1,
+            test_end,
+        )
         symbol_filter_records.extend(
             build_symbol_filter_diagnostic_records(
                 final_selected.get("symbol_filter_info"),
@@ -11776,6 +11951,19 @@ def baseline_report(args):
 
 
 def write_experiment_report(path, summary):
+    walk_forward_enabled = bool(summary.get("walk_forward_enabled", False))
+    conclusion_lines = [
+        "## Conclusion",
+        "- Overall accepted: `{}`".format(summary.get("accepted", 1)),
+        "- Rejection reason: `{}`".format(summary.get("rejection_reason", "")),
+    ]
+    if walk_forward_enabled:
+        conclusion_lines.extend([
+            "- Walk-forward acceptance passed: `{}`".format(summary.get("walkforward_acceptance_passed", 0)),
+            "- Acceptance reasons: `{}`".format(summary.get("walkforward_acceptance_reasons", "")),
+        ])
+    else:
+        conclusion_lines.append("- Walk-forward acceptance: `n/a (disabled)`")
     lines = [
         "# CoinPredictor Experiment Report",
         "",
@@ -11843,10 +12031,8 @@ def write_experiment_report(path, summary):
         "- Regime summaries are derived only from columns available at prediction time.",
         "- Execution realism is still approximate because the dataset does not include full exchange microstructure.",
         "",
-        "## Conclusion",
-        "- Walk-forward acceptance passed: `{}`".format(summary.get("walkforward_acceptance_passed", 0)),
-        "- Acceptance reasons: `{}`".format(summary.get("walkforward_acceptance_reasons", "")),
     ]
+    lines.extend(conclusion_lines)
     def write_one(output_path):
         with open(output_path, "w", encoding="utf-8") as handle:
             handle.write("\n".join(lines) + "\n")
@@ -12241,12 +12427,14 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
             setattr(args, name, DEFAULT_REPORT_FILENAMES.get(name, ""))
     apply_default_report_paths(args)
     aggregate = walk_records[-1] if walk_records and walk_records[-1].get("split") == "walkforward_average" else None
-    walkforward_summary = walkforward_acceptance_summary(walk_records, args) if walk_records else walkforward_acceptance_summary([], args)
+    walkforward_summary = resolved_walkforward_summary(walk_records, args)
+    overall_acceptance = resolved_run_acceptance(fixed_record, walkforward_summary, args)
     run_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     effective_upside_target = getattr(args, "effective_upside_target", getattr(args, "upside_target", 0.05))
     effective_downside_stop = getattr(args, "effective_downside_stop", getattr(args, "downside_stop", 0.02))
     prediction_report_path = prediction_report_source_path(args, walk_records)
     calibration_rows, calibration_summary = calibration_report_from_predictions(prediction_report_path)
+    calibration_summary = resolved_calibration_summary(calibration_rows, calibration_summary, fixed_record, aggregate)
     regime_rows, regime_summary = regime_report_from_predictions(prediction_report_path, args)
     symbol_rows, symbol_summary = symbol_report_from_predictions(prediction_report_path, args)
     feature_stability_rows, feature_stability_summary = feature_stability_report(args)
@@ -12358,7 +12546,29 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
     summary.update(symbol_summary)
     summary.update(feature_stability_summary)
     summary.update(baseline_summary)
+    for key in (
+        "candidate_threshold_count",
+        "rejected_under_min_trades_count",
+        "rejected_over_max_trades_count",
+        "rejected_under_min_precision_count",
+        "rejected_mixed_constraints_count",
+        "admissible_candidate_count",
+        "fallback_candidate_count",
+        "lowest_trade_count_seen",
+        "highest_trade_count_seen",
+        "best_precision_seen",
+        "best_precision_threshold",
+        "closest_over_max_trades_count",
+        "closest_over_max_threshold",
+        "closest_over_max_precision",
+        "closest_under_min_precision",
+        "closest_under_min_precision_threshold",
+        "closest_under_min_precision_trades",
+    ):
+        if fixed_record and key in fixed_record:
+            summary[key] = fixed_record.get(key)
     summary.update(walkforward_summary)
+    summary.update(overall_acceptance)
     def write_one(output_path):
         with open(output_path, "w", encoding="utf-8") as handle:
             json.dump(summary, handle, indent=2, sort_keys=True)
@@ -12521,11 +12731,11 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
         "mean_selected_validation_max_drawdown": aggregate.get("mean_selected_validation_max_drawdown", 0.0) if aggregate else 0.0,
         "mean_selected_base_objective_score": aggregate.get("mean_selected_base_objective_score", 0.0) if aggregate else 0.0,
         "mean_selected_penalized_objective_score": aggregate.get("mean_selected_penalized_objective_score", 0.0) if aggregate else 0.0,
-        "acceptance_tier": walkforward_summary.get("acceptance_tier", "none"),
-        "accepted": walkforward_summary.get("accepted", 1),
-        "failed_acceptance_checks": walkforward_summary.get("failed_acceptance_checks", ""),
-        "rejection_reason": walkforward_summary.get("rejection_reason", ""),
-        "strategy_strength": walkforward_summary.get("strategy_strength", "not_checked"),
+        "acceptance_tier": overall_acceptance.get("acceptance_tier", "none"),
+        "accepted": overall_acceptance.get("accepted", 1),
+        "failed_acceptance_checks": overall_acceptance.get("failed_acceptance_checks", ""),
+        "rejection_reason": overall_acceptance.get("rejection_reason", ""),
+        "strategy_strength": overall_acceptance.get("strategy_strength", "not_checked"),
         "walkforward_acceptance_passed": walkforward_summary.get("walkforward_acceptance_passed", 0),
         "walkforward_acceptance_reasons": walkforward_summary.get("walkforward_acceptance_reasons", ""),
         "brier_score": calibration_summary.get("brier_score", 0.0),
@@ -12750,6 +12960,7 @@ def build_parser():
     parser.add_argument("--walk-forward", action="store_true")
     parser.add_argument("--walk-train-months", type=int, default=6)
     parser.add_argument("--walk-validation-months", type=int, default=1)
+    parser.add_argument("--walk-test-months", type=int, default=1)
     parser.add_argument("--walk-forward-final-model", choices=["selected", "refit"], default="selected")
     parser.add_argument("--require-positive-walkforward", action="store_true")
     parser.add_argument("--min-profitable-fold-rate", type=float, default=0.0)
@@ -12929,6 +13140,8 @@ def main(argv):
         raise ValueError("--walk-train-months must be at least 1")
     if args.walk_validation_months < 1:
         raise ValueError("--walk-validation-months must be at least 1")
+    if args.walk_test_months < 1:
+        raise ValueError("--walk-test-months must be at least 1")
     if args.meta_filter_max_rows < 0:
         raise ValueError("--meta-filter-max-rows cannot be negative")
     if args.min_symbol_validation_trades < 0:
