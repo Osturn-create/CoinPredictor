@@ -1635,6 +1635,38 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(execution["executed_selected_by_topk"][0], 1)
         self.assertEqual(execution["executed_selected_by_topk"][2], 1)
 
+    def test_topk_symbol_minute_cap_diversifies_ranked_selection(self):
+        base = 1600000000000
+        rows = [
+            symbol_row("AAVEUSDT", base, quote_volume=1000000000.0, trade_return=0.03),
+            symbol_row("AAVEUSDT", base, quote_volume=1000000000.0, trade_return=0.02),
+            symbol_row("AAVEUSDT", base, quote_volume=1000000000.0, trade_return=0.01),
+            symbol_row("BTCUSDT", base, quote_volume=1000000000.0, trade_return=0.015),
+        ]
+        args = SimpleNamespace(top_k_per_symbol_minute=1)
+        execution = pipeline.portfolio_execution(
+            rows,
+            [0.99, 0.98, 0.97, 0.96],
+            0.5,
+            0.0,
+            0.0,
+            10000.0,
+            0.10,
+            0.01,
+            10,
+            60,
+            5,
+            threshold_objective="ev",
+            trade_selection="topk_ev",
+            top_k_per_minute=2,
+            upside_target=0.05,
+            downside_stop=0.02,
+            ev_safety_margin=0.0,
+            hybrid_runtime_args=args,
+        )
+        self.assertEqual(sorted(execution["executed"]), [0, 3])
+        self.assertEqual(execution["symbol_minute_cap_blocked"], 2)
+
     def test_topk_fast_path_matches_reference_for_k1(self):
         base = 1600000000000
         rows = [
@@ -1902,6 +1934,21 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(len(execution["executed"]), 2)
         self.assertEqual(execution["fold_trade_limit_blocked"], 2)
 
+    def test_symbol_period_cap_blocks_repeat_symbol_entries(self):
+        base = 1600000000000
+        rows = [
+            symbol_row("AAVEUSDT", base, trade_return=0.01, quote_volume=1000000000.0),
+            symbol_row("AAVEUSDT", base + 30 * 60000, trade_return=0.01, quote_volume=1000000000.0),
+            symbol_row("AAVEUSDT", base + 61 * 60000, trade_return=0.01, quote_volume=1000000000.0),
+        ]
+        args = SimpleNamespace(max_trades_per_symbol_period=1)
+        execution = pipeline.portfolio_execution(
+            rows, [1.0, 1.0, 1.0], 0.5, 0.0, 0.0, 10000.0, 0.10, 0.01, 0, 60, 1,
+            hybrid_runtime_args=args,
+        )
+        self.assertEqual(sorted(execution["executed"]), [0, 2])
+        self.assertEqual(execution["symbol_trade_limit_blocked"], 1)
+
     def test_daily_loss_limit_blocks_after_realized_losses(self):
         base = 1600000000000
         rows = [
@@ -1941,6 +1988,22 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertAlmostEqual(base_score, 0.1)
         self.assertAlmostEqual(penalized_score, 0.1 - 0.5 * 0.10 - 0.1 * 20)
+
+    def test_threshold_penalized_score_applies_symbol_concentration_penalty(self):
+        metrics = {
+            "predicted_trades": 10,
+            "portfolio_profit": 5.0,
+            "symbol_profit_concentration_top1": 0.8,
+            "symbol_profit_concentration_top3": 0.9,
+        }
+        base_score, penalized_score = pipeline.threshold_penalized_score(
+            metrics,
+            "profit",
+            top1_concentration_penalty=2.0,
+            top3_concentration_penalty=1.0,
+        )
+        self.assertAlmostEqual(base_score, 5.0)
+        self.assertAlmostEqual(penalized_score, 5.0 - 2.0 * 0.8 - 1.0 * 0.9)
 
     def test_threshold_score_ev_uses_expected_value(self):
         metrics = {
@@ -2541,6 +2604,76 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("GOOD", symbol_filter["allowed_symbols"])
         self.assertIn("BAD", symbol_filter["filtered_symbols"])
 
+    def test_symbol_filter_dominance_support_floor_blocks_thin_leader(self):
+        rows = [
+            symbol_row("AAVEUSDT", 1600000000000, label=1, trade_return=0.02),
+            symbol_row("BTCUSDT", 1600000000000, label=1, trade_return=0.015),
+            symbol_row("AAVEUSDT", 1600000060000, label=1, trade_return=0.02),
+            symbol_row("BTCUSDT", 1600000060000, label=1, trade_return=0.015),
+            symbol_row("AAVEUSDT", 1600000120000, label=1, trade_return=0.02),
+            symbol_row("BTCUSDT", 1600000120000, label=1, trade_return=0.015),
+        ]
+        bundle = pipeline.build_prediction_bundle(
+            probability=[0.99, 0.70, 0.99, 0.70, 0.99, 0.70],
+            calibrated_probability=[0.99, 0.70, 0.99, 0.70, 0.99, 0.70],
+        )
+        args = SimpleNamespace(
+            symbol_validation_filter="positive_avg_profit",
+            symbol_filter_stage="executed",
+            symbol_filter_min_candidates=1,
+            symbol_filter_min_executed=5,
+            symbol_filter_candidate_weight=0.5,
+            symbol_filter_executed_weight=0.5,
+            symbol_filter_shrinkage=0.0,
+            symbol_filter_min_active_days=2,
+            symbol_filter_max_executed_trade_share=0.6,
+            min_symbol_validation_trades=1,
+            min_symbol_validation_average_profit=0.0,
+            min_symbol_validation_total_profit=0.0,
+            fee=0.0,
+            slippage=0.0,
+            validation_slippage_multiplier=1.0,
+            initial_capital=10000.0,
+            max_position_fraction=0.25,
+            max_volume_fraction=1.0,
+            max_trades_per_period=0,
+            trade_period_minutes=60,
+            holding_period_minutes=5,
+            threshold_objective="avg_profit",
+            trade_selection="topk_score",
+            top_k_per_minute=1,
+            upside_target=0.02,
+            downside_stop=0.02,
+            ev_safety_margin=0.0,
+            objective_mode="classification",
+            min_predicted_net_return=0.0,
+            hybrid_min_score=0.0,
+            max_trades_per_day=0,
+            max_losing_trades_per_day=0,
+            max_daily_drawdown=0.0,
+            pause_after_drawdown_minutes=0,
+            hybrid_score_mode="basic",
+            hybrid_uncertainty_penalty=0.0,
+            dynamic_hybrid_thresholds="none",
+            meta_filter="none",
+            meta_filter_min_probability=0.0,
+            fee_mode="fixed",
+            position_sizing_mode="fixed_fraction",
+            min_order_notional=0.0,
+            lot_size_step=0.0,
+            tick_size=0.0,
+            latency_penalty_bps=0.0,
+            partial_fill_mode="none",
+            max_open_positions=0,
+            max_daily_loss_fraction=0.0,
+            cooldown_after_loss_minutes=0,
+        )
+        symbol_filter = pipeline.fit_symbol_validation_filter(rows, bundle, 0.5, args, "probability")
+        diagnostics = {item["symbol"]: item for item in symbol_filter["diagnostics"]}
+        self.assertEqual(diagnostics["AAVEUSDT"]["symbol_filter_reason"], "dominance_support_floor")
+        self.assertEqual(diagnostics["AAVEUSDT"]["dominance_gate_triggered"], 1)
+        self.assertNotIn("AAVEUSDT", symbol_filter["allowed_symbols"])
+
     def test_symbol_filter_candidate_blend_does_not_double_count_executed_support(self):
         rows = [
             symbol_row("LEADER", 1600000000000, label=1, trade_return=0.02),
@@ -2987,6 +3120,85 @@ class PipelineTests(unittest.TestCase):
         explicit = pipeline.parse_explicit_flags(["--memory-budget-gb", "7.8", "--n-jobs", "4"])
         pipeline.apply_memory_budget_defaults(args, explicit)
         self.assertEqual(args.n_jobs, 4)
+
+    def test_parser_accepts_symbol_concentration_controls(self):
+        parser = pipeline.build_parser()
+        args = parser.parse_args([
+            "--max-trades-per-symbol-period", "2",
+            "--top-k-per-symbol-minute", "1",
+            "--threshold-top1-concentration-penalty", "2.5",
+            "--threshold-max-top1-concentration", "0.7",
+            "--symbol-filter-min-active-days", "3",
+            "--symbol-filter-max-executed-trade-share", "0.55",
+            "--prediction-bundle-cache", "disk",
+            "--fast-diagnostics",
+        ])
+        self.assertEqual(args.max_trades_per_symbol_period, 2)
+        self.assertEqual(args.top_k_per_symbol_minute, 1)
+        self.assertAlmostEqual(args.threshold_top1_concentration_penalty, 2.5)
+        self.assertAlmostEqual(args.threshold_max_top1_concentration, 0.7)
+        self.assertEqual(args.symbol_filter_min_active_days, 3)
+        self.assertAlmostEqual(args.symbol_filter_max_executed_trade_share, 0.55)
+        self.assertEqual(args.prediction_bundle_cache, "disk")
+        self.assertTrue(args.fast_diagnostics)
+
+    def test_prediction_bundle_for_models_reuses_memory_cache(self):
+        class DummyModel(object):
+            def __init__(self):
+                self.calls = 0
+
+            def predict_values(self, x_rows):
+                self.calls += 1
+                return [0.75] * len(x_rows)
+
+        pipeline.PREDICTION_BUNDLE_MEMORY_CACHE.clear()
+        model = DummyModel()
+        rows = [row(1600000000000), row(1600000060000)]
+        args = SimpleNamespace(
+            prediction_batch_rows=100,
+            memmap_dir=self.temp.name,
+            prediction_bundle_cache="memory",
+            prediction_bundle_cache_dir=self.temp.name,
+            input=self.csv_path,
+            cache_dir=self.temp.name,
+            meta_filter="none",
+            threshold_objective="profit_balanced",
+            trade_selection="threshold",
+            top_k_per_minute=1,
+            upside_target=0.05,
+            downside_stop=0.02,
+            ev_safety_margin=0.0,
+            objective_mode="classification",
+            min_predicted_net_return=0.0,
+            hybrid_min_score=0.0,
+            max_trades_per_day=0,
+            max_trades_per_fold=0,
+            max_losing_trades_per_day=0,
+            max_daily_drawdown=0.0,
+            pause_after_drawdown_minutes=0,
+            hybrid_score_mode="basic",
+            hybrid_uncertainty_penalty=0.0,
+            regression_target="trade_return",
+            n_jobs=1,
+            max_rss_gb=0.0,
+        )
+        selected = {
+            "classification_model": model,
+            "regression_model": None,
+            "threshold": 0.5,
+            "params": {"n_estimators": 10},
+            "calibration": None,
+            "regression_calibration": None,
+            "uncertainty_model": None,
+            "meta_filter_info": None,
+            "symbol_filter_info": None,
+            "ev_payoff_info": None,
+            "hybrid_return_info": None,
+        }
+        first = pipeline.prediction_bundle_for_models(selected, rows, "internal", args, "unit test")
+        second = pipeline.prediction_bundle_for_models(selected, rows, "internal", args, "unit test")
+        self.assertEqual(model.calls, 1)
+        self.assertEqual(list(first["probability"]), list(second["probability"]))
 
     def test_memory_guard_without_psutil(self):
         args = SimpleNamespace(max_rss_gb=7.8, abort_on_memory_limit=True)

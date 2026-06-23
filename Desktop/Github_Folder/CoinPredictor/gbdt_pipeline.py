@@ -63,6 +63,7 @@ SHARDED_AGGREGATE_CACHE_VERSION = 4
 START_TIME = time.time()
 CACHE_LOAD_INFO = {}
 TEMP_PREDICTION_PATHS = set()
+PREDICTION_BUNDLE_MEMORY_CACHE = {}
 AUC_SAMPLE_ROWS = 1000000
 CANONICAL_TRAINING_CSV = "kline_growth_training.csv"
 TRAINING_MANIFEST_VERSION = 1
@@ -6039,9 +6040,12 @@ SYMBOL_FILTER_DIAGNOSTIC_COLUMNS = [
     "eligible_candidate_avg_predicted_return",
     "eligible_candidate_realized_avg_return",
     "eligible_candidate_positive_rate",
+    "eligible_active_days",
     "executed_avg_profit",
     "executed_avg_return",
     "executed_win_rate",
+    "executed_active_days",
+    "executed_trade_share",
     "candidate_quality",
     "executed_quality",
     "symbol_score",
@@ -6049,6 +6053,7 @@ SYMBOL_FILTER_DIAGNOSTIC_COLUMNS = [
     "symbol_filter_stage",
     "symbol_filter_decision",
     "symbol_filter_reason",
+    "dominance_gate_triggered",
 ]
 
 
@@ -6102,6 +6107,13 @@ def row_symbol_name(rows, local_index):
     return rows[local_index].symbol
 
 
+def row_open_time_value(rows, local_index):
+    if is_compact_rows(rows):
+        position = local_index if rows.indices is None else int(rows.indices[local_index])
+        return int(rows.table.open_times[position])
+    return int(rows[local_index].open_time)
+
+
 def compact_quote_volume(table, position):
     if table.quote_volumes is not None:
         raw_quote_volume = float(table.quote_volumes[position])
@@ -6117,6 +6129,196 @@ def compact_quote_volume(table, position):
         math.expm1(table.feature_value_at(position, feature_index))
         * RECONSTRUCTED_QUOTE_VOLUME_DISCOUNT,
     )
+
+
+def candidate_rank(bucket, trade_selection, use_expected_value_ranking, top_k_per_minute,
+                   top_k_per_symbol_minute, record_block):
+    if trade_selection not in ("topk_ev", "topk_score"):
+        return list(bucket)
+    if use_expected_value_ranking:
+        ranked = sorted(bucket, key=lambda item: (-item[6], -item[8]))
+    else:
+        ranked = sorted(bucket, key=lambda item: (-item[7], -item[8]))
+    limit = max(0, int(top_k_per_minute))
+    chosen = []
+    chosen_symbols = {}
+    for item in ranked:
+        symbol_name = item[3]
+        if top_k_per_symbol_minute > 0 and chosen_symbols.get(symbol_name, 0) >= top_k_per_symbol_minute:
+            record_block(int(item[0]), "symbol_minute_cap_blocked", symbol_name, int(item[1]))
+            continue
+        chosen.append(item)
+        chosen_symbols[symbol_name] = chosen_symbols.get(symbol_name, 0) + 1
+        if limit > 0 and len(chosen) >= limit:
+            break
+    if use_expected_value_ranking:
+        return sorted(chosen, key=lambda item: (-item[8], -item[7]))
+    return sorted(chosen, key=lambda item: (-item[7], -item[8]))
+
+
+def symbol_limits_allow(state, item, initial_capital, max_trades_per_fold,
+                        max_trades_per_day, max_losing_trades_per_day,
+                        max_daily_loss_fraction, max_open_positions,
+                        max_trades_per_symbol_period, max_trades_per_period,
+                        trade_period_minutes, record_block):
+    local_index, minute, day_id, symbol_name = int(item[0]), int(item[1]), int(item[2]), item[3]
+    if max_trades_per_fold > 0 and state["fold_trade_count"] >= max_trades_per_fold:
+        record_block(local_index, "fold_trade_limit_blocked", symbol_name, minute)
+        return False
+    if max_trades_per_day > 0 and state["entries_by_day"].get(day_id, 0) >= max_trades_per_day:
+        record_block(local_index, "daily_trade_limit_blocked", symbol_name, minute)
+        return False
+    if max_losing_trades_per_day > 0 and state["realized_losing_trades_by_day"].get(day_id, 0) >= max_losing_trades_per_day:
+        record_block(local_index, "daily_loss_limit_blocked", symbol_name, minute)
+        return False
+    pause_until = state["pause_until_minute_by_day"].get(day_id, 0)
+    if pause_until and minute < pause_until:
+        if max_daily_loss_fraction > 0.0 and state["realized_pnl_by_day"].get(day_id, 0.0) <= -max_daily_loss_fraction * initial_capital:
+            record_block(local_index, "daily_loss_fraction_blocked", symbol_name, minute)
+        else:
+            record_block(local_index, "daily_drawdown_limit_blocked", symbol_name, minute)
+        return False
+    symbol_pause_until = state["symbol_pause_until_minute"].get(symbol_name, 0)
+    if symbol_pause_until and minute < symbol_pause_until:
+        record_block(local_index, "cooldown_after_loss_blocked", symbol_name, minute)
+        return False
+    if max_open_positions > 0 and len(state["open_positions"]) >= max_open_positions:
+        record_block(local_index, "max_open_positions_blocked", symbol_name, minute)
+        return False
+    if max_trades_per_symbol_period > 0:
+        symbol_recent_entries = state["recent_entry_minutes_by_symbol"].setdefault(symbol_name, deque())
+        while symbol_recent_entries and symbol_recent_entries[0] <= minute - trade_period_minutes:
+            symbol_recent_entries.popleft()
+        if len(symbol_recent_entries) >= max_trades_per_symbol_period:
+            record_block(local_index, "symbol_trade_limit_blocked", symbol_name, minute)
+            return False
+    if max_trades_per_period > 0:
+        while state["recent_entry_minutes"] and state["recent_entry_minutes"][0] <= minute - trade_period_minutes:
+            state["recent_entry_minutes"].popleft()
+        if len(state["recent_entry_minutes"]) >= max_trades_per_period:
+            record_block(local_index, "period_trade_limit_blocked", symbol_name, minute)
+            return False
+    return True
+
+
+def capital_allocation(cash, invested, quote_volume_value, max_volume_fraction,
+                       max_position_fraction, calibrated_probability, threshold_value,
+                       expected_value, volatility_value, position_size_multiplier_fn,
+                       hybrid_runtime_args, blocked_counts):
+    volume_cap = quote_volume_value * max_volume_fraction
+    equity_position_cap = (cash + invested) * max_position_fraction
+    desired_position_size = min(equity_position_cap, cash)
+    desired_position_size *= position_size_multiplier_fn(
+        calibrated_probability,
+        threshold_value,
+        expected_value,
+        volatility_value,
+    )
+    partial_fill_mode = getattr(hybrid_runtime_args, "partial_fill_mode", "none") if hybrid_runtime_args is not None else "none"
+    if partial_fill_mode == "volume_fraction" and volume_cap + 1e-12 < desired_position_size:
+        blocked_counts["partial_fill_adjusted"] += 1
+    position_size = min(desired_position_size, volume_cap, cash)
+    lot_size_step = max(0.0, float(getattr(hybrid_runtime_args, "lot_size_step", 0.0))) if hybrid_runtime_args is not None else 0.0
+    tick_size = max(0.0, float(getattr(hybrid_runtime_args, "tick_size", 0.0))) if hybrid_runtime_args is not None else 0.0
+    if lot_size_step > 0.0 and position_size > 0.0:
+        rounded = math.floor(position_size / lot_size_step) * lot_size_step
+        if rounded + 1e-12 < position_size:
+            blocked_counts["lot_size_adjusted"] += 1
+        position_size = rounded
+    if tick_size > 0.0 and position_size > 0.0:
+        rounded = math.floor(position_size / tick_size) * tick_size
+        if rounded + 1e-12 < position_size:
+            blocked_counts["tick_size_adjusted"] += 1
+        position_size = rounded
+    return position_size
+
+
+def execution_stats_result(executed, executed_pnls, executed_minutes, executed_trade_day_ids,
+                           executed_expected_values, executed_trade_scores,
+                           executed_selection_ranks, executed_selected_by_topk,
+                           executed_selected_by_meta_filter, raw_selected, blocked_flags,
+                           blocked_by_symbol, blocked_by_bucket, cash, initial_capital,
+                           effective_fee, position_sizing_mode, max_drawdown,
+                           blocked_counts, fold_trade_count, entries_by_day,
+                           realized_pnl_by_day):
+    portfolio_profit = cash - initial_capital
+    position_sizes = list(executed.values())
+    active_days = len(entries_by_day)
+    realized_day_profits = list(realized_pnl_by_day.values())
+    profitable_days = sum(1 for value in realized_day_profits if value > 0.0)
+    losing_days = sum(1 for value in realized_day_profits if value < 0.0)
+    max_trades_in_any_day = max(entries_by_day.values()) if entries_by_day else 0
+    return {
+        "executed": executed,
+        "executed_pnls": executed_pnls,
+        "executed_minutes": executed_minutes,
+        "executed_trade_day_ids": executed_trade_day_ids,
+        "executed_expected_values": executed_expected_values,
+        "executed_trade_scores": executed_trade_scores,
+        "executed_selection_ranks": executed_selection_ranks,
+        "executed_selected_by_topk": executed_selected_by_topk,
+        "executed_selected_by_meta_filter": executed_selected_by_meta_filter,
+        "raw_selected": raw_selected,
+        "blocked_flags": blocked_flags or {},
+        "blocked_by_symbol": blocked_by_symbol,
+        "blocked_by_bucket": blocked_by_bucket,
+        "ending_capital": cash,
+        "portfolio_profit": portfolio_profit,
+        "portfolio_return": portfolio_profit / initial_capital,
+        "applied_fee": effective_fee,
+        "position_sizing_mode": position_sizing_mode,
+        "max_capital_drawdown": max_drawdown,
+        "average_position_size": sum(position_sizes) / len(position_sizes) if position_sizes else 0.0,
+        "median_position_size": median(position_sizes),
+        "min_position_size": min(position_sizes) if position_sizes else 0.0,
+        "max_position_size": max(position_sizes) if position_sizes else 0.0,
+        "average_profit_per_trade": portfolio_profit / len(position_sizes) if position_sizes else 0.0,
+        "worst_trade": min(executed_pnls.values()) if executed_pnls else 0.0,
+        "daily_trade_limit_blocked": blocked_counts["daily_trade_limit_blocked"],
+        "fold_trade_limit_blocked": blocked_counts["fold_trade_limit_blocked"],
+        "daily_loss_limit_blocked": blocked_counts["daily_loss_limit_blocked"],
+        "daily_drawdown_limit_blocked": blocked_counts["daily_drawdown_limit_blocked"],
+        "min_order_notional_blocked": blocked_counts["min_order_notional_blocked"],
+        "max_open_positions_blocked": blocked_counts["max_open_positions_blocked"],
+        "daily_loss_fraction_blocked": blocked_counts["daily_loss_fraction_blocked"],
+        "cooldown_after_loss_blocked": blocked_counts["cooldown_after_loss_blocked"],
+        "symbol_trade_limit_blocked": blocked_counts["symbol_trade_limit_blocked"],
+        "symbol_minute_cap_blocked": blocked_counts["symbol_minute_cap_blocked"],
+        "lot_size_adjusted": blocked_counts["lot_size_adjusted"],
+        "tick_size_adjusted": blocked_counts["tick_size_adjusted"],
+        "partial_fill_adjusted": blocked_counts["partial_fill_adjusted"],
+        "latency_penalty_adjusted": blocked_counts["latency_penalty_adjusted"],
+        "blocked_trades_total": (
+            blocked_counts["daily_trade_limit_blocked"]
+            + blocked_counts["fold_trade_limit_blocked"]
+            + blocked_counts["daily_loss_limit_blocked"]
+            + blocked_counts["daily_drawdown_limit_blocked"]
+            + blocked_counts["period_trade_limit_blocked"]
+            + blocked_counts["min_order_notional_blocked"]
+            + blocked_counts["max_open_positions_blocked"]
+            + blocked_counts["daily_loss_fraction_blocked"]
+            + blocked_counts["cooldown_after_loss_blocked"]
+            + blocked_counts["symbol_trade_limit_blocked"]
+            + blocked_counts["symbol_minute_cap_blocked"]
+        ),
+        "blocked_by_trade_frequency": (
+            blocked_counts["daily_trade_limit_blocked"]
+            + blocked_counts["fold_trade_limit_blocked"]
+            + blocked_counts["daily_loss_limit_blocked"]
+            + blocked_counts["period_trade_limit_blocked"]
+            + blocked_counts["symbol_trade_limit_blocked"]
+            + blocked_counts["symbol_minute_cap_blocked"]
+        ),
+        "blocked_by_drawdown": blocked_counts["daily_drawdown_limit_blocked"] + blocked_counts["daily_loss_fraction_blocked"],
+        "max_trades_in_any_day": max_trades_in_any_day,
+        "max_trades_in_any_fold": fold_trade_count,
+        "trades_per_active_day": float(fold_trade_count) / active_days if active_days else 0.0,
+        "active_days": active_days,
+        "profitable_days": profitable_days,
+        "losing_days": losing_days,
+        "worst_day_profit": min(realized_day_profits) if realized_day_profits else 0.0,
+        "best_day_profit": max(realized_day_profits) if realized_day_profits else 0.0,
+    }
 
 
 def compact_signal_indices(probabilities, threshold, batch_size=1000000):
@@ -6204,6 +6406,8 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
     executed_selected_by_topk = {}
     executed_selected_by_meta_filter = {}
     blocked_flags = {} if capture_blocked_details else None
+    blocked_by_symbol = {}
+    blocked_by_bucket = {}
     blocked_counts = {
         "daily_trade_limit_blocked": 0,
         "fold_trade_limit_blocked": 0,
@@ -6214,6 +6418,8 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
         "max_open_positions_blocked": 0,
         "daily_loss_fraction_blocked": 0,
         "cooldown_after_loss_blocked": 0,
+        "symbol_trade_limit_blocked": 0,
+        "symbol_minute_cap_blocked": 0,
         "lot_size_adjusted": 0,
         "tick_size_adjusted": 0,
         "partial_fill_adjusted": 0,
@@ -6224,6 +6430,7 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
     realized_losing_trades_by_day = {}
     pause_until_minute_by_day = {}
     symbol_pause_until_minute = {}
+    recent_entry_minutes_by_symbol = {}
     fold_trade_count = 0
     use_expected_value_ranking = (
         trade_selection == "topk_ev"
@@ -6244,6 +6451,8 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
     hybrid_uncertainty_penalty = getattr(hybrid_runtime_args, "hybrid_uncertainty_penalty", 0.0) if hybrid_runtime_args is not None else 0.0
     meta_filter_mode = getattr(hybrid_runtime_args, "meta_filter", "none") if hybrid_runtime_args is not None else "none"
     meta_filter_min_probability = getattr(hybrid_runtime_args, "meta_filter_min_probability", 0.0) if hybrid_runtime_args is not None else 0.0
+    top_k_per_symbol_minute = max(0, int(getattr(hybrid_runtime_args, "top_k_per_symbol_minute", 0))) if hybrid_runtime_args is not None else 0
+    max_trades_per_symbol_period = max(0, int(getattr(hybrid_runtime_args, "max_trades_per_symbol_period", 0))) if hybrid_runtime_args is not None else 0
     meta_filter_active = meta_filter_mode != "none" and bundle.get("meta_probability") is not None
     ev_context = resolve_ev_context(bundle, hybrid_runtime_args, upside_target, downside_stop)
     hybrid_context = resolve_hybrid_return_context(bundle, hybrid_runtime_args, upside_target, downside_stop)
@@ -6258,8 +6467,20 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
         max(base_hybrid_threshold, float(hybrid_min_score)),
     ) if objective_mode == "hybrid" and hybrid_runtime_args is not None else (None, None)
 
-    def record_block(index, reason):
+    def record_block(index, reason, symbol_name="", minute=None):
         blocked_counts[reason] += 1
+        if symbol_name:
+            symbol_stats = blocked_by_symbol.setdefault(symbol_name, {"count": 0, "reason": reason})
+            symbol_stats["count"] += 1
+            if symbol_stats["count"] == 1 or reason != symbol_stats.get("reason"):
+                symbol_stats["reason"] = reason
+        if minute is not None:
+            bucket_width = max(1, int(trade_period_minutes))
+            bucket_start = int(minute) - (int(minute) % bucket_width)
+            bucket_stats = blocked_by_bucket.setdefault(bucket_start, {"count": 0, "reason": reason})
+            bucket_stats["count"] += 1
+            if bucket_stats["count"] == 1 or reason != bucket_stats.get("reason"):
+                bucket_stats["reason"] = reason
         if capture_blocked_details:
             flags = blocked_flags.setdefault(index, {
                 "blocked_by_daily_trade_limit": 0,
@@ -6342,60 +6563,48 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
         release_positions(minute)
         if meta_filter_active and meta_probability < meta_filter_min_probability:
             return
-        if max_trades_per_fold > 0 and fold_trade_count >= max_trades_per_fold:
-            record_block(local_index, "fold_trade_limit_blocked")
+        if not symbol_limits_allow(
+            {
+                "fold_trade_count": fold_trade_count,
+                "entries_by_day": entries_by_day,
+                "realized_losing_trades_by_day": realized_losing_trades_by_day,
+                "realized_pnl_by_day": realized_pnl_by_day,
+                "pause_until_minute_by_day": pause_until_minute_by_day,
+                "symbol_pause_until_minute": symbol_pause_until_minute,
+                "open_positions": open_positions,
+                "recent_entry_minutes_by_symbol": recent_entry_minutes_by_symbol,
+                "recent_entry_minutes": recent_entry_minutes,
+            },
+            item,
+            initial_capital,
+            max_trades_per_fold,
+            max_trades_per_day,
+            max_losing_trades_per_day,
+            max_daily_loss_fraction,
+            max_open_positions,
+            max_trades_per_symbol_period,
+            max_trades_per_period,
+            trade_period_minutes,
+            record_block,
+        ):
             return
-        if max_trades_per_day > 0 and entries_by_day.get(day_id, 0) >= max_trades_per_day:
-            record_block(local_index, "daily_trade_limit_blocked")
-            return
-        if max_losing_trades_per_day > 0 and realized_losing_trades_by_day.get(day_id, 0) >= max_losing_trades_per_day:
-            record_block(local_index, "daily_loss_limit_blocked")
-            return
-        pause_until = pause_until_minute_by_day.get(day_id, 0)
-        if pause_until and minute < pause_until:
-            if max_daily_loss_fraction > 0.0 and realized_pnl_by_day.get(day_id, 0.0) <= -max_daily_loss_fraction * initial_capital:
-                record_block(local_index, "daily_loss_fraction_blocked")
-            else:
-                record_block(local_index, "daily_drawdown_limit_blocked")
-            return
-        symbol_pause_until = symbol_pause_until_minute.get(symbol_name, 0)
-        if symbol_pause_until and minute < symbol_pause_until:
-            record_block(local_index, "cooldown_after_loss_blocked")
-            return
-        if max_open_positions > 0 and len(open_positions) >= max_open_positions:
-            record_block(local_index, "max_open_positions_blocked")
-            return
-        if max_trades_per_period > 0:
-            while recent_entry_minutes and recent_entry_minutes[0] <= minute - trade_period_minutes:
-                recent_entry_minutes.popleft()
-            if len(recent_entry_minutes) >= max_trades_per_period:
-                blocked_counts["period_trade_limit_blocked"] += 1
-                return
-        volume_cap = quote_volume_value * max_volume_fraction
-        equity_position_cap = (cash + invested) * max_position_fraction
         threshold_value = row_probability_threshold(threshold, local_index)
-        desired_position_size = min(equity_position_cap, cash)
-        desired_position_size *= position_size_multiplier(
+        position_size = capital_allocation(
+            cash,
+            invested,
+            quote_volume_value,
+            max_volume_fraction,
+            max_position_fraction,
             calibrated_probability,
             threshold_value,
             expected_value,
             volatility_value,
+            position_size_multiplier,
+            hybrid_runtime_args,
+            blocked_counts,
         )
-        if partial_fill_mode == "volume_fraction" and volume_cap + 1e-12 < desired_position_size:
-            blocked_counts["partial_fill_adjusted"] += 1
-        position_size = min(desired_position_size, volume_cap, cash)
-        if lot_size_step > 0.0 and position_size > 0.0:
-            rounded = math.floor(position_size / lot_size_step) * lot_size_step
-            if rounded + 1e-12 < position_size:
-                blocked_counts["lot_size_adjusted"] += 1
-            position_size = rounded
-        if tick_size > 0.0 and position_size > 0.0:
-            rounded = math.floor(position_size / tick_size) * tick_size
-            if rounded + 1e-12 < position_size:
-                blocked_counts["tick_size_adjusted"] += 1
-            position_size = rounded
         if min_order_notional > 0.0 and position_size + 1e-12 < min_order_notional:
-            record_block(local_index, "min_order_notional_blocked")
+            record_block(local_index, "min_order_notional_blocked", symbol_name, minute)
             return
         if position_size <= 0.0:
             return
@@ -6408,6 +6617,8 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
         open_positions.append((minute + holding_period_minutes, position_size, pnl, day_id, symbol_name))
         if max_trades_per_period > 0:
             recent_entry_minutes.append(minute)
+        if max_trades_per_symbol_period > 0:
+            recent_entry_minutes_by_symbol.setdefault(symbol_name, deque()).append(minute)
         fold_trade_count += 1
         entries_by_day[day_id] = entries_by_day.get(day_id, 0) + 1
         executed[local_index] = position_size
@@ -6424,21 +6635,14 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
         if not bucket:
             return
         if trade_selection in ("topk_ev", "topk_score"):
-            if use_expected_value_ranking:
-                ranked = sorted(bucket, key=lambda item: (-item[6], -item[8]))
-            else:
-                ranked = sorted(bucket, key=lambda item: (-item[7], -item[8]))
-            limit = max(0, int(top_k_per_minute))
-            if limit <= 0:
-                chosen = ranked
-            elif limit == 1:
-                chosen = [ranked[0]]
-            else:
-                chosen = ranked[:limit]
-            if use_expected_value_ranking:
-                chosen = sorted(chosen, key=lambda item: (-item[8], -item[7]))
-            else:
-                chosen = sorted(chosen, key=lambda item: (-item[7], -item[8]))
+            chosen = candidate_rank(
+                bucket,
+                trade_selection,
+                use_expected_value_ranking,
+                top_k_per_minute,
+                top_k_per_symbol_minute,
+                record_block,
+            )
             for rank, item in enumerate(chosen, 1):
                 execute_candidate(item, rank, 1)
             return
@@ -6634,76 +6838,30 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
     flush_bucket(current_bucket)
 
     release_positions(sys.maxsize)
-    portfolio_profit = cash - initial_capital
-    position_sizes = list(executed.values())
-    active_days = len(entries_by_day)
-    realized_day_profits = list(realized_pnl_by_day.values())
-    profitable_days = sum(1 for value in realized_day_profits if value > 0.0)
-    losing_days = sum(1 for value in realized_day_profits if value < 0.0)
-    max_trades_in_any_day = max(entries_by_day.values()) if entries_by_day else 0
-    return {
-        "executed": executed,
-        "executed_pnls": executed_pnls,
-        "executed_minutes": executed_minutes,
-        "executed_trade_day_ids": executed_trade_day_ids,
-        "executed_expected_values": executed_expected_values,
-        "executed_trade_scores": executed_trade_scores,
-        "executed_selection_ranks": executed_selection_ranks,
-        "executed_selected_by_topk": executed_selected_by_topk,
-        "executed_selected_by_meta_filter": executed_selected_by_meta_filter,
-        "raw_selected": raw_selected,
-        "blocked_flags": blocked_flags or {},
-        "ending_capital": cash,
-        "portfolio_profit": portfolio_profit,
-        "portfolio_return": portfolio_profit / initial_capital,
-        "applied_fee": effective_fee,
-        "position_sizing_mode": position_sizing_mode,
-        "max_capital_drawdown": max_drawdown,
-        "average_position_size": sum(position_sizes) / len(position_sizes) if position_sizes else 0.0,
-        "median_position_size": median(position_sizes),
-        "min_position_size": min(position_sizes) if position_sizes else 0.0,
-        "max_position_size": max(position_sizes) if position_sizes else 0.0,
-        "average_profit_per_trade": portfolio_profit / len(position_sizes) if position_sizes else 0.0,
-        "worst_trade": min(executed_pnls.values()) if executed_pnls else 0.0,
-        "daily_trade_limit_blocked": blocked_counts["daily_trade_limit_blocked"],
-        "fold_trade_limit_blocked": blocked_counts["fold_trade_limit_blocked"],
-        "daily_loss_limit_blocked": blocked_counts["daily_loss_limit_blocked"],
-        "daily_drawdown_limit_blocked": blocked_counts["daily_drawdown_limit_blocked"],
-        "min_order_notional_blocked": blocked_counts["min_order_notional_blocked"],
-        "max_open_positions_blocked": blocked_counts["max_open_positions_blocked"],
-        "daily_loss_fraction_blocked": blocked_counts["daily_loss_fraction_blocked"],
-        "cooldown_after_loss_blocked": blocked_counts["cooldown_after_loss_blocked"],
-        "lot_size_adjusted": blocked_counts["lot_size_adjusted"],
-        "tick_size_adjusted": blocked_counts["tick_size_adjusted"],
-        "partial_fill_adjusted": blocked_counts["partial_fill_adjusted"],
-        "latency_penalty_adjusted": blocked_counts["latency_penalty_adjusted"],
-        "blocked_trades_total": (
-            blocked_counts["daily_trade_limit_blocked"]
-            + blocked_counts["fold_trade_limit_blocked"]
-            + blocked_counts["daily_loss_limit_blocked"]
-            + blocked_counts["daily_drawdown_limit_blocked"]
-            + blocked_counts["period_trade_limit_blocked"]
-            + blocked_counts["min_order_notional_blocked"]
-            + blocked_counts["max_open_positions_blocked"]
-            + blocked_counts["daily_loss_fraction_blocked"]
-            + blocked_counts["cooldown_after_loss_blocked"]
-        ),
-        "blocked_by_trade_frequency": (
-            blocked_counts["daily_trade_limit_blocked"]
-            + blocked_counts["fold_trade_limit_blocked"]
-            + blocked_counts["daily_loss_limit_blocked"]
-            + blocked_counts["period_trade_limit_blocked"]
-        ),
-        "blocked_by_drawdown": blocked_counts["daily_drawdown_limit_blocked"] + blocked_counts["daily_loss_fraction_blocked"],
-        "max_trades_in_any_day": max_trades_in_any_day,
-        "max_trades_in_any_fold": fold_trade_count,
-        "trades_per_active_day": float(fold_trade_count) / active_days if active_days else 0.0,
-        "active_days": active_days,
-        "profitable_days": profitable_days,
-        "losing_days": losing_days,
-        "worst_day_profit": min(realized_day_profits) if realized_day_profits else 0.0,
-        "best_day_profit": max(realized_day_profits) if realized_day_profits else 0.0,
-    }
+    return execution_stats_result(
+        executed,
+        executed_pnls,
+        executed_minutes,
+        executed_trade_day_ids,
+        executed_expected_values,
+        executed_trade_scores,
+        executed_selection_ranks,
+        executed_selected_by_topk,
+        executed_selected_by_meta_filter,
+        raw_selected,
+        blocked_flags,
+        blocked_by_symbol,
+        blocked_by_bucket,
+        cash,
+        initial_capital,
+        effective_fee,
+        position_sizing_mode,
+        max_drawdown,
+        blocked_counts,
+        fold_trade_count,
+        entries_by_day,
+        realized_pnl_by_day,
+    )
 
 
 def raw_classification_metrics(rows, predictions, threshold, batch_size=1000000,
@@ -6802,6 +6960,139 @@ def execution_frequency_metrics(execution):
         "trades_per_day": len(minutes) / float(len(days)),
         "trades_per_month": len(minutes) / float(len(months)),
     }
+
+
+def execution_symbol_summary(rows, execution):
+    by_symbol = {}
+
+    def stats_for(symbol):
+        return by_symbol.setdefault(symbol, {
+            "symbol": symbol,
+            "predicted_trades": 0,
+            "portfolio_profit_contribution": 0.0,
+            "active_days": set(),
+        })
+
+    for local_index, pnl in execution.get("executed_pnls", {}).items():
+        local_index = int(local_index)
+        symbol = row_symbol_name(rows, local_index)
+        stats = stats_for(symbol)
+        stats["predicted_trades"] += 1
+        stats["portfolio_profit_contribution"] += float(pnl)
+        day_id = execution.get("executed_trade_day_ids", {}).get(local_index)
+        if day_id is None:
+            minute = execution.get("executed_minutes", {}).get(local_index, 0)
+            day_id = minute_day_id(int(minute))
+        stats["active_days"].add(int(day_id))
+
+    if not by_symbol:
+        return {
+            "symbol_execution_rows": [],
+            "profitable_symbols": 0,
+            "losing_symbols": 0,
+            "symbol_profit_concentration_top1": 0.0,
+            "symbol_profit_concentration_top3": 0.0,
+            "symbol_trade_concentration_top1": 0.0,
+            "best_symbol": "",
+            "worst_symbol": "",
+            "dominant_symbol": "",
+            "dominant_symbol_executed_trade_count": 0,
+            "dominant_symbol_active_days": 0,
+        }
+
+    rows_out = []
+    positive_profit_contributions = []
+    total_trades = 0
+    for symbol in sorted(by_symbol):
+        stats = by_symbol[symbol]
+        total_trades += int(stats["predicted_trades"])
+        positive_profit_contributions.append(max(0.0, float(stats["portfolio_profit_contribution"])))
+        rows_out.append({
+            "symbol": symbol,
+            "predicted_trades": int(stats["predicted_trades"]),
+            "portfolio_profit_contribution": float(stats["portfolio_profit_contribution"]),
+            "active_days": len(stats["active_days"]),
+        })
+    positive_profit_contributions.sort(reverse=True)
+    profit_contribution_total = sum(positive_profit_contributions)
+    dominant = max(rows_out, key=lambda row: (row["predicted_trades"], row["portfolio_profit_contribution"], row["symbol"]))
+    return {
+        "symbol_execution_rows": rows_out,
+        "profitable_symbols": sum(1 for row in rows_out if row["portfolio_profit_contribution"] > 0.0),
+        "losing_symbols": sum(1 for row in rows_out if row["portfolio_profit_contribution"] < 0.0),
+        "symbol_profit_concentration_top1": (
+            positive_profit_contributions[0] / profit_contribution_total
+            if profit_contribution_total > 0.0 and positive_profit_contributions else 0.0
+        ),
+        "symbol_profit_concentration_top3": (
+            sum(positive_profit_contributions[:3]) / profit_contribution_total
+            if profit_contribution_total > 0.0 else 0.0
+        ),
+        "symbol_trade_concentration_top1": (
+            float(dominant["predicted_trades"]) / float(max(1, total_trades))
+            if rows_out else 0.0
+        ),
+        "best_symbol": max(rows_out, key=lambda row: row["portfolio_profit_contribution"])["symbol"],
+        "worst_symbol": min(rows_out, key=lambda row: row["portfolio_profit_contribution"])["symbol"],
+        "dominant_symbol": dominant["symbol"],
+        "dominant_symbol_executed_trade_count": int(dominant["predicted_trades"]),
+        "dominant_symbol_active_days": int(dominant["active_days"]),
+    }
+
+
+def execution_rejection_diagnostics(execution):
+    blocked_by_symbol = execution.get("blocked_by_symbol", {}) or {}
+    blocked_by_bucket = execution.get("blocked_by_bucket", {}) or {}
+    top_symbol = max(
+        blocked_by_symbol.items(),
+        key=lambda item: (int(item[1].get("count", 0)), item[0]),
+        default=None,
+    )
+    top_bucket = max(
+        blocked_by_bucket.items(),
+        key=lambda item: (int(item[1].get("count", 0)), int(item[0])),
+        default=None,
+    )
+    result = {
+        "top_blocked_symbol": "",
+        "top_blocked_symbol_reason": "",
+        "top_blocked_symbol_count": 0,
+        "top_blocked_bucket_start_minute": 0,
+        "top_blocked_bucket_reason": "",
+        "top_blocked_bucket_count": 0,
+    }
+    if top_symbol is not None:
+        result.update({
+            "top_blocked_symbol": top_symbol[0],
+            "top_blocked_symbol_reason": top_symbol[1].get("reason", ""),
+            "top_blocked_symbol_count": int(top_symbol[1].get("count", 0)),
+        })
+    if top_bucket is not None:
+        result.update({
+            "top_blocked_bucket_start_minute": int(top_bucket[0]),
+            "top_blocked_bucket_reason": top_bucket[1].get("reason", ""),
+            "top_blocked_bucket_count": int(top_bucket[1].get("count", 0)),
+        })
+    return result
+
+
+def finalize_evaluation_metrics(rows, metrics, execution, compute_auc, bundle):
+    metrics.update(execution_frequency_metrics(execution))
+    metrics.update(execution_symbol_summary(rows, execution))
+    metrics.update(execution_rejection_diagnostics(execution))
+    calibration_report = calibration_report_for_rows(rows, bundle, metrics.get("selected_threshold", 0.0))
+    metrics["calibration_report"] = calibration_report
+    metrics["brier_score"] = calibration_report.get("brier_score", 0.0)
+    metrics["expected_calibration_error"] = calibration_report.get("expected_calibration_error", 0.0)
+    metrics["max_calibration_error"] = calibration_report.get("max_calibration_error", 0.0)
+    if compute_auc and bundle.get("probability") is not None:
+        metrics["auc"] = auc_score_from_rows(
+            bundle["calibrated_probability"] if bundle.get("calibrated_probability") is not None else bundle.get("probability", []),
+            rows,
+        )
+    else:
+        metrics["auc"] = 0.0
+    return metrics
 
 
 def evaluate_compact(rows, predictions, threshold, fee, slippage, compute_auc=True, initial_capital=10000.0,
@@ -6931,8 +7222,6 @@ def evaluate_compact(rows, predictions, threshold, fee, slippage, compute_auc=Tr
     accuracy = float(tp + tn) / total if total else 0.0
     f1 = 2.0 * precision * recall / (precision + recall) if precision + recall else 0.0
     trade_count = float(predicted_trades) if predicted_trades else 1.0
-    calibration_report = calibration_report_for_rows(rows, bundle, threshold)
-
     metrics = {
         "rows": total,
         "actual_positive_rows": actual_positive,
@@ -6941,7 +7230,6 @@ def evaluate_compact(rows, predictions, threshold, fee, slippage, compute_auc=Tr
         "false_positive_rows": fp,
         "true_negative_rows": tn,
         "false_negative_rows": fn,
-        "auc": auc_score_from_rows(bundle["calibrated_probability"] if bundle.get("calibrated_probability") is not None else bundle.get("probability", []), rows) if compute_auc and bundle.get("probability") is not None else 0.0,
         "accuracy": accuracy,
         "precision": precision,
         "recall": recall,
@@ -6985,6 +7273,8 @@ def evaluate_compact(rows, predictions, threshold, fee, slippage, compute_auc=Tr
         "max_open_positions_blocked": execution.get("max_open_positions_blocked", 0),
         "daily_loss_fraction_blocked": execution.get("daily_loss_fraction_blocked", 0),
         "cooldown_after_loss_blocked": execution.get("cooldown_after_loss_blocked", 0),
+        "symbol_trade_limit_blocked": execution.get("symbol_trade_limit_blocked", 0),
+        "symbol_minute_cap_blocked": execution.get("symbol_minute_cap_blocked", 0),
         "lot_size_adjusted": execution.get("lot_size_adjusted", 0),
         "tick_size_adjusted": execution.get("tick_size_adjusted", 0),
         "partial_fill_adjusted": execution.get("partial_fill_adjusted", 0),
@@ -7001,14 +7291,10 @@ def evaluate_compact(rows, predictions, threshold, fee, slippage, compute_auc=Tr
         "worst_day_profit": execution["worst_day_profit"],
         "best_day_profit": execution["best_day_profit"],
         "normalized_microsecond_open_times": NORMALIZED_MICROSECOND_OPEN_TIMES,
-        "brier_score": calibration_report.get("brier_score", 0.0),
-        "expected_calibration_error": calibration_report.get("expected_calibration_error", 0.0),
-        "max_calibration_error": calibration_report.get("max_calibration_error", 0.0),
+        "selected_threshold": threshold,
     }
     metrics.update(raw_metrics)
-    metrics.update(execution_frequency_metrics(execution))
-    metrics["calibration_report"] = calibration_report
-    return metrics
+    return finalize_evaluation_metrics(rows, metrics, execution, compute_auc, bundle)
 
 
 def evaluate(rows, predictions, threshold, fee, slippage, compute_auc=True, initial_capital=10000.0,
@@ -7162,8 +7448,6 @@ def evaluate(rows, predictions, threshold, fee, slippage, compute_auc=True, init
     accuracy = float(tp + tn) / total if total else 0.0
     f1 = 2.0 * precision * recall / (precision + recall) if precision + recall else 0.0
     trade_count = float(predicted_trades) if predicted_trades else 1.0
-    calibration_report = calibration_report_for_rows(rows, bundle, threshold)
-
     metrics = {
         "rows": total,
         "actual_positive_rows": actual_positive,
@@ -7172,7 +7456,6 @@ def evaluate(rows, predictions, threshold, fee, slippage, compute_auc=True, init
         "false_positive_rows": fp,
         "true_negative_rows": tn,
         "false_negative_rows": fn,
-        "auc": auc_score_from_rows(bundle["calibrated_probability"] if bundle.get("calibrated_probability") is not None else bundle.get("probability", []), rows) if compute_auc and bundle.get("probability") is not None else 0.0,
         "accuracy": accuracy,
         "precision": precision,
         "recall": recall,
@@ -7216,6 +7499,8 @@ def evaluate(rows, predictions, threshold, fee, slippage, compute_auc=True, init
         "max_open_positions_blocked": execution.get("max_open_positions_blocked", 0),
         "daily_loss_fraction_blocked": execution.get("daily_loss_fraction_blocked", 0),
         "cooldown_after_loss_blocked": execution.get("cooldown_after_loss_blocked", 0),
+        "symbol_trade_limit_blocked": execution.get("symbol_trade_limit_blocked", 0),
+        "symbol_minute_cap_blocked": execution.get("symbol_minute_cap_blocked", 0),
         "lot_size_adjusted": execution.get("lot_size_adjusted", 0),
         "tick_size_adjusted": execution.get("tick_size_adjusted", 0),
         "partial_fill_adjusted": execution.get("partial_fill_adjusted", 0),
@@ -7232,14 +7517,10 @@ def evaluate(rows, predictions, threshold, fee, slippage, compute_auc=True, init
         "worst_day_profit": execution["worst_day_profit"],
         "best_day_profit": execution["best_day_profit"],
         "normalized_microsecond_open_times": NORMALIZED_MICROSECOND_OPEN_TIMES,
-        "brier_score": calibration_report.get("brier_score", 0.0),
-        "expected_calibration_error": calibration_report.get("expected_calibration_error", 0.0),
-        "max_calibration_error": calibration_report.get("max_calibration_error", 0.0),
+        "selected_threshold": threshold,
     }
     metrics.update(raw_metrics)
-    metrics.update(execution_frequency_metrics(execution))
-    metrics["calibration_report"] = calibration_report
-    return metrics
+    return finalize_evaluation_metrics(rows, metrics, execution, compute_auc, bundle)
 
 
 def rows_label_values(rows):
@@ -7346,6 +7627,13 @@ def fit_symbol_validation_filter(rows, predictions, threshold, args, trade_score
         return {
             "mode": "none",
             "enabled": False,
+            "symbol_filter_min_candidates": 0,
+            "symbol_filter_min_executed": 0,
+            "symbol_filter_candidate_weight": 0.5,
+            "symbol_filter_executed_weight": 0.5,
+            "symbol_filter_shrinkage": 50.0,
+            "symbol_filter_min_active_days": 0,
+            "symbol_filter_max_executed_trade_share": 0.0,
             "allowed_symbols": [],
             "total_symbols": 0,
             "filtered_symbols": [],
@@ -7411,12 +7699,15 @@ def fit_symbol_validation_filter(rows, predictions, threshold, args, trade_score
             "executed_profit": 0.0,
             "executed_net_return_sum": 0.0,
             "executed_win_count": 0,
+            "_eligible_active_days": set(),
+            "_executed_active_days": set(),
         })
 
     global_candidate_sum = 0.0
     global_candidate_count = 0
     global_executed_sum = 0.0
     global_executed_count = 0
+    total_executed_trades = max(1, len(execution["executed"]))
     hybrid_score_mode = getattr(args, "hybrid_score_mode", "basic")
     hybrid_uncertainty_penalty = getattr(args, "hybrid_uncertainty_penalty", 0.0)
 
@@ -7465,6 +7756,7 @@ def fit_symbol_validation_filter(rows, predictions, threshold, args, trade_score
         stats["eligible_candidate_predicted_return_sum"] += float(predicted_trade_return_value(bundle, local_index))
         stats["eligible_candidate_realized_return_sum"] += realized_return
         stats["eligible_candidate_positive_sum"] += float(labels[local_index])
+        stats["_eligible_active_days"].add(minute_day_id(open_time_minute(row_open_time_value(rows, local_index))))
         global_candidate_sum += realized_return
         global_candidate_count += 1
 
@@ -7479,6 +7771,9 @@ def fit_symbol_validation_filter(rows, predictions, threshold, args, trade_score
         stats["executed_net_return_sum"] += net_return
         if float(pnl) > 0.0:
             stats["executed_win_count"] += 1
+        executed_day_id = execution.get("executed_trade_day_ids", {}).get(local_index)
+        if executed_day_id is not None:
+            stats["_executed_active_days"].add(int(executed_day_id))
         global_executed_sum += net_return
         global_executed_count += 1
 
@@ -7494,11 +7789,16 @@ def fit_symbol_validation_filter(rows, predictions, threshold, args, trade_score
     min_trades = max(1, int(getattr(args, "min_symbol_validation_trades", 1)))
     min_avg_profit = float(getattr(args, "min_symbol_validation_average_profit", 0.0))
     min_total_profit = float(getattr(args, "min_symbol_validation_total_profit", 0.0))
+    min_active_days = max(0, int(getattr(args, "symbol_filter_min_active_days", 0)))
+    max_executed_trade_share = float(getattr(args, "symbol_filter_max_executed_trade_share", 0.0))
     diagnostics = []
     for symbol, stats in sorted(symbol_stats.items()):
         raw_count = int(stats["raw_candidate_count"])
         eligible_count = int(stats["eligible_candidate_count"])
         executed_count = int(stats["executed_trade_count"])
+        eligible_active_days = len(stats["_eligible_active_days"])
+        executed_active_days = len(stats["_executed_active_days"])
+        executed_trade_share = float(executed_count) / float(total_executed_trades) if total_executed_trades > 0 else 0.0
         raw_avg_score = float(stats["raw_candidate_score_sum"]) / float(raw_count) if raw_count else 0.0
         raw_avg_probability = float(stats["raw_candidate_probability_sum"]) / float(raw_count) if raw_count else 0.0
         raw_avg_predicted_return = float(stats["raw_candidate_predicted_return_sum"]) / float(raw_count) if raw_count else 0.0
@@ -7514,6 +7814,9 @@ def fit_symbol_validation_filter(rows, predictions, threshold, args, trade_score
         stats["win_rate"] = executed_win_rate
         stats["candidate_quality"] = eligible_avg_realized_return
         stats["executed_quality"] = executed_avg_return
+        stats["eligible_active_days"] = eligible_active_days
+        stats["executed_active_days"] = executed_active_days
+        stats["executed_trade_share"] = executed_trade_share
 
         allowed = True
         reason = "insufficient_evidence"
@@ -7574,6 +7877,17 @@ def fit_symbol_validation_filter(rows, predictions, threshold, args, trade_score
                 allowed = True
                 reason = "insufficient_blended_evidence"
 
+        dominance_gate_triggered = False
+        if allowed and max_executed_trade_share > 0.0 and executed_trade_share > max_executed_trade_share:
+            support_ready = (
+                executed_count >= max(min_trades, min_executed)
+                or (min_active_days > 0 and executed_active_days >= min_active_days)
+            )
+            if not support_ready:
+                allowed = False
+                reason = "dominance_support_floor"
+                dominance_gate_triggered = True
+
         if allowed:
             allowed_symbols.append(symbol)
         else:
@@ -7591,9 +7905,12 @@ def fit_symbol_validation_filter(rows, predictions, threshold, args, trade_score
             "eligible_candidate_avg_predicted_return": eligible_avg_predicted_return,
             "eligible_candidate_realized_avg_return": eligible_avg_realized_return,
             "eligible_candidate_positive_rate": eligible_positive_rate,
+            "eligible_active_days": eligible_active_days,
             "executed_avg_profit": executed_avg_profit,
             "executed_avg_return": executed_avg_return,
             "executed_win_rate": executed_win_rate,
+            "executed_active_days": executed_active_days,
+            "executed_trade_share": executed_trade_share,
             "candidate_quality": eligible_avg_realized_return,
             "executed_quality": executed_avg_return,
             "symbol_score": symbol_score if stage == "candidate_blend" else decision_metric,
@@ -7601,12 +7918,22 @@ def fit_symbol_validation_filter(rows, predictions, threshold, args, trade_score
             "symbol_filter_stage": stage,
             "symbol_filter_decision": "allowed" if allowed else "blocked",
             "symbol_filter_reason": reason,
+            "dominance_gate_triggered": 1 if dominance_gate_triggered else 0,
         })
+        del stats["_eligible_active_days"]
+        del stats["_executed_active_days"]
     enabled = bool(allowed_symbols) and len(filtered_symbols) > 0
     return {
         "mode": mode,
         "stage": stage,
         "enabled": enabled,
+        "symbol_filter_min_candidates": min_candidates,
+        "symbol_filter_min_executed": min_executed,
+        "symbol_filter_candidate_weight": candidate_weight,
+        "symbol_filter_executed_weight": executed_weight,
+        "symbol_filter_shrinkage": shrinkage,
+        "symbol_filter_min_active_days": min_active_days,
+        "symbol_filter_max_executed_trade_share": max_executed_trade_share,
         "allowed_symbols": allowed_symbols if enabled else [],
         "total_symbols": len(symbol_stats),
         "filtered_symbols": filtered_symbols if enabled else [],
@@ -8005,7 +8332,9 @@ def threshold_score(metrics, objective, zero_trade_profit_score=0.0,
 def threshold_penalized_score(metrics, objective, zero_trade_profit_score=0.0,
                               drawdown_penalty=0.0, trade_count_penalty=0.0,
                               target_validation_trades=0,
-                              min_validation_trades=0, max_validation_trades=0):
+                              min_validation_trades=0, max_validation_trades=0,
+                              top1_concentration_penalty=0.0,
+                              top3_concentration_penalty=0.0):
     base_score = threshold_score(
         metrics,
         objective,
@@ -8021,6 +8350,10 @@ def threshold_penalized_score(metrics, objective, zero_trade_profit_score=0.0,
         if trade_count_penalty > 0.0 and target_validation_trades > 0:
             excess_trades = max(0, int(metrics.get("predicted_trades", 0)) - int(target_validation_trades))
             penalized_score -= trade_count_penalty * excess_trades
+        if top1_concentration_penalty > 0.0:
+            penalized_score -= top1_concentration_penalty * float(metrics.get("symbol_profit_concentration_top1", 0.0))
+        if top3_concentration_penalty > 0.0:
+            penalized_score -= top3_concentration_penalty * float(metrics.get("symbol_profit_concentration_top3", 0.0))
     return base_score, penalized_score
 
 
@@ -8172,7 +8505,9 @@ def annotate_selected_validation_metrics(metrics, threshold, selected_score_name
 def build_selected_threshold_result(threshold, metrics, objective, zero_trade_profit_score,
                                     drawdown_penalty, trade_count_penalty,
                                     target_validation_trades, selected_score_name,
-                                    min_validation_trades=0, max_validation_trades=0):
+                                    min_validation_trades=0, max_validation_trades=0,
+                                    top1_concentration_penalty=0.0,
+                                    top3_concentration_penalty=0.0):
     base_score, penalized_score = threshold_penalized_score(
         metrics,
         objective,
@@ -8182,6 +8517,8 @@ def build_selected_threshold_result(threshold, metrics, objective, zero_trade_pr
         target_validation_trades,
         min_validation_trades,
         max_validation_trades,
+        top1_concentration_penalty,
+        top3_concentration_penalty,
     )
     annotate_selected_validation_metrics(
         metrics,
@@ -8247,9 +8584,22 @@ def tune_threshold(rows, predictions, thresholds, objective, fee, slippage,
         "closest_under_min_precision": 0.0,
         "closest_under_min_precision_threshold": 0.0,
         "closest_under_min_precision_trades": 0,
+        "rejected_over_top1_concentration_count": 0,
+        "rejected_over_top3_concentration_count": 0,
+        "closest_top1_concentration": 0.0,
+        "closest_top1_concentration_threshold": 0.0,
+        "closest_top3_concentration": 0.0,
+        "closest_top3_concentration_threshold": 0.0,
     }
+    threshold_rejection_diagnostics = []
     closest_over_max_gap = None
     closest_under_precision_gap = None
+    closest_top1_gap = None
+    closest_top3_gap = None
+    max_top1_concentration = float(getattr(hybrid_runtime_args, "threshold_max_top1_concentration", 0.0)) if hybrid_runtime_args is not None else 0.0
+    max_top3_concentration = float(getattr(hybrid_runtime_args, "threshold_max_top3_concentration", 0.0)) if hybrid_runtime_args is not None else 0.0
+    top1_concentration_penalty = float(getattr(hybrid_runtime_args, "threshold_top1_concentration_penalty", 0.0)) if hybrid_runtime_args is not None else 0.0
+    top3_concentration_penalty = float(getattr(hybrid_runtime_args, "threshold_top3_concentration_penalty", 0.0)) if hybrid_runtime_args is not None else 0.0
     if strict_profit:
         best_metrics = evaluate(
             rows,
@@ -8292,6 +8642,8 @@ def tune_threshold(rows, predictions, thresholds, objective, fee, slippage,
             selected_score_name,
             min_validation_trades,
             max_validation_trades,
+            top1_concentration_penalty,
+            top3_concentration_penalty,
         )
         best_result["tie_rank_reason"] = "strict_profit_no_trade_baseline"
         best_result["validation_metrics"]["selected_threshold_tie_rank_reason"] = "strict_profit_no_trade_baseline"
@@ -8337,9 +8689,13 @@ def tune_threshold(rows, predictions, thresholds, objective, fee, slippage,
             selected_score_name,
             min_validation_trades,
             max_validation_trades,
+            top1_concentration_penalty,
+            top3_concentration_penalty,
         )
         trade_count = int(metrics.get("predicted_trades", 0))
         precision = float(metrics.get("precision", 0.0))
+        top1_concentration = float(metrics.get("symbol_profit_concentration_top1", 0.0))
+        top3_concentration = float(metrics.get("symbol_profit_concentration_top3", 0.0))
         if rejection_summary["lowest_trade_count_seen"] == 0 or trade_count < rejection_summary["lowest_trade_count_seen"]:
             rejection_summary["lowest_trade_count_seen"] = trade_count
         if trade_count > rejection_summary["highest_trade_count_seen"]:
@@ -8350,6 +8706,8 @@ def tune_threshold(rows, predictions, thresholds, objective, fee, slippage,
         too_few = metrics["predicted_trades"] < min_validation_trades
         too_many = max_validation_trades > 0 and metrics["predicted_trades"] > max_validation_trades
         too_imprecise = metrics["predicted_trades"] > 0 and metrics["precision"] < min_validation_precision
+        too_top1_concentrated = max_top1_concentration > 0.0 and top1_concentration > max_top1_concentration
+        too_top3_concentrated = max_top3_concentration > 0.0 and top3_concentration > max_top3_concentration
         if too_few:
             rejection_summary["rejected_under_min_trades_count"] += 1
         if too_many:
@@ -8368,9 +8726,42 @@ def tune_threshold(rows, predictions, thresholds, objective, fee, slippage,
                 rejection_summary["closest_under_min_precision"] = precision
                 rejection_summary["closest_under_min_precision_threshold"] = float(threshold)
                 rejection_summary["closest_under_min_precision_trades"] = int(metrics["predicted_trades"])
-        if sum(1 for flag in (too_few, too_many, too_imprecise) if flag) > 1:
+        if too_top1_concentrated:
+            rejection_summary["rejected_over_top1_concentration_count"] += 1
+            top1_gap = top1_concentration - max_top1_concentration
+            if closest_top1_gap is None or top1_gap < closest_top1_gap:
+                closest_top1_gap = top1_gap
+                rejection_summary["closest_top1_concentration"] = top1_concentration
+                rejection_summary["closest_top1_concentration_threshold"] = float(threshold)
+        if too_top3_concentrated:
+            rejection_summary["rejected_over_top3_concentration_count"] += 1
+            top3_gap = top3_concentration - max_top3_concentration
+            if closest_top3_gap is None or top3_gap < closest_top3_gap:
+                closest_top3_gap = top3_gap
+                rejection_summary["closest_top3_concentration"] = top3_concentration
+                rejection_summary["closest_top3_concentration_threshold"] = float(threshold)
+        threshold_rejection_diagnostics.append({
+            "threshold": float(threshold),
+            "predicted_trades": trade_count,
+            "precision": precision,
+            "portfolio_profit": float(metrics.get("portfolio_profit", 0.0)),
+            "symbol_profit_concentration_top1": top1_concentration,
+            "symbol_profit_concentration_top3": top3_concentration,
+            "top_blocked_symbol": metrics.get("top_blocked_symbol", ""),
+            "top_blocked_symbol_reason": metrics.get("top_blocked_symbol_reason", ""),
+            "top_blocked_symbol_count": int(metrics.get("top_blocked_symbol_count", 0)),
+            "top_blocked_bucket_start_minute": int(metrics.get("top_blocked_bucket_start_minute", 0)),
+            "top_blocked_bucket_reason": metrics.get("top_blocked_bucket_reason", ""),
+            "top_blocked_bucket_count": int(metrics.get("top_blocked_bucket_count", 0)),
+            "rejected_under_min_trades": 1 if too_few else 0,
+            "rejected_over_max_trades": 1 if too_many else 0,
+            "rejected_under_min_precision": 1 if too_imprecise else 0,
+            "rejected_over_top1_concentration": 1 if too_top1_concentrated else 0,
+            "rejected_over_top3_concentration": 1 if too_top3_concentrated else 0,
+        })
+        if sum(1 for flag in (too_few, too_many, too_imprecise, too_top1_concentrated, too_top3_concentrated) if flag) > 1:
             rejection_summary["rejected_mixed_constraints_count"] += 1
-        if too_many or too_imprecise:
+        if too_many or too_imprecise or too_top1_concentrated or too_top3_concentrated:
             continue
         if too_few:
             if metrics["predicted_trades"] > 0:
@@ -8458,6 +8849,8 @@ def tune_threshold(rows, predictions, thresholds, objective, fee, slippage,
                 selected_score_name,
                 min_validation_trades,
                 max_validation_trades,
+                top1_concentration_penalty,
+                top3_concentration_penalty,
             )
             best_result["tie_rank_reason"] = "no_trade_fallback"
             best_result["validation_metrics"]["selected_threshold_tie_rank_reason"] = "no_trade_fallback"
@@ -8465,6 +8858,7 @@ def tune_threshold(rows, predictions, thresholds, objective, fee, slippage,
         best_result["validation_metrics"]["selected_threshold_tie_rank_reason"] = best_result.get("tie_rank_reason", "higher_objective_score")
     if best_result is not None:
         best_result["validation_metrics"].update(rejection_summary)
+        best_result["validation_metrics"]["threshold_rejection_diagnostics"] = threshold_rejection_diagnostics
     return best_result
 
 
@@ -8883,6 +9277,163 @@ def divide_prediction_values_in_place(values, divisor):
     return values
 
 
+def rows_prediction_signature(rows):
+    length = len(rows)
+    if length <= 0:
+        return {"rows": 0}
+    sample_points = sorted(set([0, length // 2, length - 1]))
+    return {
+        "rows": length,
+        "first_open_time": row_open_time_value(rows, sample_points[0]),
+        "mid_open_time": row_open_time_value(rows, sample_points[len(sample_points) // 2]),
+        "last_open_time": row_open_time_value(rows, sample_points[-1]),
+        "first_symbol": row_symbol_name(rows, sample_points[0]),
+        "last_symbol": row_symbol_name(rows, sample_points[-1]),
+    }
+
+
+def selected_prediction_signature(selected):
+    if selected.get("ensemble_members"):
+        return {
+            "ensemble_windows": [member.get("ensemble_window", 0) for member in selected.get("ensemble_members", [])],
+            "members": [selected_prediction_signature(member) for member in selected.get("ensemble_members", [])],
+        }
+    calibration = selected.get("calibration") or {}
+    regression_calibration = selected.get("regression_calibration") or {}
+    uncertainty_model = selected.get("uncertainty_model") or {}
+    meta_filter_info = selected.get("meta_filter_info") or {}
+    symbol_filter_info = selected.get("symbol_filter_info") or {}
+    return {
+        "params": selected.get("params", {}),
+        "best_iteration": selected.get("best_iteration"),
+        "threshold": selected.get("threshold"),
+        "has_classification_model": 1 if selected.get("classification_model") is not None else 0,
+        "has_regression_model": 1 if selected.get("regression_model") is not None else 0,
+        "calibration": {
+            "mode": calibration.get("mode", "none"),
+            "a": calibration.get("a", 0.0),
+            "b": calibration.get("b", 0.0),
+        },
+        "regression_calibration": {
+            "mode": regression_calibration.get("mode", "none"),
+            "a": regression_calibration.get("a", 1.0),
+            "b": regression_calibration.get("b", 0.0),
+        },
+        "uncertainty_model": {
+            "mode": uncertainty_model.get("mode", "none"),
+            "rows": uncertainty_model.get("rows", 0),
+        },
+        "meta_filter": {
+            "mode": meta_filter_info.get("mode", "none"),
+            "enabled": 1 if meta_filter_info.get("enabled") else 0,
+            "rows": meta_filter_info.get("rows", 0),
+        },
+        "symbol_filter": {
+            "mode": symbol_filter_info.get("mode", "none"),
+            "enabled": 1 if symbol_filter_info.get("enabled") else 0,
+            "allowed": len(symbol_filter_info.get("allowed_symbols", [])),
+        },
+    }
+
+
+def prediction_bundle_cache_directory(args):
+    if getattr(args, "prediction_bundle_cache_dir", ""):
+        return os.path.abspath(args.prediction_bundle_cache_dir)
+    return os.path.join(resolve_cache_dir(args.input, args.cache_dir or None), "prediction_bundles")
+
+
+def prediction_bundle_cache_key(selected, rows, kind, args, stage_prefix):
+    payload = {
+        "cache_version": 1,
+        "kind": kind,
+        "stage_prefix": stage_prefix,
+        "rows": rows_prediction_signature(rows),
+        "selected": selected_prediction_signature(selected),
+        "prediction_batch_rows": int(getattr(args, "prediction_batch_rows", 0)),
+    }
+    return hashlib.sha1(json.dumps(json_safe(payload), sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def prediction_bundle_cache_path(args, cache_key):
+    return os.path.join(prediction_bundle_cache_directory(args), "{}.npz".format(cache_key))
+
+
+def prediction_bundle_cache_enabled(args):
+    return getattr(args, "prediction_bundle_cache", "memory") in ("memory", "disk")
+
+
+def prediction_bundle_to_cache_arrays(bundle):
+    arrays = {}
+    for key in ("probability", "calibrated_probability", "predicted_trade_return",
+                "raw_predicted_trade_return", "predicted_return_uncertainty", "meta_probability"):
+        values = bundle.get(key)
+        if values is None:
+            continue
+        if np is not None:
+            arrays[key] = np.asarray(values, dtype=np.float32)
+        else:
+            arrays[key] = list(float(value) for value in values)
+    return arrays
+
+
+def prediction_bundle_from_cache_arrays(arrays, selected):
+    bundle = build_prediction_bundle(
+        arrays.get("probability"),
+        arrays.get("calibrated_probability"),
+        arrays.get("predicted_trade_return"),
+        raw_predicted_trade_return=arrays.get("raw_predicted_trade_return"),
+        predicted_return_uncertainty=arrays.get("predicted_return_uncertainty"),
+        meta_probability=arrays.get("meta_probability"),
+        ev_context=selected.get("ev_payoff_info"),
+        hybrid_return_context=selected.get("hybrid_return_info"),
+        uncertainty_context=selected.get("uncertainty_model"),
+    )
+    return bundle
+
+
+def load_prediction_bundle_cache(selected, rows, kind, args, stage_prefix):
+    cache_mode = getattr(args, "prediction_bundle_cache", "memory")
+    if cache_mode == "none":
+        return None
+    cache_key = prediction_bundle_cache_key(selected, rows, kind, args, stage_prefix)
+    if cache_key in PREDICTION_BUNDLE_MEMORY_CACHE:
+        arrays = PREDICTION_BUNDLE_MEMORY_CACHE[cache_key]
+        return prediction_bundle_from_cache_arrays(arrays, selected)
+    if cache_mode != "disk" or np is None:
+        return None
+    cache_path = prediction_bundle_cache_path(args, cache_key)
+    if not os.path.exists(cache_path):
+        return None
+    try:
+        payload = np.load(cache_path, allow_pickle=False)
+        arrays = {key: payload[key] for key in payload.files}
+        payload.close()
+        PREDICTION_BUNDLE_MEMORY_CACHE[cache_key] = arrays
+        return prediction_bundle_from_cache_arrays(arrays, selected)
+    except Exception:
+        return None
+
+
+def save_prediction_bundle_cache(selected, rows, kind, args, stage_prefix, bundle):
+    cache_mode = getattr(args, "prediction_bundle_cache", "memory")
+    if cache_mode == "none":
+        return
+    cache_key = prediction_bundle_cache_key(selected, rows, kind, args, stage_prefix)
+    arrays = prediction_bundle_to_cache_arrays(bundle)
+    PREDICTION_BUNDLE_MEMORY_CACHE[cache_key] = arrays
+    if cache_mode != "disk" or np is None:
+        return
+    cache_path = prediction_bundle_cache_path(args, cache_key)
+    directory = os.path.dirname(cache_path)
+    os.makedirs(directory, exist_ok=True)
+    if os.path.exists(cache_path):
+        return
+    def write_one(output_path):
+        with open(output_path, "wb") as handle:
+            np.savez(handle, **arrays)
+    atomic_write_path(cache_path, write_one)
+
+
 def average_prediction_bundles(rows, args, bundles):
     if not bundles:
         return build_prediction_bundle()
@@ -8959,6 +9510,9 @@ def average_prediction_bundles(rows, args, bundles):
 
 
 def prediction_bundle_for_models(selected, rows, kind, args, stage_prefix):
+    cached_bundle = load_prediction_bundle_cache(selected, rows, kind, args, stage_prefix)
+    if cached_bundle is not None:
+        return cached_bundle
     if selected.get("ensemble_members"):
         bundles = []
         for member in selected["ensemble_members"]:
@@ -8978,6 +9532,7 @@ def prediction_bundle_for_models(selected, rows, kind, args, stage_prefix):
         )
         if meta_probability is not None:
             bundle["meta_probability"] = meta_probability
+        save_prediction_bundle_cache(selected, rows, kind, args, stage_prefix, bundle)
         return bundle
     probability = None
     calibrated_probability = None
@@ -9034,6 +9589,7 @@ def prediction_bundle_for_models(selected, rows, kind, args, stage_prefix):
     )
     if meta_probability is not None:
         bundle["meta_probability"] = meta_probability
+    save_prediction_bundle_cache(selected, rows, kind, args, stage_prefix, bundle)
     return bundle
 
 
@@ -9346,6 +9902,8 @@ def fit_select_model(train_rows, validation_rows, feature_names, args, kind):
             "symbol_filter_candidate_weight": getattr(args, "symbol_filter_candidate_weight", 0.5),
             "symbol_filter_executed_weight": getattr(args, "symbol_filter_executed_weight", 0.5),
             "symbol_filter_shrinkage": getattr(args, "symbol_filter_shrinkage", 50.0),
+            "symbol_filter_min_active_days": getattr(args, "symbol_filter_min_active_days", 0),
+            "symbol_filter_max_executed_trade_share": getattr(args, "symbol_filter_max_executed_trade_share", 0.0),
             "symbols_blocked_count": 0,
             "symbols_allowed_count": 0,
         }
@@ -9738,6 +10296,8 @@ def fit_select_model(train_rows, validation_rows, feature_names, args, kind):
             "symbol_filter_candidate_weight": symbol_filter_info.get("symbol_filter_candidate_weight", getattr(args, "symbol_filter_candidate_weight", 0.5)),
             "symbol_filter_executed_weight": symbol_filter_info.get("symbol_filter_executed_weight", getattr(args, "symbol_filter_executed_weight", 0.5)),
             "symbol_filter_shrinkage": symbol_filter_info.get("symbol_filter_shrinkage", getattr(args, "symbol_filter_shrinkage", 50.0)),
+            "symbol_filter_min_active_days": symbol_filter_info.get("symbol_filter_min_active_days", getattr(args, "symbol_filter_min_active_days", 0)),
+            "symbol_filter_max_executed_trade_share": symbol_filter_info.get("symbol_filter_max_executed_trade_share", getattr(args, "symbol_filter_max_executed_trade_share", 0.0)),
             "symbol_filter_enabled": 1 if symbol_filter_info.get("enabled") else 0,
             "symbol_filter_allowed_symbols": len(symbol_filter_info.get("allowed_symbols", [])),
             "symbol_filter_total_symbols": symbol_filter_info.get("total_symbols", 0),
@@ -10153,6 +10713,12 @@ METRIC_COLUMNS = [
     "closest_under_min_precision",
     "closest_under_min_precision_threshold",
     "closest_under_min_precision_trades",
+    "rejected_over_top1_concentration_count",
+    "rejected_over_top3_concentration_count",
+    "closest_top1_concentration",
+    "closest_top1_concentration_threshold",
+    "closest_top3_concentration",
+    "closest_top3_concentration_threshold",
     "train_rows",
     "validation_rows",
     "test_rows",
@@ -10204,10 +10770,24 @@ METRIC_COLUMNS = [
     "average_profit_per_trade",
     "worst_trade",
     "max_capital_drawdown",
+    "symbol_profit_concentration_top1",
+    "symbol_profit_concentration_top3",
+    "symbol_trade_concentration_top1",
+    "dominant_symbol",
+    "dominant_symbol_executed_trade_count",
+    "dominant_symbol_active_days",
+    "top_blocked_symbol",
+    "top_blocked_symbol_reason",
+    "top_blocked_symbol_count",
+    "top_blocked_bucket_start_minute",
+    "top_blocked_bucket_reason",
+    "top_blocked_bucket_count",
     "daily_trade_limit_blocked",
     "fold_trade_limit_blocked",
     "daily_loss_limit_blocked",
     "daily_drawdown_limit_blocked",
+    "symbol_trade_limit_blocked",
+    "symbol_minute_cap_blocked",
     "blocked_trades_total",
     "blocked_by_trade_frequency",
     "blocked_by_drawdown",
@@ -10217,6 +10797,7 @@ METRIC_COLUMNS = [
     "max_position_fraction",
     "max_volume_fraction",
     "max_trades_per_period",
+    "max_trades_per_symbol_period",
     "max_trades_per_day",
     "max_trades_per_fold",
     "max_losing_trades_per_day",
@@ -10232,6 +10813,10 @@ METRIC_COLUMNS = [
     "hybrid_min_score",
     "threshold_drawdown_penalty",
     "threshold_trade_count_penalty",
+    "threshold_top1_concentration_penalty",
+    "threshold_top3_concentration_penalty",
+    "threshold_max_top1_concentration",
+    "threshold_max_top3_concentration",
     "target_validation_trades",
     "threshold_tiebreaker",
     "threshold_tie_epsilon",
@@ -10242,6 +10827,7 @@ METRIC_COLUMNS = [
     "adaptive_thresholds",
     "trade_selection",
     "top_k_per_minute",
+    "top_k_per_symbol_minute",
     "calibration",
     "calibration_a",
     "calibration_b",
@@ -10295,6 +10881,8 @@ METRIC_COLUMNS = [
     "symbol_filter_candidate_weight",
     "symbol_filter_executed_weight",
     "symbol_filter_shrinkage",
+    "symbol_filter_min_active_days",
+    "symbol_filter_max_executed_trade_share",
     "symbol_filter_enabled",
     "symbol_filter_allowed_symbols",
     "symbol_filter_total_symbols",
@@ -10477,6 +11065,7 @@ def metrics_record(model_name, split, objective, threshold, train_rows, validati
         "max_position_fraction": args.max_position_fraction,
         "max_volume_fraction": args.max_volume_fraction,
         "max_trades_per_period": args.max_trades_per_period,
+        "max_trades_per_symbol_period": getattr(args, "max_trades_per_symbol_period", 0),
         "max_trades_per_day": args.max_trades_per_day,
         "max_trades_per_fold": args.max_trades_per_fold,
         "max_losing_trades_per_day": args.max_losing_trades_per_day,
@@ -10498,6 +11087,10 @@ def metrics_record(model_name, split, objective, threshold, train_rows, validati
         "ev_payoff_mode": getattr(args, "ev_payoff_mode", "fixed_targets"),
         "threshold_drawdown_penalty": args.threshold_drawdown_penalty,
         "threshold_trade_count_penalty": args.threshold_trade_count_penalty,
+        "threshold_top1_concentration_penalty": getattr(args, "threshold_top1_concentration_penalty", 0.0),
+        "threshold_top3_concentration_penalty": getattr(args, "threshold_top3_concentration_penalty", 0.0),
+        "threshold_max_top1_concentration": getattr(args, "threshold_max_top1_concentration", 0.0),
+        "threshold_max_top3_concentration": getattr(args, "threshold_max_top3_concentration", 0.0),
         "target_validation_trades": args.target_validation_trades,
         "threshold_tiebreaker": getattr(args, "threshold_tiebreaker", "fewer_trades"),
         "threshold_tie_epsilon": getattr(args, "threshold_tie_epsilon", 1e-9),
@@ -10508,11 +11101,14 @@ def metrics_record(model_name, split, objective, threshold, train_rows, validati
         "adaptive_thresholds": 0 if args.disable_adaptive_thresholds else 1,
         "trade_selection": args.trade_selection,
         "top_k_per_minute": args.top_k_per_minute,
+        "top_k_per_symbol_minute": getattr(args, "top_k_per_symbol_minute", 0),
         "selected_ev_safety_margin": args.ev_safety_margin,
         "acceptance_tier": getattr(args, "acceptance_tier", "none"),
         "normalized_microsecond_open_times": NORMALIZED_MICROSECOND_OPEN_TIMES,
         "dynamic_hybrid_thresholds": getattr(args, "dynamic_hybrid_thresholds", "none"),
         "meta_filter": getattr(args, "meta_filter", "none"),
+        "symbol_filter_min_active_days": getattr(args, "symbol_filter_min_active_days", 0),
+        "symbol_filter_max_executed_trade_share": getattr(args, "symbol_filter_max_executed_trade_share", 0.0),
         "ensemble_windows": ",".join(str(value) for value in getattr(args, "ensemble_window_list", [])),
         "ensemble_model_count": len(getattr(args, "ensemble_window_list", [])),
         "ensemble_enabled": 1 if getattr(args, "ensemble_window_list", []) else 0,
@@ -10920,6 +11516,8 @@ def aggregate_fold_records(records, model_name, objective):
         "adaptive_thresholds": records[0].get("adaptive_thresholds", 0),
         "trade_selection": records[0].get("trade_selection", "threshold"),
         "top_k_per_minute": records[0].get("top_k_per_minute", 0),
+        "top_k_per_symbol_minute": records[0].get("top_k_per_symbol_minute", 0),
+        "max_trades_per_symbol_period": records[0].get("max_trades_per_symbol_period", 0),
         "threshold_tie_epsilon": records[0].get("threshold_tie_epsilon", 1e-9),
         "threshold_target_trades": records[0].get("threshold_target_trades", 0),
         "threshold_target_active_days": records[0].get("threshold_target_active_days", 0),
@@ -12433,37 +13031,43 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
     effective_upside_target = getattr(args, "effective_upside_target", getattr(args, "upside_target", 0.05))
     effective_downside_stop = getattr(args, "effective_downside_stop", getattr(args, "downside_stop", 0.02))
     prediction_report_path = prediction_report_source_path(args, walk_records)
+    fast_diagnostics = bool(getattr(args, "fast_diagnostics", False))
     calibration_rows, calibration_summary = calibration_report_from_predictions(prediction_report_path)
     calibration_summary = resolved_calibration_summary(calibration_rows, calibration_summary, fixed_record, aggregate)
-    regime_rows, regime_summary = regime_report_from_predictions(prediction_report_path, args)
     symbol_rows, symbol_summary = symbol_report_from_predictions(prediction_report_path, args)
-    feature_stability_rows, feature_stability_summary = feature_stability_report(args)
-    baseline_rows, baseline_summary = baseline_report(args)
-    write_optional_csv_report(
-        args.calibration_report_out,
-        ["probability_source", "probability_bucket", "rows", "trades_if_thresholded", "mean_predicted_probability", "actual_positive_rate", "avg_forward_return", "avg_trade_return", "total_trade_return", "skipped_reason"],
-        calibration_rows,
-    )
-    write_optional_csv_report(
-        args.regime_report_out,
-        ["regime_type", "regime_value", "rows", "predicted_trades", "win_rate", "avg_trade_return", "total_profit_after_fee_and_slippage", "portfolio_return_if_isolated", "max_drawdown_if_isolated", "profit_factor", "skipped_reason"],
-        regime_rows,
-    )
-    write_optional_csv_report(
-        args.symbol_report_out,
-        ["symbol", "rows", "predicted_trades", "actual_positive_rows", "win_rate", "avg_forward_return", "avg_trade_return", "total_profit_after_fee", "total_profit_after_fee_and_slippage", "profit_factor", "avg_position_size", "portfolio_profit_contribution", "skipped_reason"],
-        symbol_rows,
-    )
-    write_optional_csv_report(
-        args.feature_stability_out,
-        ["feature", "mean_importance", "std_importance", "min_rank", "max_rank", "mean_rank", "folds_present", "stability_score", "skipped_reason"],
-        feature_stability_rows,
-    )
-    write_optional_csv_report(
-        args.baseline_report_out,
-        ["baseline_name", "available", "skipped_reason", "trades", "win_rate", "avg_trade_return", "total_profit_after_fee_and_slippage", "portfolio_return", "max_drawdown", "profit_factor"],
-        baseline_rows,
-    )
+    if fast_diagnostics:
+        regime_rows, regime_summary = [skipped_report_row("fast_diagnostics_mode")], {}
+        feature_stability_rows, feature_stability_summary = [skipped_report_row("fast_diagnostics_mode")], {}
+        baseline_rows, baseline_summary = [skipped_report_row("fast_diagnostics_mode")], {}
+    else:
+        regime_rows, regime_summary = regime_report_from_predictions(prediction_report_path, args)
+        feature_stability_rows, feature_stability_summary = feature_stability_report(args)
+        baseline_rows, baseline_summary = baseline_report(args)
+        write_optional_csv_report(
+            args.calibration_report_out,
+            ["probability_source", "probability_bucket", "rows", "trades_if_thresholded", "mean_predicted_probability", "actual_positive_rate", "avg_forward_return", "avg_trade_return", "total_trade_return", "skipped_reason"],
+            calibration_rows,
+        )
+        write_optional_csv_report(
+            args.regime_report_out,
+            ["regime_type", "regime_value", "rows", "predicted_trades", "win_rate", "avg_trade_return", "total_profit_after_fee_and_slippage", "portfolio_return_if_isolated", "max_drawdown_if_isolated", "profit_factor", "skipped_reason"],
+            regime_rows,
+        )
+        write_optional_csv_report(
+            args.symbol_report_out,
+            ["symbol", "rows", "predicted_trades", "actual_positive_rows", "win_rate", "avg_forward_return", "avg_trade_return", "total_profit_after_fee", "total_profit_after_fee_and_slippage", "profit_factor", "avg_position_size", "portfolio_profit_contribution", "skipped_reason"],
+            symbol_rows,
+        )
+        write_optional_csv_report(
+            args.feature_stability_out,
+            ["feature", "mean_importance", "std_importance", "min_rank", "max_rank", "mean_rank", "folds_present", "stability_score", "skipped_reason"],
+            feature_stability_rows,
+        )
+        write_optional_csv_report(
+            args.baseline_report_out,
+            ["baseline_name", "available", "skipped_reason", "trades", "win_rate", "avg_trade_return", "total_profit_after_fee_and_slippage", "portfolio_return", "max_drawdown", "profit_factor"],
+            baseline_rows,
+        )
     model_reference = aggregate if aggregate else fixed_record
     model_vs_best_baseline_return_delta = float(model_reference.get("portfolio_return", 0.0)) - float(baseline_summary.get("best_baseline_portfolio_return", 0.0))
     model_vs_best_baseline_profit_delta = float(model_reference.get("total_profit_after_fee_and_slippage", model_reference.get("portfolio_profit", 0.0))) - float(baseline_summary.get("best_baseline_total_profit", 0.0))
@@ -12605,6 +13209,8 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
         "symbol_filter_stage",
         "threshold_tiebreaker",
         "ensemble_windows",
+        "top_k_per_symbol_minute",
+        "max_trades_per_symbol_period",
         "portfolio_profit",
         "portfolio_return",
         "precision",
@@ -12705,6 +13311,8 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
         "symbol_filter_stage": fixed_record.get("symbol_filter_stage", getattr(args, "symbol_filter_stage", "executed")),
         "threshold_tiebreaker": fixed_record.get("threshold_tiebreaker", getattr(args, "threshold_tiebreaker", "fewer_trades")),
         "ensemble_windows": fixed_record.get("ensemble_windows", ",".join(str(value) for value in getattr(args, "ensemble_window_list", []))),
+        "top_k_per_symbol_minute": fixed_record.get("top_k_per_symbol_minute", getattr(args, "top_k_per_symbol_minute", 0)),
+        "max_trades_per_symbol_period": fixed_record.get("max_trades_per_symbol_period", getattr(args, "max_trades_per_symbol_period", 0)),
         "portfolio_profit": fixed_record.get("portfolio_profit", 0.0),
         "portfolio_return": fixed_record.get("portfolio_return", 0.0),
         "precision": fixed_record.get("precision", 0.0),
@@ -12796,7 +13404,8 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
         "latency_penalty_bps": getattr(args, "latency_penalty_bps", 0.0),
         "max_open_positions": getattr(args, "max_open_positions", 0),
     })
-    write_experiment_report(args.experiment_report_out, report_summary)
+    if not fast_diagnostics:
+        write_experiment_report(args.experiment_report_out, report_summary)
     log_memory("Run summaries written")
 
 
@@ -12833,6 +13442,7 @@ def build_parser():
     parser.add_argument("--max-losing-trades-per-day", type=int, default=0)
     parser.add_argument("--max-daily-drawdown", type=float, default=0.0)
     parser.add_argument("--pause-after-drawdown-minutes", type=int, default=0)
+    parser.add_argument("--max-trades-per-symbol-period", type=int, default=0)
     parser.add_argument("--min-order-notional", type=float, default=0.0)
     parser.add_argument("--lot-size-step", type=float, default=0.0)
     parser.add_argument("--tick-size", type=float, default=0.0)
@@ -12850,6 +13460,7 @@ def build_parser():
     parser.add_argument("--trade-selection", choices=["threshold", "topk_ev", "topk_score"], default="threshold")
     parser.add_argument("--trade-score", choices=["auto", "probability", "ev", "predicted_return", "hybrid"], default="auto")
     parser.add_argument("--top-k-per-minute", type=int, default=3)
+    parser.add_argument("--top-k-per-symbol-minute", type=int, default=0)
     parser.add_argument("--profit-safety", choices=["strict", "explore"], default="explore")
     parser.add_argument("--upside-target", type=float, default=0.05)
     parser.add_argument("--downside-stop", type=float, default=0.02)
@@ -12889,6 +13500,8 @@ def build_parser():
     parser.add_argument("--symbol-filter-candidate-weight", type=float, default=0.5)
     parser.add_argument("--symbol-filter-executed-weight", type=float, default=0.5)
     parser.add_argument("--symbol-filter-shrinkage", type=float, default=50.0)
+    parser.add_argument("--symbol-filter-min-active-days", type=int, default=0)
+    parser.add_argument("--symbol-filter-max-executed-trade-share", type=float, default=0.0)
     parser.add_argument("--min-symbol-validation-trades", type=int, default=3)
     parser.add_argument("--min-symbol-validation-average-profit", type=float, default=0.0)
     parser.add_argument("--min-symbol-validation-total-profit", type=float, default=0.0)
@@ -12902,6 +13515,10 @@ def build_parser():
     parser.add_argument("--ensemble-windows", default="")
     parser.add_argument("--threshold-drawdown-penalty", type=float, default=0.0)
     parser.add_argument("--threshold-trade-count-penalty", type=float, default=0.0)
+    parser.add_argument("--threshold-top1-concentration-penalty", type=float, default=0.0)
+    parser.add_argument("--threshold-top3-concentration-penalty", type=float, default=0.0)
+    parser.add_argument("--threshold-max-top1-concentration", type=float, default=0.0)
+    parser.add_argument("--threshold-max-top3-concentration", type=float, default=0.0)
     parser.add_argument("--target-validation-trades", type=int, default=0)
     parser.add_argument("--threshold-tiebreaker", choices=["fewer_trades", "target_trades", "active_days", "balanced"], default="fewer_trades")
     parser.add_argument("--threshold-tie-epsilon", type=float, default=1e-9)
@@ -12951,6 +13568,8 @@ def build_parser():
     parser.add_argument("--train-sample-mode", choices=["stratified", "balanced", "chronological"], default="stratified")
     parser.add_argument("--max-positive-sample-fraction", type=float, default=0.33)
     parser.add_argument("--prediction-batch-rows", type=int, default=200000)
+    parser.add_argument("--prediction-bundle-cache", choices=["none", "memory", "disk"], default="memory")
+    parser.add_argument("--prediction-bundle-cache-dir", default="")
     parser.add_argument("--adaptive-threshold-sample-rows", type=int, default=1000000)
     parser.add_argument("--auc-sample-rows", type=int, default=1000000)
     parser.add_argument("--calibration", choices=["none", "platt"], default="none")
@@ -12990,6 +13609,7 @@ def build_parser():
     parser.add_argument("--output-compression", choices=["gzip", "none"], default="none")
     parser.add_argument("--profile-out", default="kline_growth_pipeline_profile.csv")
     parser.add_argument("--disable-profile", action="store_true")
+    parser.add_argument("--fast-diagnostics", action="store_true")
     parser.add_argument("--cooldown-minutes", type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument("--max-trades-per-symbol-month", type=int, default=0, help=argparse.SUPPRESS)
     return parser
@@ -13028,6 +13648,8 @@ def main(argv):
         raise ValueError("--max-volume-fraction must be between 0 and 1")
     if args.max_trades_per_period < 0:
         raise ValueError("--max-trades-per-period cannot be negative")
+    if args.max_trades_per_symbol_period < 0:
+        raise ValueError("--max-trades-per-symbol-period cannot be negative")
     if args.max_trades_per_day < 0:
         raise ValueError("--max-trades-per-day cannot be negative")
     if args.market_breadth_min_symbols <= 0:
@@ -13064,6 +13686,16 @@ def main(argv):
         raise ValueError("--holding-period-minutes must be positive")
     if args.top_k_per_minute < 0:
         raise ValueError("--top-k-per-minute cannot be negative")
+    if args.top_k_per_symbol_minute < 0:
+        raise ValueError("--top-k-per-symbol-minute cannot be negative")
+    if args.threshold_top1_concentration_penalty < 0.0:
+        raise ValueError("--threshold-top1-concentration-penalty cannot be negative")
+    if args.threshold_top3_concentration_penalty < 0.0:
+        raise ValueError("--threshold-top3-concentration-penalty cannot be negative")
+    if not 0.0 <= args.threshold_max_top1_concentration <= 1.0:
+        raise ValueError("--threshold-max-top1-concentration must be between 0 and 1")
+    if not 0.0 <= args.threshold_max_top3_concentration <= 1.0:
+        raise ValueError("--threshold-max-top3-concentration must be between 0 and 1")
     if not 0.0 <= args.min_profitable_fold_rate <= 1.0:
         raise ValueError("--min-profitable-fold-rate must be between 0 and 1")
     if args.max_worst_fold_drawdown < 0.0:
@@ -13156,6 +13788,10 @@ def main(argv):
         raise ValueError("--symbol-filter-executed-weight cannot be negative")
     if args.symbol_filter_shrinkage < 0.0:
         raise ValueError("--symbol-filter-shrinkage cannot be negative")
+    if args.symbol_filter_min_active_days < 0:
+        raise ValueError("--symbol-filter-min-active-days cannot be negative")
+    if not 0.0 <= args.symbol_filter_max_executed_trade_share <= 1.0:
+        raise ValueError("--symbol-filter-max-executed-trade-share must be between 0 and 1")
     if args.regression_clip_min > args.regression_clip_max:
         raise ValueError("--regression-clip-min must be <= --regression-clip-max")
     if args.early_stopping_rounds < 0:
@@ -13183,7 +13819,9 @@ def main(argv):
     if args.cooldown_minutes:
         print("Warning: --cooldown-minutes is retained as a compatibility alias and is ignored; portfolio entry limits replace cooldown.", file=sys.stderr, flush=True)
     if args.max_trades_per_symbol_month:
-        print("Warning: --max-trades-per-symbol-month is retained as a compatibility alias and is ignored; use --max-trades-per-period.", file=sys.stderr, flush=True)
+        if "max_trades_per_symbol_period" not in explicit_flags:
+            args.max_trades_per_symbol_period = args.max_trades_per_symbol_month
+        print("Warning: --max-trades-per-symbol-month is a compatibility alias; use --max-trades-per-symbol-period.", file=sys.stderr, flush=True)
     if args.execution_delay_minutes:
         print("Warning: --execution-delay-minutes requires delayed-entry price data that is not available in this pipeline; continuing with delay disabled.", file=sys.stderr, flush=True)
         args.execution_delay_minutes = 0
