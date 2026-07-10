@@ -3629,6 +3629,20 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("--threshold-floor-snap-penalty-weight", command)
         self.assertIn("--hybrid-return-combination", command)
 
+    def test_experiment_runner_economic_ranker_profile_emits_ranking_flags(self):
+        args = run_experiments.parse_args(["--profile", "economic-ranker"])
+        experiment = run_experiments.build_experiment_grid_for_profile("economic-ranker", False, 1)[0]
+        command = run_experiments.build_command(args, experiment)
+        self.assertIn("--objective-mode", command)
+        self.assertIn("economic_ranking", command)
+        self.assertIn("--trade-score", command)
+        self.assertIn("ranker_score", command)
+        self.assertIn("--ranker-objective", command)
+        self.assertIn("rank_xendcg", command)
+        self.assertIn("--ranker-group-minutes", command)
+        self.assertIn("--top-percent-per-period", command)
+        self.assertIn(".gbdt_cache_full30_volatile", command)
+
     def test_configure_output_paths_maps_into_results_dir(self):
         parser = pipeline.build_parser()
         args = parser.parse_args(["--results-dir", os.path.join(self.temp.name, "results")])
@@ -4127,6 +4141,139 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(execution["executed_trade_score_count"], 1)
         self.assertEqual(execution["rejected_trade_score_count"], 2)
 
+    def test_ranker_relevance_context_uses_train_only_utility_quantiles(self):
+        parser = pipeline.build_parser()
+        args = parser.parse_args([
+            "--objective-mode", "economic_ranking",
+            "--fee", "0",
+            "--slippage", "0",
+            "--ranker-relevance-q1", "0.5",
+            "--ranker-relevance-q2", "0.75",
+            "--ranker-relevance-q3", "1.0",
+        ])
+        train_rows = [
+            row(1600000000000, trade_return=0.001),
+            row(1600000060000, trade_return=0.002),
+            row(1600000120000, trade_return=0.004),
+            row(1600000180000, trade_return=-0.010),
+        ]
+        context = pipeline.fit_ranker_relevance_context(train_rows, args)
+        self.assertEqual(context["utility_rows"], 4)
+        self.assertEqual(context["positive_utility_rows"], 3)
+        self.assertAlmostEqual(context["weak_positive_threshold"], 0.002)
+        self.assertAlmostEqual(context["useful_positive_threshold"], 0.003)
+        self.assertAlmostEqual(context["strong_positive_threshold"], 0.004)
+        validation_labels = pipeline.ranker_relevance_labels([
+            row(1600000240000, trade_return=0.100),
+            row(1600000300000, trade_return=0.000),
+        ], args, context)
+        self.assertEqual(list(validation_labels), [4, 0])
+        self.assertAlmostEqual(context["strong_positive_threshold"], 0.004)
+
+    def test_ranker_grouped_rows_drops_singleton_decision_groups(self):
+        parser = pipeline.build_parser()
+        args = parser.parse_args([
+            "--objective-mode", "economic_ranking",
+            "--ranker-group-minutes", "1",
+            "--ranker-min-group-size", "2",
+        ])
+        base = 1600000000000
+        grouped_rows, groups, info = pipeline.ranker_grouped_rows([
+            symbol_row("AAAUSDT", base, trade_return=0.01),
+            symbol_row("BBBUSDT", base + 10 * 1000, trade_return=0.02),
+            symbol_row("CCCUSDT", base + 2 * 60 * 1000, trade_return=0.03),
+        ], args)
+        self.assertEqual(groups, [2])
+        self.assertEqual(len(grouped_rows), 2)
+        self.assertEqual(info["ranker_group_count"], 1)
+        self.assertEqual(info["ranker_group_rows"], 2)
+
+    def test_prediction_bundle_exposes_ranker_trade_score(self):
+        parser = pipeline.build_parser()
+        args = parser.parse_args(["--objective-mode", "economic_ranking"])
+        bundle = pipeline.build_prediction_bundle(ranker_score=[0.1, 0.25])
+        self.assertAlmostEqual(pipeline.trade_score_value(bundle, 1, "ranker_score", 0.05, 0.02, 0.0, 0.0), 0.25)
+        values = list(pipeline.score_values_for_bundle([], bundle, args))
+        self.assertAlmostEqual(float(values[0]), 0.1)
+        self.assertAlmostEqual(float(values[1]), 0.25)
+
+    def test_portfolio_execution_top_percent_ranker_selection(self):
+        base = 1600000000000
+        rows = [
+            symbol_row("AAAUSDT", base, quote_volume=1000000000.0, trade_return=0.01),
+            symbol_row("BBBUSDT", base, quote_volume=1000000000.0, trade_return=0.02),
+            symbol_row("CCCUSDT", base, quote_volume=1000000000.0, trade_return=0.03),
+            symbol_row("DDDUSDT", base, quote_volume=1000000000.0, trade_return=0.04),
+        ]
+        execution = pipeline.portfolio_execution(
+            rows,
+            pipeline.build_prediction_bundle(ranker_score=[4.0, 3.0, 2.0, 1.0]),
+            -1000000000.0,
+            0.0,
+            0.0,
+            10000.0,
+            0.10,
+            0.01,
+            10,
+            60,
+            5,
+            trade_selection="top_percent_score",
+            top_k_per_minute=0,
+            objective_mode="economic_ranking",
+            trade_score_name="ranker_score",
+            hybrid_runtime_args=SimpleNamespace(top_percent_per_period=0.5, prefer_unique_symbols=False),
+        )
+        self.assertEqual(execution["ranking_candidate_count"], 4)
+        self.assertEqual(execution["ranking_selected_candidate_count"], 2)
+        self.assertEqual(len(execution["executed"]), 2)
+        self.assertEqual(execution["executed_selection_ranks"], {0: 1, 1: 2})
+
+    def test_metrics_record_carries_ranker_training_diagnostics(self):
+        parser = pipeline.build_parser()
+        args = parser.parse_args([
+            "--objective-mode", "economic_ranking",
+            "--trade-score", "ranker_score",
+            "--ranker-adverse-penalty", "0.1",
+        ])
+        validation_metrics = {
+            "predicted_trades": 1,
+            "precision": 1.0,
+            "recall": 0.5,
+            "average_profit_after_fee_and_slippage": 0.01,
+            "total_profit_after_fee_and_slippage": 0.01,
+            "portfolio_profit": 10.0,
+            "portfolio_return": 0.001,
+            "calibration_info": {
+                "ranker_objective": "rank_xendcg",
+                "ranker_relevance_mode": "train_quantiles",
+                "ranker_utility_rows": 100,
+                "ranker_positive_utility_rows": 20,
+                "ranker_weak_positive_threshold": 0.001,
+                "ranker_useful_positive_threshold": 0.002,
+                "ranker_strong_positive_threshold": 0.004,
+                "ranker_train_group_count": 10,
+                "ranker_validation_group_count": 3,
+                "ranker_train_average_group_size": 8.0,
+                "ranker_validation_average_group_size": 5.0,
+            },
+        }
+        record = pipeline.metrics_record(
+            "gbdt_lightgbm",
+            "fixed",
+            "profit_balanced",
+            -1000000000.0,
+            [],
+            [],
+            [],
+            {},
+            args,
+            validation_metrics,
+        )
+        self.assertEqual(record["trade_score"], "ranker_score")
+        self.assertEqual(record["ranker_relevance_mode"], "train_quantiles")
+        self.assertEqual(record["ranker_positive_utility_rows"], 20)
+        self.assertAlmostEqual(record["ranker_adverse_penalty"], 0.1)
+
     def test_feature_usage_summary_reports_nonzero_features(self):
         class DummyModel(object):
             def feature_importance(self, feature_names):
@@ -4358,10 +4505,12 @@ class PipelineTests(unittest.TestCase):
             "probability",
             "calibrated_probability",
             "hybrid_score",
+            "ranker_score",
             "expected_value",
             "predicted_net_return",
             "trade_score",
             "predicted",
+            "raw_signal",
             "position_size",
             "forward_return",
             "trade_return",
@@ -4377,10 +4526,12 @@ class PipelineTests(unittest.TestCase):
                 "probability": 0.9 - index * 0.01,
                 "calibrated_probability": 0.85 - index * 0.01,
                 "hybrid_score": 1.0 - index * 0.01,
+                "ranker_score": 2.0 - index * 0.01,
                 "expected_value": 0.05 - index * 0.002,
                 "predicted_net_return": 0.04 - index * 0.002,
                 "trade_score": 1.0 - index * 0.01,
                 "predicted": 1 if index < 3 else 0,
+                "raw_signal": 1 if index < 5 else 0,
                 "position_size": 1000.0 if index == 0 else 0.0,
                 "forward_return": 0.01 if index < 2 else -0.005,
                 "trade_return": 0.02 if index == 0 else (0.03 if index == 1 else -0.01),
@@ -4414,7 +4565,17 @@ class PipelineTests(unittest.TestCase):
         self.assertAlmostEqual(top_decile["top_symbol_share"], 1.0)
         self.assertEqual(summary["ranking_report_rows_available"], 20)
         self.assertIn("trade_score", summary["ranking_report_score_sources"])
+        self.assertIn("ranker_score", summary["ranking_report_score_sources"])
         self.assertAlmostEqual(summary["ranking_trade_score_top_decile_avg_net_return"], 0.0235)
+        self.assertAlmostEqual(summary["ranking_ranker_score_top_decile_avg_net_return"], 0.0235)
+        raw_candidates = next(
+            row
+            for row in report_rows
+            if row["score_source"] == "ranker_score"
+            and row["bucket_type"] == "selection"
+            and row["bucket"] == "raw_candidates"
+        )
+        self.assertEqual(raw_candidates["rows"], 5)
 
     def test_portfolio_execution_blocks_symbol_during_loss_cooldown(self):
         base_time = 1600000000000
@@ -5064,6 +5225,85 @@ class PipelineTests(unittest.TestCase):
         bundle = pipeline.build_prediction_bundle(probability=[0.1, 0.2])
         with mock.patch("gbdt_pipeline.atomic_write_path", side_effect=PermissionError("denied")):
             pipeline.save_prediction_bundle_cache(selected, rows, "lightgbm", args, "test", bundle)
+
+    def test_robustness_summary_flags_profitable_but_fragile_ranker(self):
+        args = SimpleNamespace(
+            objective_mode="economic_ranking",
+            trade_score="ranker_score",
+            robustness_gates="warn",
+            robustness_gate_action="warn",
+            robust_min_trades=10,
+            robust_min_active_days=3,
+            robust_min_active_symbols=3,
+            robust_min_active_months=2,
+            robust_max_top_symbol_share=0.70,
+            robust_max_top_month_share=0.70,
+            robust_min_profit_factor=1.05,
+            robust_min_tail_monotonicity=0.60,
+            robust_require_positive_top_1pct=True,
+            robust_require_positive_top_decile=True,
+            robust_require_positive_total_profit=False,
+        )
+        summary = {
+            "objective_mode": "economic_ranking",
+            "trade_score": "ranker_score",
+            "walkforward_total_portfolio_profit": 120.0,
+            "walkforward_total_predicted_trades": 25,
+            "ranking_report_score_sources": "ranker_score",
+            "ranking_ranker_score_executed_profit_factor": 1.20,
+            "ranking_ranker_score_executed_symbol_count": 1,
+            "ranking_ranker_score_executed_month_count": 1,
+            "ranking_ranker_score_executed_active_days": 2,
+            "ranking_ranker_score_executed_top_symbol_share": 0.92,
+            "ranking_ranker_score_executed_top_month_share": 0.95,
+            "ranking_ranker_score_net_return_monotonicity": 0.50,
+            "ranking_ranker_score_top_1pct_rows": 5,
+            "ranking_ranker_score_top_1pct_avg_net_return": -0.001,
+            "ranking_ranker_score_top_decile_rows": 10,
+            "ranking_ranker_score_top_decile_avg_net_return": 0.002,
+        }
+        robust = pipeline.robustness_summary(summary, args)
+        self.assertEqual(robust["robustness_gate_status"], "failed")
+        self.assertEqual(robust["profitable_but_fragile"], 1)
+        self.assertIn("top_symbol_share", robust["robustness_failed_checks"])
+        self.assertIn("top_1pct_net_return", robust["robustness_failed_checks"])
+
+    def test_parser_accepts_robustness_gate_controls(self):
+        parser = pipeline.build_parser()
+        args = parser.parse_args([
+            "--robustness-gate-action", "reject",
+            "--robust-min-trades", "20",
+            "--robust-min-active-days", "5",
+            "--robust-min-active-symbols", "4",
+            "--robust-min-active-months", "3",
+            "--robust-max-top-symbol-share", "0.55",
+            "--robust-max-top-month-share", "0.60",
+            "--robust-min-profit-factor", "1.2",
+            "--robust-min-tail-monotonicity", "0.7",
+            "--robust-require-positive-top-1pct",
+            "--robust-require-positive-top-decile",
+        ])
+        self.assertEqual(args.robustness_gate_action, "reject")
+        self.assertEqual(args.robust_min_trades, 20)
+        self.assertAlmostEqual(args.robust_max_top_symbol_share, 0.55)
+        self.assertTrue(args.robust_require_positive_top_1pct)
+
+    def test_experiment_report_spells_out_profitable_but_fragile(self):
+        report_path = os.path.join(self.temp.name, "fragile_report.md")
+        pipeline.write_experiment_report(report_path, {
+            "accepted": 1,
+            "rejection_reason": "Profitable but fragile.",
+            "robustness_gate_status": "failed",
+            "profitable_but_fragile": 1,
+            "robustness_gates": "warn",
+            "robustness_gate_action": "warn",
+            "robustness_failed_checks": "top_month_share 0.9500 > 0.7000",
+            "robustness_strength": "profitable_but_fragile",
+        })
+        with open(report_path, encoding="utf-8") as handle:
+            report = handle.read()
+        self.assertIn("Profitable but fragile.", report)
+        self.assertIn("Robustness Gates", report)
 
 
 if __name__ == "__main__":

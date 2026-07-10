@@ -52,6 +52,16 @@ RESULT_COLUMNS = [
     "profile",
     "objective_mode",
     "trade_score",
+    "trade_selection",
+    "top_percent_per_period",
+    "ranker_objective",
+    "ranker_min_score",
+    "ranker_group_minutes",
+    "ranker_min_group_size",
+    "ranker_relevance_q1",
+    "ranker_relevance_q2",
+    "ranker_relevance_q3",
+    "ranker_adverse_penalty",
     "walk_train_months",
     "walk_validation_months",
     "walk_test_months",
@@ -111,6 +121,15 @@ RESULT_COLUMNS = [
     "average_profit_per_trade",
     "accepted",
     "strategy_strength",
+    "robustness_gate_status",
+    "profitable_but_fragile",
+    "robustness_failed_checks",
+    "ranking_trade_score_net_return_monotonicity",
+    "ranking_ranker_score_net_return_monotonicity",
+    "ranking_trade_score_executed_top_symbol_share",
+    "ranking_trade_score_executed_top_month_share",
+    "ranking_ranker_score_executed_top_symbol_share",
+    "ranking_ranker_score_executed_top_month_share",
     "max_rss_gb_observed",
     "run_exit_code",
 ]
@@ -118,7 +137,7 @@ RESULT_COLUMNS = [
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(description="Run same-spec experiment grids against gbdt_pipeline.py")
-    parser.add_argument("--profile", choices=["7.8gb", "7.8gb-overtrade-check", "hybrid-calibration", "hybrid-risk-adjusted", "hybrid-meta-filter", "hybrid-ensemble-small", "hybrid-late-recent", "hybrid-late-recent-tuned"], default="7.8gb")
+    parser.add_argument("--profile", choices=["7.8gb", "7.8gb-overtrade-check", "hybrid-calibration", "hybrid-risk-adjusted", "hybrid-meta-filter", "hybrid-ensemble-small", "hybrid-late-recent", "hybrid-late-recent-tuned", "economic-ranker"], default="7.8gb")
     parser.add_argument("--max-runs", type=int, default=6)
     parser.add_argument("--full-grid", action="store_true")
     parser.add_argument("--input", default="")
@@ -134,7 +153,7 @@ def parse_args(argv):
 
 
 def same_spec_profile_args(profile):
-    if profile not in ("7.8gb", "7.8gb-overtrade-check", "hybrid-calibration", "hybrid-risk-adjusted", "hybrid-meta-filter", "hybrid-ensemble-small", "hybrid-late-recent", "hybrid-late-recent-tuned"):
+    if profile not in ("7.8gb", "7.8gb-overtrade-check", "hybrid-calibration", "hybrid-risk-adjusted", "hybrid-meta-filter", "hybrid-ensemble-small", "hybrid-late-recent", "hybrid-late-recent-tuned", "economic-ranker"):
         raise ValueError("unsupported profile: {}".format(profile))
     return list(SAME_SPEC_PROFILE_7_8GB)
 
@@ -515,6 +534,55 @@ def hybrid_late_recent_tuned_experiments():
         }
 
 
+def economic_ranker_experiments():
+    for trade_selection, top_k, top_percent, adverse_penalty in (
+        ("topk_score", 2, 0.0, 0.0),
+        ("topk_score", 1, 0.0, 0.10),
+        ("top_percent_score", 0, 0.05, 0.0),
+    ):
+        yield {
+            "profile": "economic-ranker",
+            "input": "shard_dataset_30_volatile_from_existing",
+            "cache_dir": ".gbdt_cache_full30_volatile",
+            "objective_mode": "economic_ranking",
+            "trade_score": "ranker_score",
+            "trade_selection": trade_selection,
+            "walk_train_months": 8,
+            "walk_validation_months": 1,
+            "walk_test_months": 1,
+            "walk_forward": True,
+            "walk_forward_start_fold": 88,
+            "walk_forward_max_folds": 10,
+            "ranker_objective": "rank_xendcg",
+            "ranker_min_score": -1000000000.0,
+            "ranker_group_minutes": 1,
+            "ranker_min_group_size": 2,
+            "ranker_relevance_q1": 0.50,
+            "ranker_relevance_q2": 0.75,
+            "ranker_relevance_q3": 0.90,
+            "ranker_adverse_penalty": adverse_penalty,
+            "ev_safety_margin": 0.0,
+            "min_selected_threshold": 0.0,
+            "min_validation_precision": 0.0,
+            "top_k_per_minute": top_k,
+            "top_percent_per_period": top_percent,
+            "top_k_per_symbol_minute": 1,
+            "max_trades_per_period": 0,
+            "max_validation_trades": 400,
+            "threshold_drawdown_penalty": 0.02,
+            "threshold_trade_count_penalty": 0.00025,
+            "threshold_burst_trades_per_day_penalty": 0.01,
+            "threshold_burst_max_trades_in_day_penalty": 0.005,
+            "threshold_target_trades_per_day": 5.0,
+            "threshold_target_max_trades_in_day": 10,
+            "threshold_short_history_days": 45.0,
+            "threshold_short_history_penalty": 0.06,
+            "target_validation_trades": 220,
+            "min_predicted_net_return": 0.0,
+            "hybrid_min_score": 0.0,
+        }
+
+
 def build_experiment_grid_for_profile(profile, full_grid=False, max_runs=6):
     if profile == "7.8gb-overtrade-check":
         experiments = overtrade_check_experiments()
@@ -531,6 +599,8 @@ def build_experiment_grid_for_profile(profile, full_grid=False, max_runs=6):
         return list(hybrid_late_recent_experiments())[:max(0, max_runs)]
     if profile == "hybrid-late-recent-tuned":
         return list(hybrid_late_recent_tuned_experiments())[:max(0, max_runs)]
+    if profile == "economic-ranker":
+        return list(economic_ranker_experiments())[:max(0, max_runs)]
     experiments = list(classification_experiments())
     experiments.extend(return_regression_experiments())
     experiments.extend(hybrid_experiments())
@@ -573,6 +643,17 @@ def experiment_name(experiment):
             experiment.get("walk_train_months", 6),
             str(experiment.get("threshold_floor_snap_penalty_weight", 0.0)).replace(".", "p"),
             experiment.get("walk_forward_start_fold", 88),
+        )
+    if experiment.get("profile") == "economic-ranker":
+        selection = experiment.get("trade_selection", "topk_score").replace("_", "")
+        if experiment.get("trade_selection") == "top_percent_score":
+            selection = "toppct{}".format(str(experiment.get("top_percent_per_period", 0.0)).replace(".", "p"))
+        else:
+            selection = "topk{}".format(experiment.get("top_k_per_minute", 0))
+        return "ranker_{}m_{}_adv{}".format(
+            experiment.get("walk_train_months", 8),
+            selection,
+            str(experiment.get("ranker_adverse_penalty", 0.0)).replace(".", "p"),
         )
     if experiment["objective_mode"] == "classification":
         return "cls_ev_m{}_thr{}_prec{}_topk{}".format(
@@ -617,12 +698,13 @@ def build_command(args, experiment):
         command = [value for value in command if value != "--walk-forward"]
     command.extend([
         "--objective-mode", experiment["objective_mode"],
-        "--trade-selection", "topk_score",
+        "--trade-selection", experiment.get("trade_selection", "topk_score"),
         "--trade-score", experiment["trade_score"],
         "--walk-train-months", str(experiment.get("walk_train_months", 6)),
         "--walk-validation-months", str(experiment.get("walk_validation_months", 1)),
         "--walk-test-months", str(experiment.get("walk_test_months", 1)),
         "--top-k-per-minute", str(experiment["top_k_per_minute"]),
+        "--top-percent-per-period", str(experiment.get("top_percent_per_period", 0.0)),
         "--top-k-per-symbol-minute", str(experiment.get("top_k_per_symbol_minute", 0)),
         "--max-trades-per-period", str(experiment.get("max_trades_per_period", 10)),
         "--max-validation-trades", str(experiment.get("max_validation_trades", 250)),
@@ -671,6 +753,19 @@ def build_command(args, experiment):
         command.extend([
             "--min-predicted-net-return", str(experiment["min_predicted_net_return"]),
         ])
+    elif experiment["objective_mode"] == "economic_ranking":
+        command.extend([
+            "--ranker-objective", experiment.get("ranker_objective", "rank_xendcg"),
+            "--ranker-min-score", str(experiment.get("ranker_min_score", -1000000000.0)),
+            "--ranker-group-minutes", str(experiment.get("ranker_group_minutes", 1)),
+            "--ranker-min-group-size", str(experiment.get("ranker_min_group_size", 2)),
+            "--ranker-relevance-q1", str(experiment.get("ranker_relevance_q1", 0.50)),
+            "--ranker-relevance-q2", str(experiment.get("ranker_relevance_q2", 0.75)),
+            "--ranker-relevance-q3", str(experiment.get("ranker_relevance_q3", 0.90)),
+            "--ranker-adverse-penalty", str(experiment.get("ranker_adverse_penalty", 0.0)),
+            "--min-selected-threshold", str(experiment.get("min_selected_threshold", 0.0)),
+            "--min-validation-precision", str(experiment.get("min_validation_precision", 0.0)),
+        ])
     else:
         command.extend([
             "--calibration", "platt",
@@ -718,6 +813,16 @@ def summary_record(experiment, summary, run_exit_code):
         "profile": experiment.get("profile", ""),
         "objective_mode": experiment["objective_mode"],
         "trade_score": experiment["trade_score"],
+        "trade_selection": experiment.get("trade_selection", "topk_score"),
+        "top_percent_per_period": experiment.get("top_percent_per_period", 0.0),
+        "ranker_objective": experiment.get("ranker_objective", "none"),
+        "ranker_min_score": experiment.get("ranker_min_score", 0.0),
+        "ranker_group_minutes": experiment.get("ranker_group_minutes", 0),
+        "ranker_min_group_size": experiment.get("ranker_min_group_size", 0),
+        "ranker_relevance_q1": experiment.get("ranker_relevance_q1", 0.0),
+        "ranker_relevance_q2": experiment.get("ranker_relevance_q2", 0.0),
+        "ranker_relevance_q3": experiment.get("ranker_relevance_q3", 0.0),
+        "ranker_adverse_penalty": experiment.get("ranker_adverse_penalty", 0.0),
         "walk_train_months": experiment.get("walk_train_months", 6),
         "walk_validation_months": experiment.get("walk_validation_months", 1),
         "walk_test_months": experiment.get("walk_test_months", 1),
@@ -734,10 +839,10 @@ def summary_record(experiment, summary, run_exit_code):
         "symbol_filter_stage": experiment.get("symbol_filter_stage", "executed"),
         "threshold_tiebreaker": experiment.get("threshold_tiebreaker", "fewer_trades"),
         "ensemble_windows": experiment.get("ensemble_windows", ""),
-        "ev_safety_margin": experiment["ev_safety_margin"],
-        "min_selected_threshold": experiment["min_selected_threshold"],
-        "min_validation_precision": experiment["min_validation_precision"],
-        "top_k_per_minute": experiment["top_k_per_minute"],
+        "ev_safety_margin": experiment.get("ev_safety_margin", 0.0),
+        "min_selected_threshold": experiment.get("min_selected_threshold", 0.0),
+        "min_validation_precision": experiment.get("min_validation_precision", 0.0),
+        "top_k_per_minute": experiment.get("top_k_per_minute", 0),
         "top_k_per_symbol_minute": experiment.get("top_k_per_symbol_minute", 0),
         "max_trades_per_period": experiment.get("max_trades_per_period", 10),
         "max_validation_trades": experiment.get("max_validation_trades", 250),
@@ -758,8 +863,8 @@ def summary_record(experiment, summary, run_exit_code):
         "calibration_recent_rows": experiment.get("calibration_recent_rows", 0),
         "walk_forward_start_fold": experiment.get("walk_forward_start_fold", 0),
         "walk_forward_max_folds": experiment.get("walk_forward_max_folds", 0),
-        "min_predicted_net_return": experiment["min_predicted_net_return"],
-        "hybrid_min_score": experiment["hybrid_min_score"],
+        "min_predicted_net_return": experiment.get("min_predicted_net_return", 0.0),
+        "hybrid_min_score": experiment.get("hybrid_min_score", 0.0),
         "total_profit": float_value(source.get("portfolio_profit", 0.0)),
         "portfolio_return": float_value(source.get("portfolio_return", 0.0)),
         "profitable_fold_rate": float_value(walk_summary.get("walkforward_profitable_fold_rate", 0.0)),
@@ -775,8 +880,17 @@ def summary_record(experiment, summary, run_exit_code):
         "overactive_losing_folds": int(float_value(walk_summary.get("overactive_losing_folds", 0))),
         "avg_trades_in_losing_active_folds": float_value(walk_summary.get("avg_trades_in_losing_active_folds", 0.0)),
         "average_profit_per_trade": float_value(source.get("average_profit_per_trade", 0.0)),
-        "accepted": int(float_value(walk_summary.get("accepted", 1))),
-        "strategy_strength": walk_summary.get("strategy_strength", "not_checked"),
+        "accepted": int(float_value(summary.get("accepted", walk_summary.get("accepted", 1)))),
+        "strategy_strength": summary.get("strategy_strength", walk_summary.get("strategy_strength", "not_checked")),
+        "robustness_gate_status": summary.get("robustness_gate_status", ""),
+        "profitable_but_fragile": int(float_value(summary.get("profitable_but_fragile", 0))),
+        "robustness_failed_checks": summary.get("robustness_failed_checks", ""),
+        "ranking_trade_score_net_return_monotonicity": float_value(summary.get("ranking_trade_score_net_return_monotonicity", 0.0)),
+        "ranking_ranker_score_net_return_monotonicity": float_value(summary.get("ranking_ranker_score_net_return_monotonicity", 0.0)),
+        "ranking_trade_score_executed_top_symbol_share": float_value(summary.get("ranking_trade_score_executed_top_symbol_share", 0.0)),
+        "ranking_trade_score_executed_top_month_share": float_value(summary.get("ranking_trade_score_executed_top_month_share", 0.0)),
+        "ranking_ranker_score_executed_top_symbol_share": float_value(summary.get("ranking_ranker_score_executed_top_symbol_share", 0.0)),
+        "ranking_ranker_score_executed_top_month_share": float_value(summary.get("ranking_ranker_score_executed_top_month_share", 0.0)),
         "max_rss_gb_observed": float_value(summary.get("memory_settings", {}).get("max_rss_gb_observed", 0.0)),
         "run_exit_code": run_exit_code,
     }

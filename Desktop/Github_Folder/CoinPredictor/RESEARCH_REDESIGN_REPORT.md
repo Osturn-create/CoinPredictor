@@ -6,7 +6,7 @@ Date: 2026-07-10
 
 This report documents the research review and implementation pass performed against the current local `CoinPredictor/` repository and the current local dataset/cache artifacts. The implementation in this pass is deliberately compatibility-preserving: it does not require raw shard regeneration or external data access, and it works from the existing aggregate cache and prediction artifacts.
 
-The code changes in this pass improve production observability and robustness gates rather than claiming a fresh 80M-row retrain. That distinction matters. The current repo can run very large experiments, but the historical results show enough metric illusion risk that the first production fix must make ranking, concentration, and tail economics measurable before additional model complexity is trusted.
+The code changes in this pass improve production observability, robustness gates, and add a first-class economic ranking architecture. This report does not claim a fresh 80M-row profitability result from the local machine; it documents the architecture now available for that run and the diagnostics required to trust or reject it.
 
 ## Current Dataset Verified
 
@@ -106,7 +106,7 @@ External references used:
 - Carr and Lopez de Prado warn that calibrating trading rules through repeated historical simulation contributes to backtest overfitting: https://arxiv.org/abs/1408.1159
 - Rej, Seager, and Bouchaud discuss how iterative strategy tweaking can improve noise realizations rather than true expected performance: https://arxiv.org/abs/1902.01802
 
-## Implementation Delivered In This Pass
+## Implementation Delivered
 
 ### 1. Memory profiling correctness
 
@@ -169,7 +169,42 @@ Expected impact:
 - Concentration control: high, because symbol/month dominance is now measured in the traded tail.
 - Overfit resistance: high, because sparse/no-trade and one-month solutions become easier to reject.
 
-### 4. Tests
+### 4. Economic ranker
+
+Implemented a new `economic_ranking` objective path in `gbdt_pipeline.py`.
+
+What changed:
+
+- Added train-only utility labels from realized `trade_return - fee - slippage - latency`, with optional adverse-excursion penalty.
+- Quantized positive utility into relevance grades using training-fold quantiles only.
+- Added fold-local LightGBM ranking groups by decision-time bucket.
+- Added LightGBM ranking support with `rank_xendcg` and automatic fallback to `lambdarank`.
+- Added `ranker_score` to prediction bundles, prediction caches, ensemble averaging, prediction CSVs, feature importance, metrics, ranking reports, experiment summaries, and markdown reports.
+- Added economic-ranker selection with `topk_score`, `top_percent_score`, and `top_utility`.
+- Made threshold search opt-in for the ranker path; the default ranker path is top-tail allocation rather than validation threshold mining.
+- Disabled binary AUC for the economic-ranker path to avoid presenting the old label metric as the main success criterion.
+
+Expected impact:
+
+- Precision: medium/high in the traded tail if relevance grades preserve net utility ordering.
+- Recall: medium; the ranker is intentionally selective, but top-percent allocation prevents collapse into a single threshold.
+- Expected value: high, because the training target is net utility rather than raw binary target hit.
+- Sharpe/Sortino/drawdown: medium/high through better tail ranking and concentration diagnostics.
+- Stability across folds/months: medium/high if groupwise ranking generalizes; this must be verified with walk-forward reports.
+- Calibration quality: indirect; ranker scores are not probabilities, so calibration moves to tail economics and monotonicity.
+- Entry timing and symbol selection: high potential because candidates compete inside decision-time groups.
+
+### 5. Experiment runner profile
+
+Added an `economic-ranker` profile to `run_experiments.py` targeting the current aggregate-cache dataset:
+
+- `--objective-mode economic_ranking`
+- `--trade-score ranker_score`
+- `--ranker-objective rank_xendcg`
+- top-k and top-percent variants
+- current `shard_dataset_30_volatile_from_existing` input and `.gbdt_cache_full30_volatile` cache
+
+### 6. Tests
 
 Added tests for:
 
@@ -182,7 +217,7 @@ Full Python suite result:
 
 `python3 -m unittest CoinPredictor.test_gbdt_pipeline`
 
-Result: 166 tests passed, 25 skipped.
+Result: 172 tests passed, 25 skipped.
 
 ## Historical Old vs New Observability
 
@@ -214,22 +249,18 @@ Every serious future experiment should include:
 8. Baseline comparison.
 9. Explicit rejection if profit comes from one symbol, one month, or a non-monotonic top tail.
 
-## Next Architecture Changes To Implement After This Gate
+## Next Empirical Work
 
-The next model-level implementation should be selected only after the ranking report is run on full-candidate predictions. If top-tail monotonicity is weak, the correct next step is not more threshold tuning. It is to train an economic ranker.
+The next step is empirical, not architectural:
 
-Recommended order:
-
-1. Add a fold-local ranking training view that groups rows by decision time bucket and symbol universe availability.
-2. Quantize realized net trade utility into integer relevance labels.
-3. Train a LightGBM `rank_xendcg` or `lambdarank` model on those groups.
-4. Stack or blend the ranker with the existing expected-return hybrid score.
-5. Calibrate only the candidate tail used for trading.
-6. Replace threshold-first selection with top-N utility allocation subject to concentration and active-day gates.
-7. Remove validation-time threshold branches that no longer add out-of-sample value under ablation.
+1. Run the `economic-ranker` profile over the current aggregate cache with walk-forward enabled.
+2. Write full candidate predictions for representative folds, not only executed trades.
+3. Compare against the strongest existing hybrid profile using the same months, fees, slippage, and memory budget.
+4. Reject the ranker if top-decile utility is not positive, decile monotonicity is weak, or profit is dominated by a small number of symbols/months.
+5. Only after that, test stacking the ranker with the hybrid expected-return score.
 
 ## Bottom Line
 
-The original system is powerful but too easy to fool: it can produce attractive aggregate numbers while hiding top-tail inversion, sparse trading, and month/symbol concentration. This pass changes the production standard from "did the thresholded simulator make money?" to "does the score rank economically useful, diversified trades in the out-of-sample tail?"
+The original system is powerful but too easy to fool: it can produce attractive aggregate numbers while hiding top-tail inversion, sparse trading, and month/symbol concentration. The redesigned path changes the production standard from "did the thresholded simulator make money?" to "does the model rank economically useful, diversified trades in the out-of-sample tail?"
 
 That is the necessary foundation for any genuinely stronger trading architecture built from the current dataset.

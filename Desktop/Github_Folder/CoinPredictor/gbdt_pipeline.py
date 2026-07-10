@@ -1475,6 +1475,8 @@ def score_name_for_args(args):
         return "predicted_return"
     if args.objective_mode == "hybrid":
         return "hybrid"
+    if args.objective_mode == "economic_ranking":
+        return "ranker_score"
     return "ev" if args.threshold_objective == "ev" else "probability"
 
 
@@ -1514,6 +1516,13 @@ def predicted_net_return_value(bundle, index, fee, slippage):
 
 def predicted_return_uncertainty_value(bundle, index):
     values = bundle.get("predicted_return_uncertainty")
+    if values is None:
+        return 0.0
+    return float(values[index])
+
+
+def ranker_score_value(bundle, index):
+    values = bundle.get("ranker_score")
     if values is None:
         return 0.0
     return float(values[index])
@@ -1626,6 +1635,8 @@ def trade_score_value(bundle, index, score_name, upside_target, downside_stop, f
             upside_target,
             downside_stop,
         )
+    if score_name in ("ranker_score", "economic_rank_score"):
+        return ranker_score_value(bundle, index)
     raise ValueError("unknown trade score: {}".format(score_name))
 
 
@@ -2533,6 +2544,7 @@ def compact_signal_indices_for_bundle(rows, bundle, threshold, objective_mode="c
     if predicted_returns is None:
         predicted_returns = maybe_float32_array(bundle.get("raw_predicted_trade_return"))
     predicted_uncertainty = maybe_float32_array(bundle.get("predicted_return_uncertainty"))
+    ranker_scores = maybe_float32_array(bundle.get("ranker_score"))
     minimum_predicted = max(float(threshold if scalar_threshold is not None else 0.0), float(min_predicted_net_return))
     minimum_hybrid = max(float(threshold if scalar_threshold is not None else 0.0), float(hybrid_min_score))
     hybrid_probability_gate = 0.0
@@ -2571,6 +2583,13 @@ def compact_signal_indices_for_bundle(rows, bundle, threshold, objective_mode="c
             if predicted_returns is None:
                 continue
             mask = (predicted_returns[start:end] - fee - slippage) >= minimum_predicted
+        elif objective_mode == "economic_ranking":
+            if ranker_scores is None:
+                continue
+            if threshold_array is not None:
+                mask = ranker_scores[start:end] >= threshold_array[start:end]
+            else:
+                mask = ranker_scores[start:end] >= scalar_threshold
         else:
             if calibrated_values is None or (predicted_returns is None and hybrid_requires_predicted_return):
                 continue
@@ -2607,19 +2626,22 @@ def threshold_for_mode(args):
         return args.min_predicted_net_return
     if args.objective_mode == "hybrid":
         return args.hybrid_min_score
+    if args.objective_mode == "economic_ranking":
+        return args.ranker_min_score
     return None
 
 
 def build_prediction_bundle(probability=None, calibrated_probability=None, predicted_trade_return=None,
                             raw_predicted_trade_return=None, predicted_return_uncertainty=None,
                             meta_probability=None, ev_context=None, hybrid_return_context=None,
-                            uncertainty_context=None):
+                            uncertainty_context=None, ranker_score=None):
     return {
         "probability": probability,
         "calibrated_probability": calibrated_probability,
         "predicted_trade_return": predicted_trade_return,
         "raw_predicted_trade_return": raw_predicted_trade_return,
         "predicted_return_uncertainty": predicted_return_uncertainty,
+        "ranker_score": ranker_score,
         "meta_probability": meta_probability,
         "ev_context": ev_context,
         "hybrid_return_context": hybrid_return_context,
@@ -2629,7 +2651,8 @@ def build_prediction_bundle(probability=None, calibrated_probability=None, predi
 
 def bundle_length(bundle):
     for key in ("probability", "calibrated_probability", "predicted_trade_return",
-                "raw_predicted_trade_return", "predicted_return_uncertainty", "meta_probability"):
+                "raw_predicted_trade_return", "predicted_return_uncertainty",
+                "ranker_score", "meta_probability"):
         values = bundle.get(key)
         if values is not None:
             return len(values)
@@ -3453,6 +3476,8 @@ def score_values_for_bundle(rows, bundle, args):
         if np is not None and isinstance(predicted, np.ndarray):
             return predicted.astype(np.float32, copy=False) - np.float32(fee_slippage)
         return [float(value) - fee_slippage for value in predicted]
+    if args.objective_mode == "economic_ranking":
+        return bundle.get("ranker_score")
     probabilities = bundle["calibrated_probability"] if bundle.get("calibrated_probability") is not None else bundle.get("probability")
     predicted = bundle.get("predicted_trade_return")
     if predicted is None:
@@ -5250,6 +5275,221 @@ def actual_forward_returns(rows):
     return values
 
 
+def actual_max_adverse_returns(rows):
+    if is_compact_rows(rows):
+        values = rows.table.max_future_low_returns if rows.indices is None else rows.table.max_future_low_returns[rows.indices]
+        if np is not None:
+            return np.asarray(values, dtype=np.float32)
+        return [float(value) for value in values]
+    values = [row.max_future_low_return for row in rows]
+    if np is not None:
+        return np.asarray(values, dtype=np.float32)
+    return values
+
+
+def ranker_total_cost(args, slippage_multiplier=1.0):
+    return (
+        resolve_execution_fee(getattr(args, "fee", 0.0), args)
+        + float(getattr(args, "slippage", 0.0)) * float(slippage_multiplier)
+        + max(0.0, float(getattr(args, "latency_penalty_bps", 0.0))) / 10000.0
+    )
+
+
+def ranker_net_utility_values(rows, args, slippage_multiplier=1.0):
+    trade_returns = actual_trade_returns(rows)
+    cost = ranker_total_cost(args, slippage_multiplier)
+    adverse_penalty = max(0.0, float(getattr(args, "ranker_adverse_penalty", 0.0)))
+    if np is not None and isinstance(trade_returns, np.ndarray):
+        utilities = trade_returns.astype(np.float32, copy=True) - np.float32(cost)
+        if adverse_penalty > 0.0:
+            adverse = np.maximum(np.float32(0.0), -np.asarray(actual_max_adverse_returns(rows), dtype=np.float32))
+            utilities = utilities - np.float32(adverse_penalty) * adverse
+        return utilities.astype(np.float32, copy=False)
+    utilities = [float(value) - cost for value in trade_returns]
+    if adverse_penalty > 0.0:
+        adverse_values = actual_max_adverse_returns(rows)
+        utilities = [
+            value - adverse_penalty * max(0.0, -float(adverse_values[index]))
+            for index, value in enumerate(utilities)
+        ]
+    return utilities
+
+
+def finite_sorted(values):
+    result = []
+    for value in values:
+        numeric = safe_float(value, float("nan"))
+        if math.isfinite(numeric):
+            result.append(float(numeric))
+    result.sort()
+    return result
+
+
+def quantile_from_sorted(ordered, quantile):
+    if not ordered:
+        return 0.0
+    if len(ordered) == 1:
+        return float(ordered[0])
+    clamped = max(0.0, min(1.0, float(quantile)))
+    position = clamped * float(len(ordered) - 1)
+    lower_index = int(math.floor(position))
+    upper_index = int(math.ceil(position))
+    if lower_index == upper_index:
+        return float(ordered[lower_index])
+    weight = position - float(lower_index)
+    return float(ordered[lower_index]) + (float(ordered[upper_index]) - float(ordered[lower_index])) * weight
+
+
+def fit_ranker_relevance_context(rows, args):
+    utilities = ranker_net_utility_values(rows, args, getattr(args, "validation_slippage_multiplier", 1.0))
+    if np is not None and isinstance(utilities, np.ndarray):
+        finite_utilities = utilities[np.isfinite(utilities)]
+        positive_utilities = finite_utilities[finite_utilities > 0.0]
+        if positive_utilities.size:
+            ordered_positive = sorted(float(value) for value in positive_utilities)
+        else:
+            ordered_positive = []
+        utility_count = int(finite_utilities.size)
+        positive_count = int(positive_utilities.size)
+    else:
+        finite_values = finite_sorted(utilities)
+        ordered_positive = [value for value in finite_values if value > 0.0]
+        utility_count = len(finite_values)
+        positive_count = len(ordered_positive)
+    if ordered_positive:
+        weak = max(0.0, quantile_from_sorted(ordered_positive, float(getattr(args, "ranker_relevance_q1", 0.50))))
+        useful = max(weak, quantile_from_sorted(ordered_positive, float(getattr(args, "ranker_relevance_q2", 0.75))))
+        strong = max(useful, quantile_from_sorted(ordered_positive, float(getattr(args, "ranker_relevance_q3", 0.90))))
+    else:
+        weak, useful, strong = 0.0, 0.0, 0.0
+    return {
+        "mode": "train_quantiles",
+        "utility_rows": utility_count,
+        "positive_utility_rows": positive_count,
+        "zero_threshold": 0.0,
+        "weak_positive_threshold": weak,
+        "useful_positive_threshold": useful,
+        "strong_positive_threshold": strong,
+        "fee": resolve_execution_fee(getattr(args, "fee", 0.0), args),
+        "slippage": float(getattr(args, "slippage", 0.0)) * float(getattr(args, "validation_slippage_multiplier", 1.0)),
+        "latency_penalty": max(0.0, float(getattr(args, "latency_penalty_bps", 0.0))) / 10000.0,
+        "adverse_penalty": max(0.0, float(getattr(args, "ranker_adverse_penalty", 0.0))),
+    }
+
+
+def ranker_relevance_labels_from_utilities(utilities, context):
+    weak = float(context.get("weak_positive_threshold", 0.0))
+    useful = float(context.get("useful_positive_threshold", weak))
+    strong = float(context.get("strong_positive_threshold", useful))
+    if np is not None and isinstance(utilities, np.ndarray):
+        labels_array = np.zeros(len(utilities), dtype=np.int32)
+        positive_mask = utilities > 0.0
+        labels_array[positive_mask] = 1
+        weak_mask = positive_mask & (utilities >= weak)
+        useful_mask = positive_mask & (utilities >= useful)
+        strong_mask = positive_mask & (utilities >= strong)
+        labels_array[weak_mask] = np.maximum(labels_array[weak_mask], 2)
+        labels_array[useful_mask] = np.maximum(labels_array[useful_mask], 3)
+        labels_array[strong_mask] = np.maximum(labels_array[strong_mask], 4)
+        return labels_array
+    labels_list = []
+    for value in utilities:
+        numeric = float(value)
+        label = 0
+        if numeric > 0.0:
+            label = 1
+        if numeric > 0.0 and numeric >= weak:
+            label = max(label, 2)
+        if numeric > 0.0 and numeric >= useful:
+            label = max(label, 3)
+        if numeric > 0.0 and numeric >= strong:
+            label = max(label, 4)
+        labels_list.append(label)
+    return labels_list
+
+
+def ranker_relevance_labels(rows, args, context):
+    utilities = ranker_net_utility_values(rows, args, getattr(args, "validation_slippage_multiplier", 1.0))
+    return ranker_relevance_labels_from_utilities(utilities, context)
+
+
+def ranker_group_key_for_open_time(open_time, group_minutes):
+    return int(open_time_minute(open_time)) // max(1, int(group_minutes))
+
+
+def ranker_grouped_rows(rows, args):
+    group_minutes = max(1, int(getattr(args, "ranker_group_minutes", 1)))
+    min_group_size = max(1, int(getattr(args, "ranker_min_group_size", 2)))
+    if is_compact_rows(rows):
+        if np is None:
+            return rows, [len(rows)], {"ranker_group_fallback": "numpy_unavailable"}
+        base = compact_positions_array(rows)
+        if len(base) == 0:
+            return rows, [], {"ranker_group_count": 0, "ranker_group_rows": 0}
+        group_keys = compact_open_time_minutes(rows.table.open_times[base]) // group_minutes
+        order = np.argsort(group_keys, kind="mergesort")
+        sorted_positions = base[order].astype(np.int32, copy=False)
+        sorted_keys = group_keys[order]
+        groups = []
+        kept_segments = []
+        start = 0
+        while start < len(sorted_positions):
+            end = start + 1
+            while end < len(sorted_positions) and sorted_keys[end] == sorted_keys[start]:
+                end += 1
+            group_size = end - start
+            if group_size >= min_group_size:
+                groups.append(group_size)
+                kept_segments.append(sorted_positions[start:end])
+            start = end
+        fallback = ""
+        if not kept_segments:
+            groups = [len(sorted_positions)]
+            kept_positions = sorted_positions
+            fallback = "single_group"
+        else:
+            kept_positions = np.concatenate(kept_segments).astype(np.int32, copy=False)
+        return rows.subset(kept_positions), groups, {
+            "ranker_group_count": len(groups),
+            "ranker_group_rows": int(len(kept_positions)),
+            "ranker_group_minutes": group_minutes,
+            "ranker_min_group_size": min_group_size,
+            "ranker_group_fallback": fallback,
+            "ranker_average_group_size": float(len(kept_positions)) / float(len(groups)) if groups else 0.0,
+        }
+
+    keyed = []
+    for index, row in enumerate(rows):
+        keyed.append((ranker_group_key_for_open_time(row.open_time, group_minutes), row.open_time, row.symbol, index))
+    keyed.sort()
+    groups = []
+    kept_indices = []
+    start = 0
+    while start < len(keyed):
+        end = start + 1
+        while end < len(keyed) and keyed[end][0] == keyed[start][0]:
+            end += 1
+        group_size = end - start
+        if group_size >= min_group_size:
+            groups.append(group_size)
+            kept_indices.extend(item[3] for item in keyed[start:end])
+        start = end
+    fallback = ""
+    if not kept_indices and keyed:
+        kept_indices = [item[3] for item in keyed]
+        groups = [len(kept_indices)]
+        fallback = "single_group"
+    grouped_rows = [rows[index] for index in kept_indices]
+    return grouped_rows, groups, {
+        "ranker_group_count": len(groups),
+        "ranker_group_rows": len(grouped_rows),
+        "ranker_group_minutes": group_minutes,
+        "ranker_min_group_size": min_group_size,
+        "ranker_group_fallback": fallback,
+        "ranker_average_group_size": float(len(grouped_rows)) / float(len(groups)) if groups else 0.0,
+    }
+
+
 def regression_targets_for_rows(rows, args):
     target_name = regression_target_name(args)
     values = actual_trade_returns(rows)
@@ -5908,6 +6148,145 @@ def resolved_run_acceptance(fixed_record, walkforward_summary, args):
         "failed_acceptance_checks": source.get("failed_acceptance_checks", ""),
         "rejection_reason": source.get("rejection_reason", ""),
         "strategy_strength": source.get("strategy_strength", "not_checked"),
+    }
+
+
+def preferred_ranking_source_for_summary(summary, args):
+    objective_mode = getattr(args, "objective_mode", summary.get("objective_mode", "classification"))
+    available = set(
+        value.strip()
+        for value in str(summary.get("ranking_report_score_sources", "")).split(",")
+        if value.strip()
+    )
+    if objective_mode == "economic_ranking" and "ranker_score" in available:
+        return "ranker_score"
+    trade_score = str(summary.get("trade_score") or score_name_for_args(args))
+    if trade_score in available:
+        return trade_score
+    if "trade_score" in available:
+        return "trade_score"
+    return sorted(available)[0] if available else ""
+
+
+def summary_metric_float(summary, key, default=0.0):
+    return safe_float(summary.get(key, default), default)
+
+
+def robustness_gate_failures(summary, args):
+    if getattr(args, "robustness_gates", "warn") == "none":
+        return []
+    source_name = preferred_ranking_source_for_summary(summary, args)
+    prefix = "ranking_{}".format(source_name) if source_name else ""
+    failures = []
+
+    total_profit = summary_metric_float(
+        summary,
+        "walkforward_total_portfolio_profit",
+        summary_metric_float(summary, "portfolio_profit", 0.0),
+    )
+    predicted_trades = int(summary_metric_float(
+        summary,
+        "walkforward_total_predicted_trades",
+        summary_metric_float(summary, "predicted_trades", 0.0),
+    ))
+    min_trades = int(getattr(args, "robust_min_trades", 0))
+    if min_trades > 0 and predicted_trades < min_trades:
+        failures.append("trade_count {} < {}".format(predicted_trades, min_trades))
+
+    min_active_days = int(getattr(args, "robust_min_active_days", 0))
+    active_days = int(summary_metric_float(
+        summary,
+        "{}_executed_active_days".format(prefix),
+        summary_metric_float(summary, "active_days", 0.0),
+    )) if prefix else int(summary_metric_float(summary, "active_days", 0.0))
+    if min_active_days > 0 and predicted_trades > 0 and active_days < min_active_days:
+        failures.append("active_days {} < {}".format(active_days, min_active_days))
+
+    min_active_symbols = int(getattr(args, "robust_min_active_symbols", 0))
+    active_symbols = int(summary_metric_float(
+        summary,
+        "{}_executed_symbol_count".format(prefix),
+        summary_metric_float(summary, "profitable_symbols", 0.0) + summary_metric_float(summary, "losing_symbols", 0.0),
+    )) if prefix else int(summary_metric_float(summary, "profitable_symbols", 0.0) + summary_metric_float(summary, "losing_symbols", 0.0))
+    if min_active_symbols > 0 and predicted_trades > 0 and active_symbols < min_active_symbols:
+        failures.append("active_symbols {} < {}".format(active_symbols, min_active_symbols))
+
+    min_active_months = int(getattr(args, "robust_min_active_months", 0))
+    active_months = int(summary_metric_float(
+        summary,
+        "{}_executed_month_count".format(prefix),
+        summary_metric_float(summary, "{}_top_decile_month_count".format(prefix), 0.0) if prefix else 0.0,
+    )) if prefix else 0
+    if min_active_months > 0 and predicted_trades > 0 and active_months and active_months < min_active_months:
+        failures.append("active_months {} < {}".format(active_months, min_active_months))
+
+    max_top_symbol_share = float(getattr(args, "robust_max_top_symbol_share", 0.0))
+    top_symbol_share = summary_metric_float(
+        summary,
+        "{}_executed_top_symbol_share".format(prefix),
+        summary_metric_float(summary, "symbol_profit_concentration_top1", 0.0),
+    ) if prefix else summary_metric_float(summary, "symbol_profit_concentration_top1", 0.0)
+    if max_top_symbol_share > 0.0 and top_symbol_share > max_top_symbol_share:
+        failures.append("top_symbol_share {:.4f} > {:.4f}".format(top_symbol_share, max_top_symbol_share))
+
+    max_top_month_share = float(getattr(args, "robust_max_top_month_share", 0.0))
+    top_month_share = summary_metric_float(
+        summary,
+        "{}_executed_top_month_share".format(prefix),
+        summary_metric_float(summary, "{}_top_decile_top_month_share".format(prefix), 0.0) if prefix else 0.0,
+    ) if prefix else 0.0
+    if max_top_month_share > 0.0 and top_month_share > max_top_month_share:
+        failures.append("top_month_share {:.4f} > {:.4f}".format(top_month_share, max_top_month_share))
+
+    min_profit_factor = float(getattr(args, "robust_min_profit_factor", 0.0))
+    profit_factor = summary_metric_float(
+        summary,
+        "{}_executed_profit_factor".format(prefix),
+        summary_metric_float(summary, "profit_factor", 0.0),
+    ) if prefix else summary_metric_float(summary, "profit_factor", 0.0)
+    if min_profit_factor > 0.0 and predicted_trades > 0 and profit_factor < min_profit_factor:
+        failures.append("profit_factor {:.4f} < {:.4f}".format(profit_factor, min_profit_factor))
+
+    min_tail_monotonicity = float(getattr(args, "robust_min_tail_monotonicity", 0.0))
+    tail_monotonicity = summary_metric_float(summary, "{}_net_return_monotonicity".format(prefix), 0.0) if prefix else 0.0
+    if min_tail_monotonicity > 0.0 and prefix and tail_monotonicity < min_tail_monotonicity:
+        failures.append("tail_monotonicity {:.4f} < {:.4f}".format(tail_monotonicity, min_tail_monotonicity))
+
+    if bool(getattr(args, "robust_require_positive_top_1pct", False)) and prefix:
+        top_one_rows = int(summary_metric_float(summary, "{}_top_1pct_rows".format(prefix), 0.0))
+        top_one_return = summary_metric_float(summary, "{}_top_1pct_avg_net_return".format(prefix), 0.0)
+        if top_one_rows > 0 and top_one_return < 0.0:
+            failures.append("top_1pct_net_return {:.6f} < 0".format(top_one_return))
+
+    if bool(getattr(args, "robust_require_positive_top_decile", False)) and prefix:
+        top_decile_rows = int(summary_metric_float(summary, "{}_top_decile_rows".format(prefix), 0.0))
+        top_decile_return = summary_metric_float(summary, "{}_top_decile_avg_net_return".format(prefix), 0.0)
+        if top_decile_rows > 0 and top_decile_return < 0.0:
+            failures.append("top_decile_net_return {:.6f} < 0".format(top_decile_return))
+
+    if total_profit <= 0.0 and bool(getattr(args, "robust_require_positive_total_profit", False)):
+        failures.append("total_profit {:.6f} <= 0".format(total_profit))
+
+    return failures
+
+
+def robustness_summary(summary, args):
+    failures = robustness_gate_failures(summary, args)
+    total_profit = summary_metric_float(
+        summary,
+        "walkforward_total_portfolio_profit",
+        summary_metric_float(summary, "portfolio_profit", 0.0),
+    )
+    profitable_but_fragile = bool(failures and total_profit > 0.0)
+    action = getattr(args, "robustness_gate_action", "warn")
+    return {
+        "robustness_gates": getattr(args, "robustness_gates", "warn"),
+        "robustness_gate_action": action,
+        "robustness_gate_status": "failed" if failures else "passed",
+        "robustness_gate_failed": 1 if failures else 0,
+        "robustness_failed_checks": "; ".join(failures),
+        "profitable_but_fragile": 1 if profitable_but_fragile else 0,
+        "robustness_strength": "profitable_but_fragile" if profitable_but_fragile else ("robustness_rejected" if failures else "robustness_pass"),
     }
 
 
@@ -6895,7 +7274,7 @@ def candidate_rank(bucket, trade_selection, use_expected_value_ranking, top_k_pe
                    validation_dominance_shares=None,
                    runtime_args=None,
                    ranking_state=None):
-    if trade_selection not in ("topk_ev", "topk_score"):
+    if trade_selection not in ("topk_ev", "topk_score", "top_percent_score", "top_utility"):
         return list(bucket)
     recent_entry_minutes = recent_entry_minutes or ()
     recent_entry_minutes_by_symbol = recent_entry_minutes_by_symbol or {}
@@ -6928,7 +7307,11 @@ def candidate_rank(bucket, trade_selection, use_expected_value_ranking, top_k_pe
         ranked = sorted(bucket, key=sort_key)
     else:
         ranked = sorted(bucket, key=sort_key)
-    limit = max(0, int(top_k_per_minute))
+    if trade_selection == "top_percent_score":
+        top_percent = max(0.0, min(1.0, float(getattr(runtime_args, "top_percent_per_period", 0.0))))
+        limit = int(math.ceil(len(bucket) * top_percent)) if top_percent > 0.0 else max(0, int(top_k_per_minute))
+    else:
+        limit = max(0, int(top_k_per_minute))
     prefer_unique_symbols = bool(getattr(runtime_args, "prefer_unique_symbols", False)) and limit != 1
     chosen = []
     chosen_symbols = {}
@@ -7322,7 +7705,7 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
     }
     validation_dominance_shares = validation_symbol_dominance_shares(symbol_filter_info)
     use_expected_value_ranking = (
-        trade_selection == "topk_ev"
+        trade_selection in ("topk_ev", "top_utility")
         and bundle.get("probability") is not None
         and objective_mode == "classification"
     )
@@ -7574,7 +7957,7 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
     def flush_bucket(bucket):
         if not bucket:
             return
-        if trade_selection in ("topk_ev", "topk_score"):
+        if trade_selection in ("topk_ev", "topk_score", "top_percent_score", "top_utility"):
             chosen = candidate_rank(
                 bucket,
                 trade_selection,
@@ -7658,6 +8041,7 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
                 if predicted_returns is None:
                     predicted_returns = maybe_float32_array(bundle.get("raw_predicted_trade_return"))
                 predicted_uncertainty = maybe_float32_array(bundle.get("predicted_return_uncertainty"))
+                ranker_scores = maybe_float32_array(bundle.get("ranker_score"))
                 if calibrated_values is not None:
                     selected_calibrated = calibrated_values[signal_indices].astype(np.float32, copy=False)
                     selected_expected_values = score_batch_ev(
@@ -7695,6 +8079,11 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
                         uncertainty_context=bundle.get("uncertainty_context"),
                         hybrid_runtime_args=hybrid_runtime_args,
                     )
+                elif trade_score_name in ("ranker_score", "economic_rank_score"):
+                    if ranker_scores is None:
+                        selected_trade_scores = np.zeros(len(signal_indices), dtype=np.float32)
+                    else:
+                        selected_trade_scores = ranker_scores[signal_indices].astype(np.float32, copy=False)
                 else:
                     raise ValueError("unknown trade score: {}".format(trade_score_name))
 
@@ -7728,6 +8117,9 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
                         continue
                 elif objective_mode == "return_regression":
                     if predicted_net_return_value(bundle, local_index, fee, slippage) < max(float(threshold), min_predicted_net_return):
+                        continue
+                elif objective_mode == "economic_ranking":
+                    if ranker_score_value(bundle, local_index) < float(threshold):
                         continue
                 elif hybrid_score_value(bundle, local_index, fee, slippage, hybrid_score_mode, hybrid_uncertainty_penalty, hybrid_runtime_args, upside_target, downside_stop) < (
                         float(effective_hybrid_thresholds[local_index]) if effective_hybrid_thresholds is not None else max(float(threshold), hybrid_min_score)):
@@ -7764,8 +8156,11 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
             elif objective_mode == "return_regression":
                 if predicted_net_return_value(bundle, local_index, fee, slippage) < max(float(threshold), min_predicted_net_return):
                     continue
+            elif objective_mode == "economic_ranking":
+                if ranker_score_value(bundle, local_index) < float(threshold):
+                    continue
             elif hybrid_score_value(bundle, local_index, fee, slippage, hybrid_score_mode, hybrid_uncertainty_penalty, hybrid_runtime_args, upside_target, downside_stop) < (
-                    float(effective_hybrid_thresholds[local_index]) if effective_hybrid_thresholds is not None else max(float(threshold), hybrid_min_score)):
+                float(effective_hybrid_thresholds[local_index]) if effective_hybrid_thresholds is not None else max(float(threshold), hybrid_min_score)):
                 continue
             elif hybrid_probability_gate > 0.0 and calibrated_probability_value(bundle, local_index) < hybrid_probability_gate:
                 continue
@@ -7857,6 +8252,8 @@ def raw_classification_metrics(rows, predictions, threshold, batch_size=1000000,
             return True
         if objective_mode == "return_regression":
             return predicted_net_return_value(bundle, local_index, fee, slippage) >= max(threshold, min_predicted_net_return)
+        if objective_mode == "economic_ranking":
+            return ranker_score_value(bundle, local_index) >= float(threshold)
         if hybrid_score_value(bundle, local_index, fee, slippage, hybrid_score_mode, hybrid_uncertainty_penalty, hybrid_runtime_args, upside_target, downside_stop) < (
             float(effective_hybrid_thresholds[local_index]) if effective_hybrid_thresholds is not None else max(threshold, hybrid_min_score)
         ):
@@ -9819,6 +10216,8 @@ def selected_score_name_for_mode(args):
         return "probability"
     if args.objective_mode == "return_regression":
         return "predicted_return"
+    if args.objective_mode == "economic_ranking":
+        return "ranker_score"
     return "hybrid"
 
 
@@ -10552,9 +10951,14 @@ class NativeLightGBMModel(object):
 
     def fit(self, x_train, y_train, feature_names, x_validation=None, y_validation=None, args=None):
         import lightgbm as lgb
+        train_group = getattr(args, "_ranker_train_group", None) if args is not None else None
+        validation_group = getattr(args, "_ranker_validation_group", None) if args is not None else None
+        if self.task == "ranking" and not train_group:
+            raise ValueError("ranking model requires non-empty LightGBM group lengths")
         train_set = lgb.Dataset(
             x_train,
             label=y_train,
+            group=train_group,
             feature_name=list(feature_names) if feature_names else "auto",
             free_raw_data=False,
         )
@@ -10566,18 +10970,28 @@ class NativeLightGBMModel(object):
             valid_sets = [lgb.Dataset(
                 x_validation,
                 label=y_validation,
+                group=validation_group if self.task == "ranking" else None,
                 feature_name=list(feature_names) if feature_names else "auto",
                 reference=train_set,
                 free_raw_data=False,
             )]
             valid_names = ["validation"]
-            if self.task == "classification" and args is not None and args.early_stopping_rounds > 0:
+            if self.task in ("classification", "ranking") and args is not None and args.early_stopping_rounds > 0:
                 callbacks.append(lgb.early_stopping(args.early_stopping_rounds, verbose=False))
             if args is not None:
                 callbacks.append(lgb.log_evaluation(args.log_evaluation_period))
+        if self.task == "classification":
+            objective = "binary"
+            metric = args.eval_metric if args is not None else "binary_logloss"
+        elif self.task == "ranking":
+            objective = getattr(args, "ranker_objective", "rank_xendcg") if args is not None else "rank_xendcg"
+            metric = "ndcg"
+        else:
+            objective = "regression"
+            metric = "l2"
         native_params = {
-            "objective": "binary" if self.task == "classification" else "regression",
-            "metric": (args.eval_metric if args is not None else "binary_logloss") if self.task == "classification" else "l2",
+            "objective": objective,
+            "metric": metric,
             "learning_rate": self.params["learning_rate"],
             "num_leaves": self.params["num_leaves"],
             "max_depth": self.params["max_depth"],
@@ -10598,14 +11012,33 @@ class NativeLightGBMModel(object):
         }
         if self.task == "classification":
             native_params["scale_pos_weight"] = self.positive_weight
-        self.model = lgb.train(
-            native_params,
-            train_set,
-            num_boost_round=self.params["n_estimators"],
-            valid_sets=valid_sets,
-            valid_names=valid_names,
-            callbacks=callbacks or None,
-        )
+        if self.task == "ranking":
+            native_params["label_gain"] = [0, 1, 3, 7, 15]
+        try:
+            self.model = lgb.train(
+                native_params,
+                train_set,
+                num_boost_round=self.params["n_estimators"],
+                valid_sets=valid_sets,
+                valid_names=valid_names,
+                callbacks=callbacks or None,
+            )
+        except Exception:
+            if self.task != "ranking" or native_params.get("objective") == "lambdarank":
+                raise
+            warn_once(
+                "rank-xendcg-fallback",
+                "Warning: LightGBM rank_xendcg objective unavailable; falling back to lambdarank.",
+            )
+            native_params["objective"] = "lambdarank"
+            self.model = lgb.train(
+                native_params,
+                train_set,
+                num_boost_round=self.params["n_estimators"],
+                valid_sets=valid_sets,
+                valid_names=valid_names,
+                callbacks=callbacks or None,
+            )
         return self
 
     def predict_proba(self, x_rows):
@@ -10694,6 +11127,8 @@ def make_model(kind, params, positive_weight, objective_mode="classification"):
     if kind == "lightgbm":
         if objective_mode == "classification":
             return NativeLightGBMModel(params, positive_weight, "classification")
+        if objective_mode == "economic_ranking":
+            return NativeLightGBMModel(params, positive_weight, "ranking")
         return NativeLightGBMModel(params, positive_weight, "regression")
     if objective_mode == "classification":
         return InternalStumpGBDT(
@@ -10780,7 +11215,8 @@ def copy_prediction_values(values, args, prefix):
 def cleanup_prediction_bundle(bundle):
     seen = set()
     for key in ("probability", "calibrated_probability", "predicted_trade_return",
-                "raw_predicted_trade_return", "predicted_return_uncertainty", "meta_probability"):
+                "raw_predicted_trade_return", "predicted_return_uncertainty",
+                "ranker_score", "meta_probability"):
         values = bundle.get(key)
         if values is None:
             continue
@@ -10845,6 +11281,7 @@ def selected_prediction_signature(selected):
         "threshold": selected.get("threshold"),
         "has_classification_model": 1 if selected.get("classification_model") is not None else 0,
         "has_regression_model": 1 if selected.get("regression_model") is not None else 0,
+        "has_ranker_model": 1 if selected.get("ranker_model") is not None else 0,
         "calibration": {
             "mode": calibration.get("mode", "none"),
             "a": calibration.get("a", 0.0),
@@ -10901,7 +11338,8 @@ def prediction_bundle_cache_enabled(args):
 def prediction_bundle_to_cache_arrays(bundle):
     arrays = {}
     for key in ("probability", "calibrated_probability", "predicted_trade_return",
-                "raw_predicted_trade_return", "predicted_return_uncertainty", "meta_probability"):
+                "raw_predicted_trade_return", "predicted_return_uncertainty",
+                "ranker_score", "meta_probability"):
         values = bundle.get(key)
         if values is None:
             continue
@@ -10919,6 +11357,7 @@ def prediction_bundle_from_cache_arrays(arrays, selected):
         arrays.get("predicted_trade_return"),
         raw_predicted_trade_return=arrays.get("raw_predicted_trade_return"),
         predicted_return_uncertainty=arrays.get("predicted_return_uncertainty"),
+        ranker_score=arrays.get("ranker_score"),
         meta_probability=arrays.get("meta_probability"),
         ev_context=selected.get("ev_payoff_info"),
         hybrid_return_context=selected.get("hybrid_return_info"),
@@ -10988,6 +11427,7 @@ def average_prediction_bundles(rows, args, bundles):
     predicted_trade_return = None
     raw_predicted_trade_return = None
     predicted_return_uncertainty = None
+    ranker_score = None
     meta_probability = None
     counts = {
         "probability": 0,
@@ -10995,6 +11435,7 @@ def average_prediction_bundles(rows, args, bundles):
         "predicted_trade_return": 0,
         "raw_predicted_trade_return": 0,
         "predicted_return_uncertainty": 0,
+        "ranker_score": 0,
         "meta_probability": 0,
     }
     for bundle in bundles:
@@ -11028,6 +11469,12 @@ def average_prediction_bundles(rows, args, bundles):
                 predicted_return_uncertainty[:] = 0.0
             add_prediction_values_in_place(predicted_return_uncertainty, bundle["predicted_return_uncertainty"])
             counts["predicted_return_uncertainty"] += 1
+        if bundle.get("ranker_score") is not None:
+            if ranker_score is None:
+                ranker_score = allocate_prediction_values(row_count, args, "gbdt_ensemble_ranker_score_")
+                ranker_score[:] = 0.0
+            add_prediction_values_in_place(ranker_score, bundle["ranker_score"])
+            counts["ranker_score"] += 1
         if bundle.get("meta_probability") is not None:
             if meta_probability is None:
                 meta_probability = allocate_prediction_values(row_count, args, "gbdt_ensemble_meta_probability_")
@@ -11040,6 +11487,7 @@ def average_prediction_bundles(rows, args, bundles):
     divide_prediction_values_in_place(predicted_trade_return, counts["predicted_trade_return"])
     divide_prediction_values_in_place(raw_predicted_trade_return, counts["raw_predicted_trade_return"])
     divide_prediction_values_in_place(predicted_return_uncertainty, counts["predicted_return_uncertainty"])
+    divide_prediction_values_in_place(ranker_score, counts["ranker_score"])
     divide_prediction_values_in_place(meta_probability, counts["meta_probability"])
     return build_prediction_bundle(
         probability,
@@ -11047,6 +11495,7 @@ def average_prediction_bundles(rows, args, bundles):
         predicted_trade_return,
         raw_predicted_trade_return=raw_predicted_trade_return,
         predicted_return_uncertainty=predicted_return_uncertainty,
+        ranker_score=ranker_score,
         meta_probability=meta_probability,
         ev_context=bundles[0].get("ev_context") if bundles else None,
         hybrid_return_context=bundles[0].get("hybrid_return_context") if bundles else None,
@@ -11084,6 +11533,7 @@ def prediction_bundle_for_models(selected, rows, kind, args, stage_prefix):
     predicted_trade_return = None
     raw_predicted_trade_return = None
     predicted_return_uncertainty = None
+    ranker_score = None
     if selected.get("classification_model") is not None:
         probability = predict_model_values(
             selected["classification_model"],
@@ -11114,12 +11564,21 @@ def prediction_bundle_for_models(selected, rows, kind, args, stage_prefix):
             selected.get("uncertainty_model"),
         )
         del regression_prediction
+    if selected.get("ranker_model") is not None:
+        ranker_score = predict_model_values(
+            selected["ranker_model"],
+            rows,
+            kind,
+            args,
+            "{} economic ranker prediction".format(stage_prefix),
+        )
     bundle = build_prediction_bundle(
         probability,
         calibrated_probability,
         predicted_trade_return,
         raw_predicted_trade_return=raw_predicted_trade_return,
         predicted_return_uncertainty=predicted_return_uncertainty,
+        ranker_score=ranker_score,
         ev_context=selected.get("ev_payoff_info"),
         hybrid_return_context=selected.get("hybrid_return_info"),
         uncertainty_context=selected.get("uncertainty_model"),
@@ -11142,6 +11601,12 @@ def prediction_bundle_for_models(selected, rows, kind, args, stage_prefix):
 def selected_thresholds_for_bundle(bundle, validation_rows, args):
     if args.objective_mode != "classification":
         threshold = threshold_for_mode(args)
+        if (
+            args.objective_mode == "economic_ranking"
+            and getattr(args, "trade_selection", "threshold") in ("topk_score", "top_percent_score", "top_utility")
+            and not bool(getattr(args, "ranker_threshold_search", False))
+        ):
+            return [threshold], threshold, score_values_for_bundle(validation_rows, bundle, args)
         if args.objective_mode == "hybrid":
             threshold, threshold_diagnostics = resolved_hybrid_min_score_floor(bundle, args)
             if args.disable_adaptive_thresholds:
@@ -11744,20 +12209,41 @@ def fit_select_model(train_rows, validation_rows, feature_names, args, kind):
     y_class_validation = None
     y_reg_train = None
     y_reg_validation = None
+    ranker_context = None
+    rank_train_rows = None
+    rank_validation_rows = None
+    rank_train_group = None
+    rank_validation_group = None
+    rank_train_info = {}
+    rank_validation_info = {}
+    x_rank_train = None
+    x_rank_validation = None
+    y_rank_train = None
+    y_rank_validation = None
     if args.objective_mode in ("classification", "hybrid"):
         y_class_train = model_targets(fit_train_rows, kind, "classification")
         y_class_validation = model_targets(fit_validation_rows, kind, "classification")
     if args.objective_mode in ("return_regression", "hybrid"):
         y_reg_train = model_targets(fit_train_rows, kind, "return_regression", args)
         y_reg_validation = model_targets(fit_validation_rows, kind, "return_regression", args)
+    if args.objective_mode == "economic_ranking":
+        ranker_context = fit_ranker_relevance_context(fit_train_rows, args)
+        rank_train_rows, rank_train_group, rank_train_info = ranker_grouped_rows(fit_train_rows, args)
+        rank_validation_rows, rank_validation_group, rank_validation_info = ranker_grouped_rows(fit_validation_rows, args)
+        x_rank_train = model_matrix(rank_train_rows, kind, args)
+        x_rank_validation = model_matrix(rank_validation_rows, kind, args)
+        y_rank_train = ranker_relevance_labels(rank_train_rows, args, ranker_context)
+        y_rank_validation = ranker_relevance_labels(rank_validation_rows, args, ranker_context)
 
     best = None
     for params in candidate_params(kind, args):
         classification_model = None
         regression_model = None
+        ranker_model = None
         raw_probabilities = None
         calibrated_probabilities = None
         predicted_trade_return = None
+        ranker_score = None
         calibration = None
         regression_calibration = None
         uncertainty_model = None
@@ -11803,12 +12289,30 @@ def fit_select_model(train_rows, validation_rows, feature_names, args, kind):
         else:
             raw_predicted_trade_return = None
 
+        if args.objective_mode == "economic_ranking":
+            ranker_model = make_model(kind, params, positive_weight, "economic_ranking")
+            rank_fit_args = argparse.Namespace(**vars(args))
+            rank_fit_args._ranker_train_group = list(rank_train_group or [])
+            rank_fit_args._ranker_validation_group = list(rank_validation_group or [])
+            ranker_fit_token = start_profile_stage("economic_ranker_fit", json.dumps(params, sort_keys=True))
+            ranker_model.fit(x_rank_train, y_rank_train, feature_names, x_rank_validation, y_rank_validation, rank_fit_args)
+            finish_profile_stage(ranker_fit_token, rows_processed=len(rank_train_rows), extra_info=json.dumps(params, sort_keys=True))
+            memory_checkpoint(
+                "LightGBM economic ranker candidate fit complete" if kind == "lightgbm" else "Internal economic ranker candidate fit complete",
+                args,
+            )
+            sampled_ranker_token = start_profile_stage("sampled_validation_economic_ranker_prediction", json.dumps(params, sort_keys=True))
+            ranker_score = ranker_model.predict_values(x_validation)
+            finish_profile_stage(sampled_ranker_token, rows_processed=len(fit_validation_rows), extra_info=json.dumps(params, sort_keys=True))
+            memory_checkpoint("Sampled validation economic ranker prediction complete", args)
+
         bundle = build_prediction_bundle(
             raw_probabilities,
             calibrated_probabilities,
             predicted_trade_return,
             raw_predicted_trade_return=raw_predicted_trade_return,
             predicted_return_uncertainty=apply_uncertainty_model(predicted_trade_return, uncertainty_model) if predicted_trade_return is not None else None,
+            ranker_score=ranker_score,
             uncertainty_context=uncertainty_model,
         )
         bundle["regression_calibration"] = regression_calibration or {}
@@ -11845,11 +12349,14 @@ def fit_select_model(train_rows, validation_rows, feature_names, args, kind):
             if best is not None:
                 old_classification = best.pop("classification_model", None)
                 old_regression = best.pop("regression_model", None)
+                old_ranker = best.pop("ranker_model", None)
                 del old_classification
                 del old_regression
+                del old_ranker
             best = {
                 "classification_model": classification_model,
                 "regression_model": regression_model,
+                "ranker_model": ranker_model,
                 "params": dict(params),
                 "threshold": threshold,
                 "validation_metrics": metrics,
@@ -11863,6 +12370,11 @@ def fit_select_model(train_rows, validation_rows, feature_names, args, kind):
                 "uncertainty_model": uncertainty_model,
                 "trade_score_name": score_name,
                 "selected_score_name": selected_score_name,
+                "ranker_relevance_context": dict(ranker_context or {}),
+                "ranker_group_info": {
+                    "train": dict(rank_train_info or {}),
+                    "validation": dict(rank_validation_info or {}),
+                },
                 "ev_payoff_info": dict(bundle.get("ev_context") or {}),
                 "hybrid_return_info": dict(bundle.get("hybrid_return_context") or {}),
             }
@@ -11872,9 +12384,13 @@ def fit_select_model(train_rows, validation_rows, feature_names, args, kind):
             elif regression_model is not None and hasattr(regression_model, "best_iteration") and regression_model.best_iteration():
                 best["best_iteration"] = regression_model.best_iteration()
                 best["params"]["n_estimators"] = regression_model.best_iteration()
+            elif ranker_model is not None and hasattr(ranker_model, "best_iteration") and ranker_model.best_iteration():
+                best["best_iteration"] = ranker_model.best_iteration()
+                best["params"]["n_estimators"] = ranker_model.best_iteration()
         else:
             del classification_model
             del regression_model
+            del ranker_model
             calibration = None
         cleanup_prediction_bundle(bundle)
         del bundle
@@ -11889,6 +12405,10 @@ def fit_select_model(train_rows, validation_rows, feature_names, args, kind):
     del y_class_validation
     del y_reg_train
     del y_reg_validation
+    del x_rank_train
+    del x_rank_validation
+    del y_rank_train
+    del y_rank_validation
     gc.collect()
     if best is not None and len(fit_validation_rows) != len(validation_rows) and not args.skip_full_validation_retune:
         retune_token = start_profile_stage("full_validation_retune", "rows={}".format(len(validation_rows)))
@@ -12031,6 +12551,17 @@ def fit_select_model(train_rows, validation_rows, feature_names, args, kind):
             "regression_calibration_rmse_after": regression_calibration.get("regression_calibration_rmse_after", 0.0),
             "regression_calibration_mae_before": regression_calibration.get("regression_calibration_mae_before", 0.0),
             "regression_calibration_mae_after": regression_calibration.get("regression_calibration_mae_after", 0.0),
+            "ranker_objective": getattr(args, "ranker_objective", "rank_xendcg") if args.objective_mode == "economic_ranking" else "none",
+            "ranker_relevance_mode": (best.get("ranker_relevance_context") or {}).get("mode", "none"),
+            "ranker_utility_rows": (best.get("ranker_relevance_context") or {}).get("utility_rows", 0),
+            "ranker_positive_utility_rows": (best.get("ranker_relevance_context") or {}).get("positive_utility_rows", 0),
+            "ranker_weak_positive_threshold": (best.get("ranker_relevance_context") or {}).get("weak_positive_threshold", 0.0),
+            "ranker_useful_positive_threshold": (best.get("ranker_relevance_context") or {}).get("useful_positive_threshold", 0.0),
+            "ranker_strong_positive_threshold": (best.get("ranker_relevance_context") or {}).get("strong_positive_threshold", 0.0),
+            "ranker_train_group_count": ((best.get("ranker_group_info") or {}).get("train") or {}).get("ranker_group_count", 0),
+            "ranker_validation_group_count": ((best.get("ranker_group_info") or {}).get("validation") or {}).get("ranker_group_count", 0),
+            "ranker_train_average_group_size": ((best.get("ranker_group_info") or {}).get("train") or {}).get("ranker_average_group_size", 0.0),
+            "ranker_validation_average_group_size": ((best.get("ranker_group_info") or {}).get("validation") or {}).get("ranker_average_group_size", 0.0),
             "hybrid_return_combination": hybrid_return_info.get("hybrid_return_combination", getattr(args, "hybrid_return_combination", "probability_times_return")),
             "hybrid_min_probability": hybrid_return_info.get("hybrid_min_probability", getattr(args, "hybrid_min_probability", 0.0)),
             "configured_hybrid_min_score": best["validation_metrics"].get("configured_hybrid_min_score", getattr(args, "hybrid_min_score", 0.0)),
@@ -12184,6 +12715,7 @@ def write_predictions(path, rows, predictions, threshold, model_name,
                 "calibrated_predicted_trade_return",
                 "predicted_net_return",
                 "predicted_return_uncertainty",
+                "ranker_score",
                 "base_hybrid_score",
                 "hybrid_score",
                 "hybrid_score_basic",
@@ -12349,6 +12881,7 @@ def write_predictions(path, rows, predictions, threshold, model_name,
                     "{:.12g}".format(hybrid_details["calibrated_predicted_trade_return"]),
                     "{:.12g}".format(predicted_net_return),
                     "{:.12g}".format(predicted_return_uncertainty_value(bundle, index)),
+                    "{:.12g}".format(ranker_score_value(bundle, index)),
                     "{:.12g}".format(hybrid_details["base_hybrid_score"]),
                     "{:.12g}".format(hybrid_score),
                     "{:.12g}".format(hybrid_score_basic),
@@ -12477,6 +13010,7 @@ def write_predictions(path, rows, predictions, threshold, model_name,
                 "{:.12g}".format(hybrid_details["calibrated_predicted_trade_return"]),
                 "{:.12g}".format(predicted_net_return),
                 "{:.12g}".format(predicted_return_uncertainty_value(bundle, index)),
+                "{:.12g}".format(ranker_score_value(bundle, index)),
                 "{:.12g}".format(hybrid_details["base_hybrid_score"]),
                 "{:.12g}".format(hybrid_score),
                 "{:.12g}".format(hybrid_score_basic),
@@ -12758,6 +13292,24 @@ METRIC_COLUMNS = [
     "hybrid_gate_rows_above_configured_floor",
     "hybrid_gate_rows_above_effective_floor",
     "hybrid_gate_rows_between_effective_and_configured_floor",
+    "ranker_objective",
+    "ranker_min_score",
+    "ranker_group_minutes",
+    "ranker_min_group_size",
+    "ranker_relevance_q1",
+    "ranker_relevance_q2",
+    "ranker_relevance_q3",
+    "ranker_adverse_penalty",
+    "ranker_relevance_mode",
+    "ranker_utility_rows",
+    "ranker_positive_utility_rows",
+    "ranker_weak_positive_threshold",
+    "ranker_useful_positive_threshold",
+    "ranker_strong_positive_threshold",
+    "ranker_train_group_count",
+    "ranker_validation_group_count",
+    "ranker_train_average_group_size",
+    "ranker_validation_average_group_size",
     "threshold_drawdown_penalty",
     "threshold_trade_count_penalty",
     "threshold_diversity_penalty_weight",
@@ -12781,6 +13333,7 @@ METRIC_COLUMNS = [
     "adaptive_thresholds",
     "trade_selection",
     "top_k_per_minute",
+    "top_percent_per_period",
     "top_k_per_symbol_minute",
     "prefer_unique_symbols",
     "calibration",
@@ -13080,6 +13633,24 @@ def metrics_record(model_name, split, objective, threshold, train_rows, validati
         "hybrid_gate_rows_above_configured_floor": calibration_info.get("hybrid_gate_rows_above_configured_floor", validation_metrics.get("hybrid_gate_rows_above_configured_floor", 0)),
         "hybrid_gate_rows_above_effective_floor": calibration_info.get("hybrid_gate_rows_above_effective_floor", validation_metrics.get("hybrid_gate_rows_above_effective_floor", 0)),
         "hybrid_gate_rows_between_effective_and_configured_floor": calibration_info.get("hybrid_gate_rows_between_effective_and_configured_floor", validation_metrics.get("hybrid_gate_rows_between_effective_and_configured_floor", 0)),
+        "ranker_objective": calibration_info.get("ranker_objective", getattr(args, "ranker_objective", "rank_xendcg") if args.objective_mode == "economic_ranking" else "none"),
+        "ranker_min_score": getattr(args, "ranker_min_score", 0.0),
+        "ranker_group_minutes": getattr(args, "ranker_group_minutes", 1),
+        "ranker_min_group_size": getattr(args, "ranker_min_group_size", 2),
+        "ranker_relevance_q1": getattr(args, "ranker_relevance_q1", 0.50),
+        "ranker_relevance_q2": getattr(args, "ranker_relevance_q2", 0.75),
+        "ranker_relevance_q3": getattr(args, "ranker_relevance_q3", 0.90),
+        "ranker_adverse_penalty": getattr(args, "ranker_adverse_penalty", 0.0),
+        "ranker_relevance_mode": calibration_info.get("ranker_relevance_mode", "none"),
+        "ranker_utility_rows": calibration_info.get("ranker_utility_rows", 0),
+        "ranker_positive_utility_rows": calibration_info.get("ranker_positive_utility_rows", 0),
+        "ranker_weak_positive_threshold": calibration_info.get("ranker_weak_positive_threshold", 0.0),
+        "ranker_useful_positive_threshold": calibration_info.get("ranker_useful_positive_threshold", 0.0),
+        "ranker_strong_positive_threshold": calibration_info.get("ranker_strong_positive_threshold", 0.0),
+        "ranker_train_group_count": calibration_info.get("ranker_train_group_count", 0),
+        "ranker_validation_group_count": calibration_info.get("ranker_validation_group_count", 0),
+        "ranker_train_average_group_size": calibration_info.get("ranker_train_average_group_size", 0.0),
+        "ranker_validation_average_group_size": calibration_info.get("ranker_validation_average_group_size", 0.0),
         "hybrid_return_combination": getattr(args, "hybrid_return_combination", "probability_times_return"),
         "hybrid_min_probability": getattr(args, "hybrid_min_probability", 0.0),
         "regression_target": getattr(args, "regression_target", "trade_return"),
@@ -13109,6 +13680,7 @@ def metrics_record(model_name, split, objective, threshold, train_rows, validati
         "adaptive_thresholds": 0 if args.disable_adaptive_thresholds else 1,
         "trade_selection": args.trade_selection,
         "top_k_per_minute": args.top_k_per_minute,
+        "top_percent_per_period": getattr(args, "top_percent_per_period", 0.0),
         "top_k_per_symbol_minute": getattr(args, "top_k_per_symbol_minute", 0),
         "prefer_unique_symbols": int(bool(getattr(args, "prefer_unique_symbols", False))),
         "selected_ev_safety_margin": args.ev_safety_margin,
@@ -13266,12 +13838,20 @@ def write_feature_importance(path, model, feature_names, model_name):
         if model.get("ensemble_members"):
             for member in model.get("ensemble_members", []):
                 window_suffix = "window{}".format(member.get("ensemble_window", ""))
-                for label, part in (("classification", member.get("classification_model")), ("return_regression", member.get("regression_model"))):
+                for label, part in (
+                    ("classification", member.get("classification_model")),
+                    ("return_regression", member.get("regression_model")),
+                    ("economic_ranking", member.get("ranker_model")),
+                ):
                     if part is None:
                         continue
                     for feature, importance, fraction in part.feature_importance(feature_names):
                         rows.append(("{}_{}_{}".format(model_name, window_suffix, label), feature, importance, fraction))
-        for label, part in (("classification", model.get("classification_model")), ("return_regression", model.get("regression_model"))):
+        for label, part in (
+            ("classification", model.get("classification_model")),
+            ("return_regression", model.get("regression_model")),
+            ("economic_ranking", model.get("ranker_model")),
+        ):
             if part is None:
                 continue
             for feature, importance, fraction in part.feature_importance(feature_names):
@@ -13383,7 +13963,7 @@ def run_fixed_split(rows, feature_names, args, kind, model_name):
         selected["threshold"],
         args.fee,
         args.slippage * args.test_slippage_multiplier,
-        compute_auc=args.objective_mode != "return_regression",
+        compute_auc=args.objective_mode not in ("return_regression", "economic_ranking"),
         initial_capital=args.initial_capital,
         max_position_fraction=args.max_position_fraction,
         max_volume_fraction=args.max_volume_fraction,
@@ -13746,8 +14326,10 @@ def run_walk_forward(rows, feature_names, args, kind, model_name):
             finish_profile_stage(final_sample_token, rows_processed=len(fit_final_train_rows))
             selected_classification = selected.pop("classification_model", None)
             selected_regression = selected.pop("regression_model", None)
+            selected_ranker = selected.pop("ranker_model", None)
             del selected_classification
             del selected_regression
+            del selected_ranker
             gc.collect()
             positive_weight = class_weight_ratio_for_rows(final_train_rows, args.positive_weight_cap)
             x_final = model_matrix(fit_final_train_rows, kind, args)
@@ -13761,6 +14343,8 @@ def run_walk_forward(rows, feature_names, args, kind, model_name):
                 "calibration": selected.get("calibration"),
                 "regression_calibration": selected.get("regression_calibration"),
                 "uncertainty_model": selected.get("uncertainty_model"),
+                "ranker_relevance_context": selected.get("ranker_relevance_context") or {},
+                "ranker_group_info": selected.get("ranker_group_info") or {},
                 "meta_filter_info": selected.get("meta_filter_info"),
                 "symbol_filter_info": selected.get("symbol_filter_info"),
                 "calibration_info": selected.get("calibration_info") or {},
@@ -13789,6 +14373,27 @@ def run_walk_forward(rows, feature_names, args, kind, model_name):
                 memory_checkpoint("Walk-forward final regression fit complete", args)
             else:
                 final_selected["regression_model"] = None
+            if args.objective_mode == "economic_ranking":
+                final_ranker_context = fit_ranker_relevance_context(fit_final_train_rows, args)
+                final_rank_rows, final_rank_group, final_rank_info = ranker_grouped_rows(fit_final_train_rows, args)
+                x_rank_final = model_matrix(final_rank_rows, kind, args)
+                y_rank_final = ranker_relevance_labels(final_rank_rows, args, final_ranker_context)
+                rank_fit_args = argparse.Namespace(**vars(args))
+                rank_fit_args._ranker_train_group = list(final_rank_group or [])
+                rank_fit_args._ranker_validation_group = []
+                final_selected["ranker_model"] = make_model(kind, selected["params"], positive_weight, "economic_ranking")
+                fold_rank_fit = start_profile_stage("walkforward_fold_{}_economic_ranker_fit".format(fold_index))
+                final_selected["ranker_model"].fit(x_rank_final, y_rank_final, feature_names, args=rank_fit_args)
+                finish_profile_stage(fold_rank_fit, rows_processed=len(final_rank_rows))
+                final_selected["ranker_relevance_context"] = dict(final_ranker_context)
+                final_selected["ranker_group_info"] = {"final_train": dict(final_rank_info)}
+                del x_rank_final
+                del y_rank_final
+                del final_rank_rows
+                gc.collect()
+                memory_checkpoint("Walk-forward final economic ranker fit complete", args)
+            else:
+                final_selected["ranker_model"] = None
             del x_final
             gc.collect()
         fold_predict_token = start_profile_stage("walkforward_fold_{}_prediction".format(fold_index), model_name)
@@ -13806,7 +14411,7 @@ def run_walk_forward(rows, feature_names, args, kind, model_name):
             final_selected["threshold"],
             args.fee,
             args.slippage * args.test_slippage_multiplier,
-            compute_auc=args.objective_mode != "return_regression",
+                compute_auc=args.objective_mode not in ("return_regression", "economic_ranking"),
             initial_capital=args.initial_capital,
             max_position_fraction=args.max_position_fraction,
             max_volume_fraction=args.max_volume_fraction,
@@ -13930,8 +14535,10 @@ def run_walk_forward(rows, feature_names, args, kind, model_name):
         del bundle
         final_classification = final_selected.pop("classification_model", None)
         final_regression = final_selected.pop("regression_model", None)
+        final_ranker = final_selected.pop("ranker_model", None)
         del final_classification
         del final_regression
+        del final_ranker
         del final_selected
         del fit_final_train_rows
         del train_rows
@@ -14040,6 +14647,7 @@ def prediction_row_realized_trade_return(row):
 
 
 RANKING_SCORE_SOURCES = [
+    ("ranker_score", "ranker_score"),
     ("trade_score", "trade_score"),
     ("hybrid_score", "hybrid_score"),
     ("expected_value", "expected_value"),
@@ -14079,6 +14687,10 @@ RANKING_REPORT_COLUMNS = [
 
 def prediction_row_selected(row):
     return int(safe_float(row.get("predicted", 0), 0.0)) > 0
+
+
+def prediction_row_candidate(row):
+    return int(safe_float(row.get("raw_signal", 0), 0.0)) > 0
 
 
 def prediction_row_month(row):
@@ -14136,6 +14748,7 @@ def ranking_prediction_records(path, args):
             "trade_return": trade_return,
             "net_return": trade_return - total_cost,
             "predicted": prediction_row_selected(row),
+            "candidate": prediction_row_candidate(row),
             "analysis_position_size": position_size if position_size > 0.0 else fallback_position_size,
         })
     return records
@@ -14274,7 +14887,11 @@ def ranking_report_from_predictions(path, args):
             rows.append(bucket_row)
             source_decile_rows.append(bucket_row)
         predicted = [record for record in scored if record["predicted"]]
-        rows.append(ranking_bucket_stats(predicted, source_name, "selection", "executed_trades"))
+        executed_row = ranking_bucket_stats(predicted, source_name, "selection", "executed_trades")
+        rows.append(executed_row)
+        candidates = [record for record in scored if record["candidate"]]
+        candidate_row = ranking_bucket_stats(candidates, source_name, "selection", "raw_candidates")
+        rows.append(candidate_row)
 
         top_decile = source_decile_rows[0] if source_decile_rows else {}
         top_one = next((row for row in rows if row["score_source"] == source_name and row["bucket"] == "top_1pct"), {})
@@ -14284,9 +14901,28 @@ def ranking_report_from_predictions(path, args):
         summary["{}_top_decile_rows".format(prefix)] = top_decile.get("rows", 0)
         summary["{}_top_decile_top_symbol_share".format(prefix)] = top_decile.get("top_symbol_share", 0.0)
         summary["{}_top_decile_top_month_share".format(prefix)] = top_decile.get("top_month_share", 0.0)
+        summary["{}_top_decile_symbol_count".format(prefix)] = top_decile.get("symbol_count", 0)
+        summary["{}_top_decile_month_count".format(prefix)] = top_decile.get("month_count", 0)
+        summary["{}_top_decile_active_days".format(prefix)] = top_decile.get("active_day_count", 0)
         summary["{}_top_1pct_avg_net_return".format(prefix)] = top_one.get("avg_net_return_after_costs", 0.0)
         summary["{}_top_1pct_rows".format(prefix)] = top_one.get("rows", 0)
         summary["{}_net_return_monotonicity".format(prefix)] = ranking_monotonicity(source_decile_rows)
+        summary["{}_executed_rows".format(prefix)] = executed_row.get("rows", 0)
+        summary["{}_executed_avg_net_return".format(prefix)] = executed_row.get("avg_net_return_after_costs", 0.0)
+        summary["{}_executed_profit_factor".format(prefix)] = executed_row.get("profit_factor", 0.0)
+        summary["{}_executed_symbol_count".format(prefix)] = executed_row.get("symbol_count", 0)
+        summary["{}_executed_month_count".format(prefix)] = executed_row.get("month_count", 0)
+        summary["{}_executed_active_days".format(prefix)] = executed_row.get("active_day_count", 0)
+        summary["{}_executed_top_symbol_share".format(prefix)] = executed_row.get("top_symbol_share", 0.0)
+        summary["{}_executed_top_month_share".format(prefix)] = executed_row.get("top_month_share", 0.0)
+        summary["{}_candidate_rows".format(prefix)] = candidate_row.get("rows", 0)
+        summary["{}_candidate_avg_net_return".format(prefix)] = candidate_row.get("avg_net_return_after_costs", 0.0)
+        warnings = []
+        if int(top_one.get("rows", 0)) > 0 and float(top_one.get("avg_net_return_after_costs", 0.0)) < 0.0:
+            warnings.append("negative_top_1pct")
+        if ranking_monotonicity(source_decile_rows) < 1.0:
+            warnings.append("non_monotonic_deciles")
+        summary["{}_tail_warning".format(prefix)] = ";".join(warnings)
     return rows, summary
 
 
@@ -14908,7 +15544,11 @@ def write_experiment_report(path, summary):
         "## Conclusion",
         "- Overall accepted: `{}`".format(summary.get("accepted", 1)),
         "- Rejection reason: `{}`".format(summary.get("rejection_reason", "")),
+        "- Robustness gate status: `{}`".format(summary.get("robustness_gate_status", "")),
+        "- Profitable but fragile: `{}`".format(summary.get("profitable_but_fragile", 0)),
     ]
+    if int(summary.get("profitable_but_fragile", 0)):
+        conclusion_lines.append("- Final robustness note: `Profitable but fragile.`")
     if walk_forward_enabled:
         conclusion_lines.extend([
             "- Walk-forward acceptance passed: `{}`".format(summary.get("walkforward_acceptance_passed", 0)),
@@ -14966,6 +15606,17 @@ def write_experiment_report(path, summary):
         "- Trade-score net-return monotonicity: `{:.4f}`".format(summary.get("ranking_trade_score_net_return_monotonicity", 0.0)),
         "- Trade-score top decile symbol concentration: `{:.4f}`".format(summary.get("ranking_trade_score_top_decile_top_symbol_share", 0.0)),
         "- Trade-score top decile month concentration: `{:.4f}`".format(summary.get("ranking_trade_score_top_decile_top_month_share", 0.0)),
+        "- Ranker-score top decile net return after costs: `{:.6f}`".format(summary.get("ranking_ranker_score_top_decile_avg_net_return", 0.0)),
+        "- Ranker-score top 1% net return after costs: `{:.6f}`".format(summary.get("ranking_ranker_score_top_1pct_avg_net_return", 0.0)),
+        "- Ranker-score net-return monotonicity: `{:.4f}`".format(summary.get("ranking_ranker_score_net_return_monotonicity", 0.0)),
+        "- Ranker-score tail warning: `{}`".format(summary.get("ranking_ranker_score_tail_warning", "")),
+        "",
+        "## Robustness Gates",
+        "- Gate mode: `{}`".format(summary.get("robustness_gates", "")),
+        "- Gate action: `{}`".format(summary.get("robustness_gate_action", "")),
+        "- Gate status: `{}`".format(summary.get("robustness_gate_status", "")),
+        "- Failed checks: `{}`".format(summary.get("robustness_failed_checks", "")),
+        "- Strength label: `{}`".format(summary.get("robustness_strength", "")),
         "",
         "## Regime Summary",
         "- Best regime by avg trade return: `{}`".format(summary.get("best_regime_by_avg_trade_return", "")),
@@ -15570,6 +16221,17 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
             summary[key] = json_safe(value)
     summary.update(walkforward_summary)
     summary.update(overall_acceptance)
+    robust_summary = robustness_summary(summary, args)
+    summary.update(robust_summary)
+    if robust_summary["profitable_but_fragile"]:
+        summary["strategy_strength"] = "profitable_but_fragile"
+        if not summary.get("rejection_reason"):
+            summary["rejection_reason"] = "Profitable but fragile."
+    if robust_summary["robustness_gate_failed"] and getattr(args, "robustness_gate_action", "warn") == "reject":
+        summary["accepted"] = 0
+        summary["failed_acceptance_checks"] = robust_summary["robustness_failed_checks"]
+        summary["rejection_reason"] = robust_summary["robustness_failed_checks"]
+        summary["strategy_strength"] = "robustness_rejected"
     def write_one(output_path):
         with open(output_path, "w", encoding="utf-8") as handle:
             json.dump(summary, handle, indent=2, sort_keys=True)
@@ -15584,6 +16246,27 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
         "model_kind",
         "objective_mode",
         "trade_score",
+        "trade_selection",
+        "top_k_per_minute",
+        "top_percent_per_period",
+        "ranker_objective",
+        "ranker_min_score",
+        "ranker_group_minutes",
+        "ranker_min_group_size",
+        "ranker_relevance_q1",
+        "ranker_relevance_q2",
+        "ranker_relevance_q3",
+        "ranker_adverse_penalty",
+        "ranker_relevance_mode",
+        "ranker_utility_rows",
+        "ranker_positive_utility_rows",
+        "ranker_weak_positive_threshold",
+        "ranker_useful_positive_threshold",
+        "ranker_strong_positive_threshold",
+        "ranker_train_group_count",
+        "ranker_validation_group_count",
+        "ranker_train_average_group_size",
+        "ranker_validation_average_group_size",
         "selected_score_name",
         "selected_score_threshold",
         "selected_threshold",
@@ -15659,6 +16342,13 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
         "failed_acceptance_checks",
         "rejection_reason",
         "strategy_strength",
+        "robustness_gates",
+        "robustness_gate_action",
+        "robustness_gate_status",
+        "robustness_gate_failed",
+        "robustness_failed_checks",
+        "profitable_but_fragile",
+        "robustness_strength",
         "walkforward_acceptance_passed",
         "walkforward_gate_status",
         "walkforward_gate_failed",
@@ -15674,6 +16364,25 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
         "ranking_trade_score_net_return_monotonicity",
         "ranking_trade_score_top_decile_top_symbol_share",
         "ranking_trade_score_top_decile_top_month_share",
+        "ranking_trade_score_executed_profit_factor",
+        "ranking_trade_score_executed_symbol_count",
+        "ranking_trade_score_executed_month_count",
+        "ranking_trade_score_executed_active_days",
+        "ranking_trade_score_executed_top_symbol_share",
+        "ranking_trade_score_executed_top_month_share",
+        "ranking_ranker_score_top_decile_avg_net_return",
+        "ranking_ranker_score_top_1pct_avg_net_return",
+        "ranking_ranker_score_top_decile_label_rate",
+        "ranking_ranker_score_net_return_monotonicity",
+        "ranking_ranker_score_top_decile_top_symbol_share",
+        "ranking_ranker_score_top_decile_top_month_share",
+        "ranking_ranker_score_executed_profit_factor",
+        "ranking_ranker_score_executed_symbol_count",
+        "ranking_ranker_score_executed_month_count",
+        "ranking_ranker_score_executed_active_days",
+        "ranking_ranker_score_executed_top_symbol_share",
+        "ranking_ranker_score_executed_top_month_share",
+        "ranking_ranker_score_tail_warning",
         "best_regime_by_avg_trade_return",
         "worst_regime_by_avg_trade_return",
         "best_regime_by_profit",
@@ -15721,6 +16430,27 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
         "model_kind": kind,
         "objective_mode": args.objective_mode,
         "trade_score": score_name_for_args(args),
+        "trade_selection": getattr(args, "trade_selection", ""),
+        "top_k_per_minute": getattr(args, "top_k_per_minute", 0),
+        "top_percent_per_period": getattr(args, "top_percent_per_period", 0.0),
+        "ranker_objective": fixed_record.get("ranker_objective", getattr(args, "ranker_objective", "rank_xendcg") if args.objective_mode == "economic_ranking" else "none"),
+        "ranker_min_score": fixed_record.get("ranker_min_score", getattr(args, "ranker_min_score", 0.0)),
+        "ranker_group_minutes": fixed_record.get("ranker_group_minutes", getattr(args, "ranker_group_minutes", 1)),
+        "ranker_min_group_size": fixed_record.get("ranker_min_group_size", getattr(args, "ranker_min_group_size", 2)),
+        "ranker_relevance_q1": fixed_record.get("ranker_relevance_q1", getattr(args, "ranker_relevance_q1", 0.50)),
+        "ranker_relevance_q2": fixed_record.get("ranker_relevance_q2", getattr(args, "ranker_relevance_q2", 0.75)),
+        "ranker_relevance_q3": fixed_record.get("ranker_relevance_q3", getattr(args, "ranker_relevance_q3", 0.90)),
+        "ranker_adverse_penalty": fixed_record.get("ranker_adverse_penalty", getattr(args, "ranker_adverse_penalty", 0.0)),
+        "ranker_relevance_mode": fixed_record.get("ranker_relevance_mode", "none"),
+        "ranker_utility_rows": fixed_record.get("ranker_utility_rows", 0),
+        "ranker_positive_utility_rows": fixed_record.get("ranker_positive_utility_rows", 0),
+        "ranker_weak_positive_threshold": fixed_record.get("ranker_weak_positive_threshold", 0.0),
+        "ranker_useful_positive_threshold": fixed_record.get("ranker_useful_positive_threshold", 0.0),
+        "ranker_strong_positive_threshold": fixed_record.get("ranker_strong_positive_threshold", 0.0),
+        "ranker_train_group_count": fixed_record.get("ranker_train_group_count", 0),
+        "ranker_validation_group_count": fixed_record.get("ranker_validation_group_count", 0),
+        "ranker_train_average_group_size": fixed_record.get("ranker_train_average_group_size", 0.0),
+        "ranker_validation_average_group_size": fixed_record.get("ranker_validation_average_group_size", 0.0),
         "selected_score_name": fixed_record.get("selected_score_name", selected_score_name_for_mode(args)),
         "selected_score_threshold": fixed_record.get("selected_score_threshold", fixed_record.get("selected_threshold", 0.0)),
         "selected_threshold": fixed_record.get("selected_threshold", 0.0),
@@ -15792,10 +16522,17 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
         "mean_selected_base_objective_score": aggregate.get("mean_selected_base_objective_score", 0.0) if aggregate else 0.0,
         "mean_selected_penalized_objective_score": aggregate.get("mean_selected_penalized_objective_score", 0.0) if aggregate else 0.0,
         "acceptance_tier": overall_acceptance.get("acceptance_tier", "none"),
-        "accepted": overall_acceptance.get("accepted", 1),
-        "failed_acceptance_checks": overall_acceptance.get("failed_acceptance_checks", ""),
-        "rejection_reason": overall_acceptance.get("rejection_reason", ""),
-        "strategy_strength": overall_acceptance.get("strategy_strength", "not_checked"),
+        "accepted": summary.get("accepted", 1),
+        "failed_acceptance_checks": summary.get("failed_acceptance_checks", ""),
+        "rejection_reason": summary.get("rejection_reason", ""),
+        "strategy_strength": summary.get("strategy_strength", "not_checked"),
+        "robustness_gates": summary.get("robustness_gates", "warn"),
+        "robustness_gate_action": summary.get("robustness_gate_action", "warn"),
+        "robustness_gate_status": summary.get("robustness_gate_status", ""),
+        "robustness_gate_failed": summary.get("robustness_gate_failed", 0),
+        "robustness_failed_checks": summary.get("robustness_failed_checks", ""),
+        "profitable_but_fragile": summary.get("profitable_but_fragile", 0),
+        "robustness_strength": summary.get("robustness_strength", ""),
         "walkforward_acceptance_passed": walkforward_summary.get("walkforward_acceptance_passed", 0),
         "walkforward_gate_status": walkforward_summary.get("walkforward_gate_status", ""),
         "walkforward_gate_failed": walkforward_summary.get("walkforward_gate_failed", 0),
@@ -15811,6 +16548,25 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
         "ranking_trade_score_net_return_monotonicity": ranking_summary.get("ranking_trade_score_net_return_monotonicity", 0.0),
         "ranking_trade_score_top_decile_top_symbol_share": ranking_summary.get("ranking_trade_score_top_decile_top_symbol_share", 0.0),
         "ranking_trade_score_top_decile_top_month_share": ranking_summary.get("ranking_trade_score_top_decile_top_month_share", 0.0),
+        "ranking_trade_score_executed_profit_factor": ranking_summary.get("ranking_trade_score_executed_profit_factor", 0.0),
+        "ranking_trade_score_executed_symbol_count": ranking_summary.get("ranking_trade_score_executed_symbol_count", 0),
+        "ranking_trade_score_executed_month_count": ranking_summary.get("ranking_trade_score_executed_month_count", 0),
+        "ranking_trade_score_executed_active_days": ranking_summary.get("ranking_trade_score_executed_active_days", 0),
+        "ranking_trade_score_executed_top_symbol_share": ranking_summary.get("ranking_trade_score_executed_top_symbol_share", 0.0),
+        "ranking_trade_score_executed_top_month_share": ranking_summary.get("ranking_trade_score_executed_top_month_share", 0.0),
+        "ranking_ranker_score_top_decile_avg_net_return": ranking_summary.get("ranking_ranker_score_top_decile_avg_net_return", 0.0),
+        "ranking_ranker_score_top_1pct_avg_net_return": ranking_summary.get("ranking_ranker_score_top_1pct_avg_net_return", 0.0),
+        "ranking_ranker_score_top_decile_label_rate": ranking_summary.get("ranking_ranker_score_top_decile_label_rate", 0.0),
+        "ranking_ranker_score_net_return_monotonicity": ranking_summary.get("ranking_ranker_score_net_return_monotonicity", 0.0),
+        "ranking_ranker_score_top_decile_top_symbol_share": ranking_summary.get("ranking_ranker_score_top_decile_top_symbol_share", 0.0),
+        "ranking_ranker_score_top_decile_top_month_share": ranking_summary.get("ranking_ranker_score_top_decile_top_month_share", 0.0),
+        "ranking_ranker_score_executed_profit_factor": ranking_summary.get("ranking_ranker_score_executed_profit_factor", 0.0),
+        "ranking_ranker_score_executed_symbol_count": ranking_summary.get("ranking_ranker_score_executed_symbol_count", 0),
+        "ranking_ranker_score_executed_month_count": ranking_summary.get("ranking_ranker_score_executed_month_count", 0),
+        "ranking_ranker_score_executed_active_days": ranking_summary.get("ranking_ranker_score_executed_active_days", 0),
+        "ranking_ranker_score_executed_top_symbol_share": ranking_summary.get("ranking_ranker_score_executed_top_symbol_share", 0.0),
+        "ranking_ranker_score_executed_top_month_share": ranking_summary.get("ranking_ranker_score_executed_top_month_share", 0.0),
+        "ranking_ranker_score_tail_warning": ranking_summary.get("ranking_ranker_score_tail_warning", ""),
         "best_regime_by_avg_trade_return": regime_summary.get("best_regime_by_avg_trade_return", ""),
         "worst_regime_by_avg_trade_return": regime_summary.get("worst_regime_by_avg_trade_return", ""),
         "best_regime_by_profit": regime_summary.get("best_regime_by_profit", ""),
@@ -15881,7 +16637,7 @@ def build_parser():
     parser.add_argument("--input", default="kline_growth_training.csv")
     parser.add_argument("--model", choices=["auto", "lightgbm", "internal"], default="auto")
     parser.add_argument("--split-mode", choices=["fixed", "ratio"], default="fixed")
-    parser.add_argument("--objective-mode", choices=["classification", "return_regression", "hybrid"], default="classification")
+    parser.add_argument("--objective-mode", choices=["classification", "return_regression", "hybrid", "economic_ranking"], default="classification")
     parser.add_argument("--train-months", type=int, default=6)
     parser.add_argument("--validation-months", type=int, default=1)
     parser.add_argument("--test-months", type=int, default=1)
@@ -15931,9 +16687,10 @@ def build_parser():
     parser.add_argument("--dynamic-exit-price-source", choices=["auto", "existing_rows", "raw_klines", "disabled"], default="auto")
     parser.add_argument("--raw-kline-dir", default="")
     parser.add_argument("--position-sizing-mode", choices=["fixed_fraction", "confidence_weighted", "volatility_adjusted", "ev_weighted"], default="fixed_fraction")
-    parser.add_argument("--trade-selection", choices=["threshold", "topk_ev", "topk_score"], default="threshold")
-    parser.add_argument("--trade-score", choices=["auto", "probability", "ev", "predicted_return", "hybrid"], default="auto")
+    parser.add_argument("--trade-selection", choices=["threshold", "topk_ev", "topk_score", "top_percent_score", "top_utility"], default="threshold")
+    parser.add_argument("--trade-score", choices=["auto", "probability", "ev", "predicted_return", "hybrid", "ranker_score", "economic_rank_score"], default="auto")
     parser.add_argument("--top-k-per-minute", type=int, default=3)
+    parser.add_argument("--top-percent-per-period", type=float, default=0.0)
     parser.add_argument("--top-k-per-symbol-minute", type=int, default=0)
     parser.add_argument("--prefer-unique-symbols", action="store_true")
     parser.add_argument("--symbol-reentry-cooldown-minutes", type=int, default=0)
@@ -15946,6 +16703,15 @@ def build_parser():
     parser.add_argument("--ev-payoff-min-positive-rows", type=int, default=25)
     parser.add_argument("--ev-payoff-min-negative-rows", type=int, default=25)
     parser.add_argument("--min-predicted-net-return", type=float, default=0.0)
+    parser.add_argument("--ranker-objective", choices=["rank_xendcg", "lambdarank"], default="rank_xendcg")
+    parser.add_argument("--ranker-min-score", type=float, default=-1000000000.0)
+    parser.add_argument("--ranker-threshold-search", action="store_true")
+    parser.add_argument("--ranker-group-minutes", type=int, default=1)
+    parser.add_argument("--ranker-min-group-size", type=int, default=2)
+    parser.add_argument("--ranker-relevance-q1", type=float, default=0.50)
+    parser.add_argument("--ranker-relevance-q2", type=float, default=0.75)
+    parser.add_argument("--ranker-relevance-q3", type=float, default=0.90)
+    parser.add_argument("--ranker-adverse-penalty", type=float, default=0.0)
     parser.add_argument("--hybrid-min-score", type=float, default=0.0)
     parser.add_argument("--hybrid-min-score-calibration-aware", action="store_true")
     parser.add_argument("--hybrid-min-score-calibration-reference-scale", type=float, default=0.20)
@@ -16092,6 +16858,19 @@ def build_parser():
     parser.add_argument("--min-mean-fold-return", type=float, default=0.0)
     parser.add_argument("--max-worst-fold-drawdown", type=float, default=1.0)
     parser.add_argument("--acceptance-tier", choices=["none", "exploration", "research", "strong"], default="none")
+    parser.add_argument("--robustness-gates", choices=["none", "warn"], default="warn")
+    parser.add_argument("--robustness-gate-action", choices=["warn", "reject"], default="warn")
+    parser.add_argument("--robust-min-trades", type=int, default=10)
+    parser.add_argument("--robust-min-active-days", type=int, default=3)
+    parser.add_argument("--robust-min-active-symbols", type=int, default=3)
+    parser.add_argument("--robust-min-active-months", type=int, default=2)
+    parser.add_argument("--robust-max-top-symbol-share", type=float, default=0.70)
+    parser.add_argument("--robust-max-top-month-share", type=float, default=0.70)
+    parser.add_argument("--robust-min-profit-factor", type=float, default=1.05)
+    parser.add_argument("--robust-min-tail-monotonicity", type=float, default=0.60)
+    parser.add_argument("--robust-require-positive-top-1pct", action="store_true")
+    parser.add_argument("--robust-require-positive-top-decile", action="store_true")
+    parser.add_argument("--robust-require-positive-total-profit", action="store_true")
     parser.add_argument("--prediction-output-mode", choices=["all", "trades", "none"], default="trades")
     parser.add_argument("--predictions-out", default="kline_growth_predictions_gbdt.csv")
     parser.add_argument("--metrics-out", default="kline_growth_metrics_gbdt.csv")
@@ -16308,6 +17087,26 @@ def main(argv):
         raise ValueError("--trade-score predicted_return requires --objective-mode return_regression or hybrid")
     if args.trade_score == "hybrid" and args.objective_mode != "hybrid":
         raise ValueError("--trade-score hybrid requires --objective-mode hybrid")
+    if args.trade_score in ("ranker_score", "economic_rank_score") and args.objective_mode != "economic_ranking":
+        raise ValueError("--trade-score ranker_score requires --objective-mode economic_ranking")
+    if args.objective_mode == "economic_ranking" and args.trade_selection == "topk_ev":
+        raise ValueError("--trade-selection topk_ev is classification-specific; use topk_score, top_percent_score, or top_utility for economic_ranking")
+    if args.top_percent_per_period < 0.0 or args.top_percent_per_period > 1.0:
+        raise ValueError("--top-percent-per-period must be between 0 and 1")
+    if args.ranker_group_minutes < 1:
+        raise ValueError("--ranker-group-minutes must be at least 1")
+    if args.ranker_min_group_size < 1:
+        raise ValueError("--ranker-min-group-size must be at least 1")
+    if not 0.0 <= args.ranker_relevance_q1 <= 1.0:
+        raise ValueError("--ranker-relevance-q1 must be between 0 and 1")
+    if not 0.0 <= args.ranker_relevance_q2 <= 1.0:
+        raise ValueError("--ranker-relevance-q2 must be between 0 and 1")
+    if not 0.0 <= args.ranker_relevance_q3 <= 1.0:
+        raise ValueError("--ranker-relevance-q3 must be between 0 and 1")
+    if not args.ranker_relevance_q1 <= args.ranker_relevance_q2 <= args.ranker_relevance_q3:
+        raise ValueError("--ranker-relevance quantiles must be nondecreasing")
+    if args.ranker_adverse_penalty < 0.0:
+        raise ValueError("--ranker-adverse-penalty cannot be negative")
     if args.max_bin < 2:
         raise ValueError("--max-bin must be at least 2")
     if args.subsample_for_bin <= 0:
@@ -16352,6 +17151,22 @@ def main(argv):
         raise ValueError("--walk-forward-start-fold cannot be negative")
     if args.walk_forward_max_folds < 0:
         raise ValueError("--walk-forward-max-folds cannot be negative")
+    if args.robust_min_trades < 0:
+        raise ValueError("--robust-min-trades cannot be negative")
+    if args.robust_min_active_days < 0:
+        raise ValueError("--robust-min-active-days cannot be negative")
+    if args.robust_min_active_symbols < 0:
+        raise ValueError("--robust-min-active-symbols cannot be negative")
+    if args.robust_min_active_months < 0:
+        raise ValueError("--robust-min-active-months cannot be negative")
+    if not 0.0 <= args.robust_max_top_symbol_share <= 1.0:
+        raise ValueError("--robust-max-top-symbol-share must be between 0 and 1")
+    if not 0.0 <= args.robust_max_top_month_share <= 1.0:
+        raise ValueError("--robust-max-top-month-share must be between 0 and 1")
+    if args.robust_min_profit_factor < 0.0:
+        raise ValueError("--robust-min-profit-factor cannot be negative")
+    if not 0.0 <= args.robust_min_tail_monotonicity <= 1.0:
+        raise ValueError("--robust-min-tail-monotonicity must be between 0 and 1")
     if args.meta_filter_max_rows < 0:
         raise ValueError("--meta-filter-max-rows cannot be negative")
     if args.min_symbol_validation_trades < 0:
