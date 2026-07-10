@@ -1,0 +1,2 @@
+probability_source,probability_bucket,rows,trades_if_thresholded,mean_predicted_probability,actual_positive_rate,avg_forward_return,avg_trade_return,total_trade_return,skipped_reason
+,,,,,,,,,prediction_output_missing

@@ -4,13 +4,19 @@ import gzip
 import io
 import json
 import os
+import sys
 import tempfile
 import unittest
 import warnings
 from unittest import mock
 from types import SimpleNamespace
 
+TEST_DIR = os.path.dirname(os.path.abspath(__file__))
+if TEST_DIR not in sys.path:
+    sys.path.insert(0, TEST_DIR)
+
 import gbdt_pipeline as pipeline
+import merge_shard_dataset_cache as merge_shard_dataset_cache
 import run_experiments
 
 
@@ -28,6 +34,41 @@ HEADER = [
     "log_quote_volume",
     "ret_1m",
 ]
+
+
+def write_text_if_changed(path, content):
+    if os.path.exists(path):
+        with open(path, encoding="utf-8", newline="") as handle:
+            if handle.read() == content:
+                return
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        handle.write(content)
+
+
+def write_gzip_text_if_changed(path, content):
+    if os.path.exists(path):
+        with gzip.open(path, "rt", encoding="utf-8", newline="") as handle:
+            if handle.read() == content:
+                return
+    with gzip.open(path, "wt", encoding="utf-8", newline="") as handle:
+        handle.write(content)
+
+
+def shard_manifest_content(dataset_manifest, symbol, month, row_count, csv_path=None, compression="none"):
+    shard_manifest = dict(dataset_manifest)
+    shard_manifest.pop("shards", None)
+    shard_manifest.update({
+        "version": 1,
+        "kind": "symbol_month_shard",
+        "symbol": symbol,
+        "month": month,
+        "row_count": int(row_count),
+    })
+    if csv_path is not None:
+        shard_manifest["csv_path"] = csv_path
+    if compression:
+        shard_manifest["compression"] = compression
+    return json.dumps(shard_manifest, indent=2, sort_keys=True)
 
 
 def write_training_manifest(path, label_mode="target_stop", growth_threshold=0.05,
@@ -105,8 +146,11 @@ def write_sharded_dataset(dataset_dir, shards, compression="none"):
         }
         for shard in shards
     ])
-    with open(os.path.join(dataset_dir, "kline_growth_dataset.meta.json"), "w", encoding="utf-8") as handle:
-        json.dump(manifest, handle, indent=2, sort_keys=True)
+    dataset_manifest_content = json.dumps(manifest, indent=2, sort_keys=True)
+    write_text_if_changed(
+        os.path.join(dataset_dir, "kline_growth_dataset.meta.json"),
+        dataset_manifest_content,
+    )
     for shard in shards:
         symbol = shard["symbol"]
         month = shard["month"]
@@ -115,30 +159,27 @@ def write_sharded_dataset(dataset_dir, shards, compression="none"):
         os.makedirs(symbol_dir, exist_ok=True)
         csv_name = "{}{}".format(month, ".csv.gz" if compression == "gzip" else ".csv")
         csv_path = os.path.join(symbol_dir, csv_name)
+        csv_buffer = io.StringIO()
+        writer = csv.writer(csv_buffer)
+        writer.writerow(HEADER)
+        for item in rows:
+            writer.writerow(item)
+        csv_content = csv_buffer.getvalue()
         if compression == "gzip":
-            with gzip.open(csv_path, "wt", newline="") as handle:
-                writer = csv.writer(handle)
-                writer.writerow(HEADER)
-                for item in rows:
-                    writer.writerow(item)
+            write_gzip_text_if_changed(csv_path, csv_content)
         else:
-            with open(csv_path, "w", newline="") as handle:
-                writer = csv.writer(handle)
-                writer.writerow(HEADER)
-                for item in rows:
-                    writer.writerow(item)
-        shard_manifest = dict(manifest)
-        shard_manifest.update({
-            "version": 1,
-            "kind": "symbol_month_shard",
-            "symbol": symbol,
-            "month": month,
-            "csv_path": "shards/{}/{}".format(symbol, csv_name),
-            "compression": compression,
-            "row_count": len(rows),
-        })
-        with open(os.path.join(symbol_dir, "{}.meta.json".format(month)), "w", encoding="utf-8") as handle:
-            json.dump(shard_manifest, handle, indent=2, sort_keys=True)
+            write_text_if_changed(csv_path, csv_content)
+        write_text_if_changed(
+            os.path.join(symbol_dir, "{}.meta.json".format(month)),
+            shard_manifest_content(
+                manifest,
+                symbol,
+                month,
+                len(rows),
+                csv_path="shards/{}/{}".format(symbol, csv_name),
+                compression=compression,
+            ),
+        )
 
 
 def row(open_time, label=0, quote_volume=1000000.0, trade_return=0.01):
@@ -170,6 +211,25 @@ def symbol_row(symbol, open_time, label=0, quote_volume=1000000.0, trade_return=
         min(0.0, trade_return),
         quote_volume,
         [0.0, 0.0],
+    )
+
+
+def future_path_row(symbol, open_time, future_returns, label=1, quote_volume=1000000.0, trade_return=None):
+    realized_trade_return = float(future_returns[-1]) if trade_return is None else float(trade_return)
+    return SimpleNamespace(
+        symbol=symbol,
+        month="2020-01",
+        month_index=0,
+        open_time=open_time,
+        label=label,
+        forward_return=realized_trade_return,
+        trade_return=realized_trade_return,
+        max_future_high_return=max(max(float(value) for value in future_returns), 0.0),
+        max_future_low_return=min(min(float(value) for value in future_returns), 0.0),
+        quote_volume=quote_volume,
+        features=[0.0, 0.0],
+        feature_lookup={},
+        future_candle_returns=[float(value) for value in future_returns],
     )
 
 
@@ -383,6 +443,83 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(rows.table.symbols, ["AAAUSDT"])
         rows.cleanup()
 
+    def test_discover_sharded_dataset_shards_supports_external_meta_path_inventory(self):
+        source_dir = os.path.join(self.temp.name, "source_dataset")
+        write_sharded_dataset(source_dir, [
+            {
+                "symbol": "AAAUSDT",
+                "month": "2020-01",
+                "rows": [
+                    self.shard_row("AAAUSDT", "2020-01", 0, 1600000000000, 1, 0.02, 100000.0),
+                ],
+            },
+        ])
+        destination_dir = os.path.join(self.temp.name, "destination_dataset")
+        os.makedirs(os.path.join(destination_dir, "shards"), exist_ok=True)
+        with open(os.path.join(source_dir, "kline_growth_dataset.meta.json"), encoding="utf-8") as handle:
+            source_manifest = json.load(handle)
+        source_csv = os.path.join(source_dir, "shards", "AAAUSDT", "2020-01.csv")
+        source_meta = os.path.join(source_dir, "shards", "AAAUSDT", "2020-01.meta.json")
+        destination_manifest = dict(source_manifest)
+        destination_manifest["shards"] = [{
+            "symbol": "AAAUSDT",
+            "month": "2020-01",
+            "csv_path": os.path.relpath(source_csv, destination_dir),
+            "meta_path": os.path.relpath(source_meta, destination_dir),
+            "compression": "none",
+            "row_count": 1,
+        }]
+        with open(os.path.join(destination_dir, "kline_growth_dataset.meta.json"), "w", encoding="utf-8") as handle:
+            json.dump(destination_manifest, handle, indent=2, sort_keys=True)
+        shards = pipeline.discover_sharded_dataset_shards(destination_dir, destination_manifest)
+        self.assertEqual(len(shards), 1)
+        self.assertEqual(os.path.abspath(source_csv), shards[0]["csv_path"])
+        self.assertEqual(os.path.abspath(source_meta), shards[0]["meta_path"])
+
+    @unittest.skipUnless(pipeline.np is not None, "requires numpy-backed cache validation")
+    def test_cache_manifest_matches_allows_equivalent_manifest_signature_with_different_manifest_path(self):
+        csv_path = os.path.join(self.temp.name, "synthetic.csv")
+        with open(csv_path, "w", encoding="utf-8") as handle:
+            handle.write("symbol,month,month_index,open_time,label,forward_return,trade_return,max_future_high_return,max_future_low_return,quote_volume,log_quote_volume,ret_1m\n")
+        manifest_path_one = os.path.join(self.temp.name, "first.meta.json")
+        manifest_path_two = os.path.join(self.temp.name, "second.meta.json")
+        manifest = {"version": 1, "label_mode": "target_stop", "target_exit_mode": "first_decline"}
+        for path in (manifest_path_one, manifest_path_two):
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(manifest, handle)
+        paths = pipeline.cache_paths(csv_path, self.temp.name, pipeline.np.float32)
+        os.makedirs(os.path.dirname(paths["features"]), exist_ok=True)
+        with open(paths["features"], "wb") as handle:
+            handle.write(b"")
+        for metadata_path in paths["metadata_arrays"].values():
+            with open(metadata_path, "wb") as handle:
+                handle.write(b"")
+        info = pipeline.source_csv_info(
+            csv_path,
+            manifest,
+            manifest_path_one,
+            manifest_signature_override="same-signature",
+        )
+        cache_manifest = dict(info)
+        cache_manifest.update({
+            "version": pipeline.CACHE_VERSION,
+            "feature_dtype": "float32",
+            "feature_columns": ["ret_1m"],
+            "row_count": 0,
+            "training_manifest_path": manifest_path_two,
+        })
+        self.assertTrue(
+            pipeline.cache_manifest_matches(
+                cache_manifest,
+                csv_path,
+                pipeline.np.float32,
+                paths,
+                manifest,
+                manifest_path_one,
+                manifest_signature_override="same-signature",
+            )
+        )
+
     @unittest.skipUnless(pipeline.np is not None, "requires numpy-backed compact cache")
     def test_sharded_dataset_cache_only_hits_after_aggregate_build(self):
         dataset_dir = os.path.join(self.temp.name, "dataset")
@@ -401,6 +538,94 @@ class PipelineTests(unittest.TestCase):
         rows, _, _ = pipeline.load_rows(dataset_dir, "memmap32", cache_dir=cache_dir, cache_only=True)
         self.assertEqual(pipeline.CACHE_LOAD_INFO["status"], "hit")
         self.assertTrue(pipeline.CACHE_LOAD_INFO.get("sharded_dataset"))
+        rows.cleanup()
+
+    @unittest.skipUnless(pipeline.np is not None, "requires numpy-backed compact cache")
+    def test_sharded_dataset_cache_hit_survives_missing_external_source_shards(self):
+        source_dir = os.path.join(self.temp.name, "source_dataset")
+        write_sharded_dataset(source_dir, [
+            {
+                "symbol": "AAAUSDT",
+                "month": "2020-01",
+                "rows": [
+                    self.shard_row("AAAUSDT", "2020-01", 0, 1600000000000, 1, 0.02, 100000.0),
+                ],
+            },
+        ])
+        destination_dir = os.path.join(self.temp.name, "destination_dataset")
+        os.makedirs(os.path.join(destination_dir, "shards"), exist_ok=True)
+        with open(os.path.join(source_dir, "kline_growth_dataset.meta.json"), encoding="utf-8") as handle:
+            source_manifest = json.load(handle)
+        source_csv = os.path.join(source_dir, "shards", "AAAUSDT", "2020-01.csv")
+        source_meta = os.path.join(source_dir, "shards", "AAAUSDT", "2020-01.meta.json")
+        destination_manifest = dict(source_manifest)
+        destination_manifest["shards"] = [{
+            "symbol": "AAAUSDT",
+            "month": "2020-01",
+            "csv_path": os.path.relpath(source_csv, destination_dir),
+            "meta_path": os.path.relpath(source_meta, destination_dir),
+            "compression": "none",
+            "row_count": 1,
+        }]
+        with open(os.path.join(destination_dir, "kline_growth_dataset.meta.json"), "w", encoding="utf-8") as handle:
+            json.dump(destination_manifest, handle, indent=2, sort_keys=True)
+
+        cache_dir = os.path.join(self.temp.name, "cache")
+        rows, _, _ = pipeline.load_rows(destination_dir, "memmap32", cache_dir=cache_dir)
+        rows.cleanup()
+
+        os.remove(source_meta)
+        os.remove(source_csv)
+
+        rows, _, _ = pipeline.load_rows(destination_dir, "memmap32", cache_dir=cache_dir, cache_only=True)
+        self.assertEqual(pipeline.CACHE_LOAD_INFO["status"], "hit")
+        self.assertTrue(pipeline.CACHE_LOAD_INFO.get("sharded_dataset"))
+        self.assertEqual(len(rows), 1)
+        rows.cleanup()
+
+    @unittest.skipUnless(pipeline.np is not None, "requires numpy-backed compact cache")
+    def test_sharded_dataset_cache_hit_survives_dataset_path_change_with_same_basename(self):
+        source_root = os.path.join(self.temp.name, "source_root")
+        destination_root = os.path.join(self.temp.name, "destination_root")
+        source_dir = os.path.join(source_root, "shard_dataset_recent")
+        destination_dir = os.path.join(destination_root, "shard_dataset_recent")
+        write_sharded_dataset(source_dir, [
+            {
+                "symbol": "AAAUSDT",
+                "month": "2020-01",
+                "rows": [
+                    self.shard_row("AAAUSDT", "2020-01", 0, 1600000000000, 1, 0.02, 100000.0),
+                ],
+            },
+        ])
+        os.makedirs(os.path.join(destination_dir, "shards"), exist_ok=True)
+        with open(os.path.join(source_dir, "kline_growth_dataset.meta.json"), encoding="utf-8") as handle:
+            source_manifest = json.load(handle)
+        source_csv = os.path.join(source_dir, "shards", "AAAUSDT", "2020-01.csv")
+        source_meta = os.path.join(source_dir, "shards", "AAAUSDT", "2020-01.meta.json")
+        destination_manifest = dict(source_manifest)
+        destination_manifest["shards"] = [{
+            "symbol": "AAAUSDT",
+            "month": "2020-01",
+            "csv_path": os.path.relpath(source_csv, destination_dir),
+            "meta_path": os.path.relpath(source_meta, destination_dir),
+            "compression": "none",
+            "row_count": 1,
+        }]
+        with open(os.path.join(destination_dir, "kline_growth_dataset.meta.json"), "w", encoding="utf-8") as handle:
+            json.dump(destination_manifest, handle, indent=2, sort_keys=True)
+
+        cache_dir = os.path.join(self.temp.name, "cache")
+        rows, _, _ = pipeline.load_rows(source_dir, "memmap32", cache_dir=cache_dir)
+        rows.cleanup()
+
+        os.remove(source_meta)
+        os.remove(source_csv)
+
+        rows, _, _ = pipeline.load_rows(destination_dir, "memmap32", cache_dir=cache_dir, cache_only=True)
+        self.assertEqual(pipeline.CACHE_LOAD_INFO["status"], "hit")
+        self.assertTrue(pipeline.CACHE_LOAD_INFO.get("sharded_dataset"))
+        self.assertEqual(len(rows), 1)
         rows.cleanup()
 
     @unittest.skipUnless(pipeline.np is not None, "requires numpy-backed compact cache")
@@ -442,6 +667,63 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(observed["2020-03"], {2})
         rows.cleanup()
 
+    def test_merge_shard_dataset_cache_deduplicates_identical_symbol_month_shards(self):
+        dataset_a = os.path.join(self.temp.name, "dataset_a")
+        dataset_b = os.path.join(self.temp.name, "dataset_b")
+        output_dir = os.path.join(self.temp.name, "merged_dataset")
+        shard_rows = [
+            self.shard_row("AAAUSDT", "2020-01", 0, 1600000000000, 1, 0.02, 100000.0),
+            self.shard_row("AAAUSDT", "2020-01", 0, 1600000060000, 0, -0.01, 100500.0),
+        ]
+        for dataset_dir in (dataset_a, dataset_b):
+            write_sharded_dataset(dataset_dir, [
+                {
+                    "symbol": "AAAUSDT",
+                    "month": "2020-01",
+                    "rows": shard_rows,
+                },
+            ])
+
+        result = merge_shard_dataset_cache.create_combined_dataset(
+            output_dir,
+            [dataset_a, dataset_b],
+        )
+
+        self.assertEqual(result["merged_shard_count"], 1)
+        self.assertEqual(result["source_added_counts"], [(dataset_a, 1), (dataset_b, 0)])
+        with open(os.path.join(output_dir, "kline_growth_dataset.meta.json"), encoding="utf-8") as handle:
+            merged_manifest = json.load(handle)
+        self.assertEqual(len(merged_manifest["shards"]), 1)
+
+    def test_merge_shard_dataset_cache_rejects_conflicting_duplicate_symbol_month_shards(self):
+        dataset_a = os.path.join(self.temp.name, "dataset_a")
+        dataset_b = os.path.join(self.temp.name, "dataset_b")
+        output_dir = os.path.join(self.temp.name, "merged_dataset")
+        write_sharded_dataset(dataset_a, [
+            {
+                "symbol": "AAAUSDT",
+                "month": "2020-01",
+                "rows": [
+                    self.shard_row("AAAUSDT", "2020-01", 0, 1600000000000, 1, 0.02, 100000.0),
+                ],
+            },
+        ])
+        write_sharded_dataset(dataset_b, [
+            {
+                "symbol": "AAAUSDT",
+                "month": "2020-01",
+                "rows": [
+                    self.shard_row("AAAUSDT", "2020-01", 0, 1600000000000, 0, -0.03, 100000.0),
+                ],
+            },
+        ])
+
+        with self.assertRaisesRegex(ValueError, "conflicting duplicate shard"):
+            merge_shard_dataset_cache.create_combined_dataset(
+                output_dir,
+                [dataset_a, dataset_b],
+            )
+
     @unittest.skipUnless(pipeline.np is not None, "requires numpy-backed compact cache")
     def test_market_breadth_sidecar_augmentation_uses_existing_sharded_cache(self):
         dataset_dir = os.path.join(self.temp.name, "dataset")
@@ -454,7 +736,7 @@ class PipelineTests(unittest.TestCase):
             "ret_60m",
             "rolling_quote_volume_zscore_60m",
         ]
-        dataset_manifest = shard_dataset_manifest(feature_names=feature_names)
+        dataset_manifest = shard_dataset_manifest(feature_names=feature_names, upside_target=0.01)
         with open(os.path.join(dataset_dir, "kline_growth_dataset.meta.json"), "w", encoding="utf-8") as handle:
             json.dump(dataset_manifest, handle, indent=2, sort_keys=True)
         symbols = ["AAAUSDT", "BBBUSDT", "CCCUSDT", "DDDUSDT", "EEEUSDT"]
@@ -485,16 +767,15 @@ class PipelineTests(unittest.TestCase):
                         ret5, ret5, max(ret5, 0.0), min(ret5, 0.0), quote_volume,
                         pipeline.math.log1p(quote_volume), 0.001 * offset, ret5, ret15, ret60, quote_z,
                     ])
-            shard_manifest = dict(dataset_manifest)
-            shard_manifest.update({
-                "version": 1,
-                "kind": "symbol_month_shard",
-                "symbol": symbol,
-                "month": "2020-01",
-                "row_count": 2,
-            })
             with open(os.path.join(symbol_dir, "2020-01.meta.json"), "w", encoding="utf-8") as handle:
-                json.dump(shard_manifest, handle, indent=2, sort_keys=True)
+                handle.write(
+                    shard_manifest_content(
+                        dataset_manifest,
+                        symbol,
+                        "2020-01",
+                        2,
+                    )
+                )
         cache_dir = os.path.join(self.temp.name, "cache")
         rows, feature_columns, _ = pipeline.load_rows(dataset_dir, "memmap32", cache_dir=cache_dir)
         args = SimpleNamespace(
@@ -865,6 +1146,7 @@ class PipelineTests(unittest.TestCase):
         parser = pipeline.build_parser()
         args = parser.parse_args([])
         self.assertEqual(args.walk_forward_final_model, "selected")
+        self.assertEqual(args.walk_forward_max_folds, 0)
         self.assertEqual(args.walk_validation_months, 1)
         self.assertEqual(args.walk_test_months, 1)
 
@@ -1480,6 +1762,79 @@ class PipelineTests(unittest.TestCase):
             pipeline.threshold_rank(high_result["validation_metrics"], "avg_profit", -float("inf"), high_result["penalized_objective_score"]),
         )
 
+    def test_burst_penalty_can_change_selected_candidate(self):
+        calm_metrics = {
+            "predicted_trades": 20,
+            "portfolio_profit": 40.0,
+            "max_capital_drawdown": 0.05,
+            "precision": 0.45,
+            "raw_signal_trades": 20,
+            "portfolio_return": 0.004,
+            "recall": 0.2,
+            "average_profit_after_fee_and_slippage": 2.0,
+            "total_profit_after_fee_and_slippage": 40.0,
+            "trades_per_day": 2.0,
+            "max_trades_in_any_day": 3,
+        }
+        bursty_metrics = {
+            "predicted_trades": 60,
+            "portfolio_profit": 60.0,
+            "max_capital_drawdown": 0.05,
+            "precision": 0.45,
+            "raw_signal_trades": 60,
+            "portfolio_return": 0.006,
+            "recall": 0.25,
+            "average_profit_after_fee_and_slippage": 1.0,
+            "total_profit_after_fee_and_slippage": 60.0,
+            "trades_per_day": 12.0,
+            "max_trades_in_any_day": 20,
+        }
+        calm_result = pipeline.build_selected_threshold_result(
+            0.001, dict(calm_metrics), "profit", -float("inf"), 0.0, 0.0, 0, "hybrid",
+            burst_trades_per_day_penalty=0.1,
+            burst_max_trades_in_day_penalty=0.05,
+            target_trades_per_day=4.0,
+            target_max_trades_in_day=6,
+        )
+        bursty_result = pipeline.build_selected_threshold_result(
+            0.002, dict(bursty_metrics), "profit", -float("inf"), 0.0, 0.0, 0, "hybrid",
+            burst_trades_per_day_penalty=0.1,
+            burst_max_trades_in_day_penalty=0.05,
+            target_trades_per_day=4.0,
+            target_max_trades_in_day=6,
+        )
+        self.assertGreater(bursty_result["base_objective_score"], calm_result["base_objective_score"])
+        self.assertGreater(calm_result["penalized_objective_score"], bursty_result["penalized_objective_score"])
+
+    def test_short_history_metrics_and_penalty_are_recorded(self):
+        base = 1600000000000
+        rows = [
+            symbol_row("OLDUSDT", base, label=1, trade_return=0.01, quote_volume=1000000000.0),
+            symbol_row("OLDUSDT", base + 24 * 60 * 60 * 1000, label=1, trade_return=0.01, quote_volume=1000000000.0),
+            symbol_row("NEWUSDT", base + 24 * 60 * 60 * 1000, label=1, trade_return=0.01, quote_volume=1000000000.0),
+        ]
+        metrics = pipeline.evaluate(
+            rows,
+            [0.9, 0.85, 0.8],
+            0.5,
+            0.0,
+            0.0,
+            compute_auc=False,
+            initial_capital=10000.0,
+            max_position_fraction=0.10,
+            max_volume_fraction=0.01,
+            max_trades_per_period=10,
+            trade_period_minutes=60,
+            holding_period_minutes=5,
+            hybrid_runtime_args=SimpleNamespace(threshold_short_history_days=0.5),
+        )
+        self.assertAlmostEqual(metrics["short_history_symbol_trade_share"], 2.0 / 3.0)
+        penalized = pipeline.build_selected_threshold_result(
+            0.5, dict(metrics), "avg_profit", -float("inf"), 0.0, 0.0, 0, "probability",
+            short_history_penalty=1.0,
+        )
+        self.assertLess(penalized["penalized_objective_score"], penalized["base_objective_score"])
+
     def test_normalize_open_time_ms(self):
         self.assertEqual(pipeline.normalize_open_time_ms(1600000000000), 1600000000000)
         self.assertEqual(pipeline.normalize_open_time_ms(1600000000000000), 1600000000000)
@@ -1573,6 +1928,20 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(calibration["mode"], "platt")
         self.assertGreater(calibration["rows"], 0)
         self.assertLessEqual(pipeline.brier_score(calibrated, labels_values), calibration["validation_brier_before"] + 1e-6)
+
+    def test_recent_only_calibration_uses_tail_rows(self):
+        rows = [row(1600000000000 + index * 60000, label=0 if index < 3 else 1) for index in range(6)]
+        probabilities = [0.1, 0.2, 0.3, 0.7, 0.8, 0.9]
+        args = SimpleNamespace(
+            calibration="platt",
+            calibration_max_rows=0,
+            calibration_window_mode="recent",
+            calibration_recent_ratio=0.5,
+            calibration_recent_rows=0,
+        )
+        calibration = pipeline.fit_calibration(probabilities, rows, args)
+        self.assertEqual(calibration["rows"], 3)
+        self.assertEqual(calibration["window_mode"], "recent")
 
     def test_topk_ev_selection_one_minute(self):
         base = 1600000000000
@@ -1949,6 +2318,97 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(sorted(execution["executed"]), [0, 2])
         self.assertEqual(execution["symbol_trade_limit_blocked"], 1)
 
+    def test_symbol_reentry_cooldown_blocks_nearby_repeat_entries(self):
+        base = 1600000000000
+        rows = [
+            symbol_row("AAVEUSDT", base, trade_return=0.01, quote_volume=1000000000.0),
+            symbol_row("AAVEUSDT", base + 10 * 60000, trade_return=0.01, quote_volume=1000000000.0),
+            symbol_row("AAVEUSDT", base + 16 * 60000, trade_return=0.01, quote_volume=1000000000.0),
+        ]
+        args = SimpleNamespace(symbol_reentry_cooldown_minutes=15)
+        execution = pipeline.portfolio_execution(
+            rows, [1.0, 1.0, 1.0], 0.5, 0.0, 0.0, 10000.0, 0.10, 0.01, 0, 60, 1,
+            hybrid_runtime_args=args,
+        )
+        self.assertEqual(sorted(execution["executed"]), [0, 2])
+        self.assertEqual(execution["symbol_reentry_cooldown_blocked"], 1)
+
+    def test_candidate_rank_applies_symbol_dominance_penalty_before_selection(self):
+        bucket = [
+            (0, 100, 1, "BNBUSDT", 1.0, 0.01, 0.01, 1.00, 0.95, 0.0, 0.0),
+            (1, 100, 1, "ETHUSDT", 1.0, 0.01, 0.01, 0.92, 0.90, 0.0, 0.0),
+        ]
+        runtime_args = SimpleNamespace(
+            symbol_dominance_penalty_validation_weight=0.8,
+            symbol_dominance_penalty_recent_weight=0.0,
+            symbol_dominance_penalty_grace=0.0,
+        )
+        chosen = pipeline.candidate_rank(
+            bucket,
+            "topk_score",
+            False,
+            1,
+            0,
+            lambda *args, **kwargs: None,
+            trade_period_minutes=60,
+            recent_entry_minutes=[],
+            recent_entry_minutes_by_symbol={},
+            symbol_executed_counts={},
+            fold_trade_count=0,
+            validation_dominance_shares={"BNBUSDT": 0.9, "ETHUSDT": 0.1},
+            runtime_args=runtime_args,
+        )
+        self.assertEqual(len(chosen), 1)
+        self.assertEqual(chosen[0][3], "ETHUSDT")
+
+    def test_candidate_rank_applies_recent_symbol_dominance_penalty_across_minutes(self):
+        bucket = [
+            (0, 180, 1, "BNBUSDT", 1.0, 0.01, 0.01, 1.00, 0.95, 0.0, 0.0),
+            (1, 180, 1, "ETHUSDT", 1.0, 0.01, 0.01, 0.92, 0.90, 0.0, 0.0),
+        ]
+        runtime_args = SimpleNamespace(
+            symbol_dominance_penalty_validation_weight=0.0,
+            symbol_dominance_penalty_recent_weight=0.8,
+            symbol_dominance_penalty_grace=0.0,
+            symbol_reentry_cooldown_minutes=30,
+            holding_period_minutes=5,
+        )
+        chosen = pipeline.candidate_rank(
+            bucket,
+            "topk_score",
+            False,
+            1,
+            0,
+            lambda *args, **kwargs: None,
+            trade_period_minutes=60,
+            recent_entry_minutes=[170, 175],
+            recent_entry_minutes_by_symbol={"BNBUSDT": [170, 175]},
+            symbol_executed_counts={"BNBUSDT": 2},
+            fold_trade_count=2,
+            validation_dominance_shares={},
+            runtime_args=runtime_args,
+        )
+        self.assertEqual(len(chosen), 1)
+        self.assertEqual(chosen[0][3], "ETHUSDT")
+
+    def test_candidate_rank_prefers_unique_symbols_before_duplicate_fill(self):
+        bucket = [
+            (0, 100, 1, "BNBUSDT", 1.0, 0.01, 0.01, 0.99, 0.99, 0.0, 0.0),
+            (1, 100, 1, "BNBUSDT", 1.0, 0.01, 0.01, 0.98, 0.98, 0.0, 0.0),
+            (2, 100, 1, "ETHUSDT", 1.0, 0.01, 0.01, 0.97, 0.97, 0.0, 0.0),
+        ]
+        runtime_args = SimpleNamespace(prefer_unique_symbols=True)
+        chosen = pipeline.candidate_rank(
+            bucket,
+            "topk_score",
+            False,
+            2,
+            0,
+            lambda *args, **kwargs: None,
+            runtime_args=runtime_args,
+        )
+        self.assertEqual([item[3] for item in chosen], ["BNBUSDT", "ETHUSDT"])
+
     def test_daily_loss_limit_blocks_after_realized_losses(self):
         base = 1600000000000
         rows = [
@@ -2004,6 +2464,38 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertAlmostEqual(base_score, 5.0)
         self.assertAlmostEqual(penalized_score, 5.0 - 2.0 * 0.8 - 1.0 * 0.9)
+
+    def test_threshold_penalized_score_applies_soft_cap_overflow_penalty(self):
+        metrics = {
+            "predicted_trades": 10,
+            "portfolio_profit": 5.0,
+            "symbol_trade_concentration_top1": 0.8,
+        }
+        base_score, penalized_score = pipeline.threshold_penalized_score(
+            metrics,
+            "profit",
+            trade_top1_concentration_penalty=0.5,
+            trade_top1_concentration_cap=0.75,
+            concentration_cap_mode="soft",
+        )
+        self.assertAlmostEqual(base_score, 5.0)
+        self.assertAlmostEqual(penalized_score, 5.0 - 0.5 * 0.8 - ((0.8 - 0.75) / (1.0 - 0.75)))
+
+    def test_threshold_penalized_score_applies_diversity_penalty_weight(self):
+        metrics = {
+            "predicted_trades": 10,
+            "portfolio_profit": 5.0,
+            "symbol_profit_concentration_top1": 0.8,
+            "symbol_trade_concentration_top1": 0.8,
+            "symbol_execution_rows": [{"symbol": "BNBUSDT"}, {"symbol": "ETHUSDT"}],
+        }
+        base_score, penalized_score = pipeline.threshold_penalized_score(
+            metrics,
+            "profit",
+            diversity_penalty_weight=0.01,
+        )
+        self.assertAlmostEqual(base_score, 5.0)
+        self.assertLess(penalized_score, base_score)
 
     def test_threshold_score_ev_uses_expected_value(self):
         metrics = {
@@ -2341,6 +2833,74 @@ class PipelineTests(unittest.TestCase):
         self.assertGreater(len(thresholds), 1)
         self.assertIn(0.001, thresholds)
         self.assertTrue(all(value >= 0.001 for value in thresholds))
+
+    def test_selected_thresholds_for_bundle_hybrid_recent_calibration_can_lower_score_floor(self):
+        rows = [row(1600000000000 + index * 60000, label=1 if index % 2 == 0 else 0, trade_return=0.02 if index % 2 == 0 else -0.01) for index in range(12)]
+        bundle = pipeline.build_prediction_bundle(
+            probability=[0.4, 0.42, 0.45, 0.47, 0.5, 0.52, 0.55, 0.58, 0.6, 0.62, 0.65, 0.7],
+            calibrated_probability=[0.4, 0.42, 0.45, 0.47, 0.5, 0.52, 0.55, 0.58, 0.6, 0.62, 0.65, 0.7],
+            predicted_trade_return=[-0.0008, -0.0004, -0.0001, 0.0, 0.0002, 0.0004, 0.0006, 0.0008, 0.0009, 0.0010, 0.0011, 0.0012],
+            raw_predicted_trade_return=[-0.006, -0.004, -0.002, 0.0, 0.002, 0.004, 0.006, 0.008, 0.009, 0.010, 0.011, 0.012],
+            predicted_return_uncertainty=[0.0] * 12,
+        )
+        bundle["regression_calibration"] = {"mode": "linear", "a": 0.03, "b": 0.0}
+        args = SimpleNamespace(
+            objective_mode="hybrid",
+            disable_adaptive_thresholds=False,
+            adaptive_threshold_sample_rows=1000000,
+            fee=0.001,
+            slippage=0.0005,
+            validation_slippage_multiplier=1.0,
+            hybrid_score_mode="risk_adjusted",
+            hybrid_uncertainty_penalty=0.0,
+            hybrid_min_score=0.001,
+            hybrid_min_score_calibration_aware=True,
+            hybrid_min_score_calibration_reference_scale=0.20,
+            hybrid_min_score_calibration_min_ratio=0.25,
+            hybrid_min_score_calibration_floor_min=0.00025,
+            hybrid_min_score_calibration_floor_max=0.0,
+            calibration_window_mode="recent",
+        )
+        thresholds, fixed_threshold, score_values = pipeline.selected_thresholds_for_bundle(bundle, rows, args)
+        self.assertEqual(fixed_threshold, 0.00025)
+        self.assertIsNotNone(score_values)
+        self.assertIn(0.00025, thresholds)
+        self.assertEqual(bundle["hybrid_gate_diagnostics"]["configured_hybrid_min_score"], 0.001)
+        self.assertEqual(bundle["hybrid_gate_diagnostics"]["effective_hybrid_min_score"], 0.00025)
+
+    def test_selected_thresholds_for_bundle_hybrid_recent_calibration_can_cross_below_zero(self):
+        rows = [row(1600000000000 + index * 60000, label=1 if index % 2 == 0 else 0, trade_return=0.02 if index % 2 == 0 else -0.01) for index in range(12)]
+        bundle = pipeline.build_prediction_bundle(
+            probability=[0.4, 0.42, 0.45, 0.47, 0.5, 0.52, 0.55, 0.58, 0.6, 0.62, 0.65, 0.7],
+            calibrated_probability=[0.4, 0.42, 0.45, 0.47, 0.5, 0.52, 0.55, 0.58, 0.6, 0.62, 0.65, 0.7],
+            predicted_trade_return=[-0.0008, -0.0004, -0.0001, 0.0, 0.0002, 0.0004, 0.0006, 0.0008, 0.0009, 0.0010, 0.0011, 0.0012],
+            raw_predicted_trade_return=[-0.006, -0.004, -0.002, 0.0, 0.002, 0.004, 0.006, 0.008, 0.009, 0.010, 0.011, 0.012],
+            predicted_return_uncertainty=[0.0] * 12,
+        )
+        bundle["regression_calibration"] = {"mode": "linear", "a": 0.03, "b": 0.0}
+        args = SimpleNamespace(
+            objective_mode="hybrid",
+            disable_adaptive_thresholds=False,
+            adaptive_threshold_sample_rows=1000000,
+            fee=0.001,
+            slippage=0.0005,
+            validation_slippage_multiplier=1.0,
+            hybrid_score_mode="risk_adjusted",
+            hybrid_uncertainty_penalty=0.0,
+            hybrid_min_score=0.001,
+            hybrid_min_score_calibration_aware=True,
+            hybrid_min_score_calibration_reference_scale=0.20,
+            hybrid_min_score_calibration_min_ratio=0.25,
+            hybrid_min_score_calibration_floor_min=-0.0012,
+            hybrid_min_score_calibration_floor_max=-0.0007,
+            calibration_window_mode="recent",
+        )
+        thresholds, fixed_threshold, score_values = pipeline.selected_thresholds_for_bundle(bundle, rows, args)
+        self.assertEqual(fixed_threshold, -0.0007)
+        self.assertIsNotNone(score_values)
+        self.assertIn(-0.0007, thresholds)
+        self.assertEqual(bundle["hybrid_gate_diagnostics"]["configured_hybrid_min_score"], 0.001)
+        self.assertEqual(bundle["hybrid_gate_diagnostics"]["effective_hybrid_min_score"], -0.0007)
 
     def test_selected_thresholds_for_bundle_topk_classification_falls_back_to_adaptive_grid(self):
         rows = [row(1600000000000 + index * 60000, label=1 if index % 2 == 0 else 0) for index in range(12)]
@@ -3049,6 +3609,26 @@ class PipelineTests(unittest.TestCase):
         self.assertIn(".gbdt_cache", command)
         self.assertIn("--cache-only", command)
 
+    def test_experiment_runner_hybrid_late_recent_includes_calibration_aware_hybrid_floor_flags(self):
+        args = run_experiments.parse_args(["--profile", "hybrid-late-recent"])
+        experiment = run_experiments.build_experiment_grid_for_profile("hybrid-late-recent", False, 1)[0]
+        command = run_experiments.build_command(args, experiment)
+        self.assertIn("--hybrid-min-score-calibration-aware", command)
+        self.assertIn("--hybrid-min-score-calibration-reference-scale", command)
+        self.assertIn("--hybrid-min-score-calibration-min-ratio", command)
+        self.assertIn("--hybrid-min-score-calibration-floor-min", command)
+
+    def test_experiment_runner_hybrid_late_recent_tuned_uses_start_fold_88_and_walk_months(self):
+        args = run_experiments.parse_args(["--profile", "hybrid-late-recent-tuned"])
+        experiment = run_experiments.build_experiment_grid_for_profile("hybrid-late-recent-tuned", False, 1)[0]
+        command = run_experiments.build_command(args, experiment)
+        self.assertIn("--walk-forward-start-fold", command)
+        self.assertIn("88", command)
+        self.assertIn("--walk-train-months", command)
+        self.assertIn("6", command)
+        self.assertIn("--threshold-floor-snap-penalty-weight", command)
+        self.assertIn("--hybrid-return-combination", command)
+
     def test_configure_output_paths_maps_into_results_dir(self):
         parser = pipeline.build_parser()
         args = parser.parse_args(["--results-dir", os.path.join(self.temp.name, "results")])
@@ -3126,8 +3706,17 @@ class PipelineTests(unittest.TestCase):
         args = parser.parse_args([
             "--max-trades-per-symbol-period", "2",
             "--top-k-per-symbol-minute", "1",
+            "--prefer-unique-symbols",
+            "--symbol-reentry-cooldown-minutes", "15",
             "--threshold-top1-concentration-penalty", "2.5",
             "--threshold-max-top1-concentration", "0.7",
+            "--threshold-trade-top1-concentration-penalty", "1.25",
+            "--threshold-max-trade-top1-concentration", "0.65",
+            "--threshold-concentration-cap-mode", "hard",
+            "--threshold-diversity-profit-tolerance-ratio", "0.2",
+            "--symbol-dominance-penalty-validation-weight", "0.3",
+            "--symbol-dominance-penalty-recent-weight", "0.4",
+            "--symbol-dominance-penalty-grace", "0.25",
             "--symbol-filter-min-active-days", "3",
             "--symbol-filter-max-executed-trade-share", "0.55",
             "--prediction-bundle-cache", "disk",
@@ -3135,12 +3724,422 @@ class PipelineTests(unittest.TestCase):
         ])
         self.assertEqual(args.max_trades_per_symbol_period, 2)
         self.assertEqual(args.top_k_per_symbol_minute, 1)
+        self.assertTrue(args.prefer_unique_symbols)
+        self.assertEqual(args.symbol_reentry_cooldown_minutes, 15)
         self.assertAlmostEqual(args.threshold_top1_concentration_penalty, 2.5)
         self.assertAlmostEqual(args.threshold_max_top1_concentration, 0.7)
+        self.assertAlmostEqual(args.threshold_trade_top1_concentration_penalty, 1.25)
+        self.assertAlmostEqual(args.threshold_max_trade_top1_concentration, 0.65)
+        self.assertEqual(args.threshold_concentration_cap_mode, "hard")
+        self.assertAlmostEqual(args.threshold_diversity_profit_tolerance_ratio, 0.2)
+        self.assertAlmostEqual(args.symbol_dominance_penalty_validation_weight, 0.3)
+        self.assertAlmostEqual(args.symbol_dominance_penalty_recent_weight, 0.4)
+        self.assertAlmostEqual(args.symbol_dominance_penalty_grace, 0.25)
         self.assertEqual(args.symbol_filter_min_active_days, 3)
         self.assertAlmostEqual(args.symbol_filter_max_executed_trade_share, 0.55)
         self.assertEqual(args.prediction_bundle_cache, "disk")
         self.assertTrue(args.fast_diagnostics)
+
+    def test_apply_diversity_selection_defaults_enables_symbol_filter_and_tiebreaker(self):
+        parser = pipeline.build_parser()
+        args = parser.parse_args([
+            "--threshold-max-top1-concentration", "0.8",
+        ])
+        changed = pipeline.apply_diversity_selection_defaults(args, set())
+        self.assertTrue(changed)
+        self.assertEqual(args.threshold_tiebreaker, "diversified")
+        self.assertEqual(args.symbol_validation_filter, "positive_avg_profit")
+        self.assertEqual(args.symbol_filter_stage, "candidate_blend")
+        self.assertEqual(args.symbol_filter_min_active_days, 3)
+        self.assertAlmostEqual(args.symbol_filter_max_executed_trade_share, 0.55)
+        self.assertEqual(args.threshold_concentration_cap_mode, "soft")
+        self.assertAlmostEqual(args.threshold_diversity_penalty_weight, 0.01)
+        self.assertAlmostEqual(args.threshold_diversity_profit_tolerance_ratio, 0.25)
+        self.assertAlmostEqual(args.symbol_dominance_penalty_validation_weight, 0.35)
+        self.assertAlmostEqual(args.symbol_dominance_penalty_recent_weight, 0.50)
+        self.assertAlmostEqual(args.symbol_dominance_penalty_grace, 0.35)
+        self.assertTrue(args.prefer_unique_symbols)
+        self.assertEqual(args.symbol_reentry_cooldown_minutes, 15)
+
+    def test_tune_threshold_soft_concentration_cap_keeps_near_cap_candidate(self):
+        rows = [row(1600000000000)]
+        candidate_metrics = {
+            "predicted_trades": 31,
+            "portfolio_profit": 215.15,
+            "portfolio_return": 0.0215,
+            "precision": 0.4516,
+            "recall": 0.12,
+            "active_days": 8,
+            "raw_signal_trades": 31,
+            "max_capital_drawdown": 0.10,
+            "average_profit_after_fee_and_slippage": 6.94,
+            "total_profit_after_fee_and_slippage": 215.15,
+            "symbol_trade_concentration_top1": 24.0 / 31.0,
+            "symbol_profit_concentration_top1": 0.93,
+            "symbol_profit_concentration_top3": 1.0,
+        }
+        runtime_args = SimpleNamespace(
+            threshold_max_trade_top1_concentration=0.77375,
+            threshold_trade_top1_concentration_penalty=0.0,
+            threshold_max_top1_concentration=0.0,
+            threshold_max_top3_concentration=0.0,
+            threshold_top1_concentration_penalty=0.0,
+            threshold_top3_concentration_penalty=0.0,
+            threshold_concentration_cap_mode="soft",
+            threshold_tiebreaker="fewer_trades",
+            threshold_tie_epsilon=1e-9,
+            threshold_target_trades=0,
+            threshold_target_active_days=0,
+            target_validation_trades=0,
+            threshold_objective="profit",
+        )
+        with mock.patch.object(pipeline, "evaluate", return_value=dict(candidate_metrics)):
+            selection = pipeline.tune_threshold(
+                rows,
+                [0.8],
+                [0.77],
+                "profit",
+                0.0,
+                0.0,
+                1,
+                0,
+                0.0,
+                "explore",
+                10000.0,
+                0.10,
+                0.01,
+                10,
+                60,
+                5,
+                hybrid_runtime_args=runtime_args,
+            )
+        self.assertEqual(selection["threshold"], 0.77)
+        self.assertGreater(selection["validation_metrics"]["predicted_trades"], 0)
+
+    def test_tune_threshold_hard_concentration_cap_rejects_near_cap_candidate(self):
+        rows = [row(1600000000000)]
+        candidate_metrics = {
+            "predicted_trades": 31,
+            "portfolio_profit": 215.15,
+            "portfolio_return": 0.0215,
+            "precision": 0.4516,
+            "recall": 0.12,
+            "active_days": 8,
+            "raw_signal_trades": 31,
+            "max_capital_drawdown": 0.10,
+            "average_profit_after_fee_and_slippage": 6.94,
+            "total_profit_after_fee_and_slippage": 215.15,
+            "symbol_trade_concentration_top1": 24.0 / 31.0,
+            "symbol_profit_concentration_top1": 0.93,
+            "symbol_profit_concentration_top3": 1.0,
+        }
+        fallback_metrics = {
+            "predicted_trades": 0,
+            "portfolio_profit": 0.0,
+            "portfolio_return": 0.0,
+            "precision": 0.0,
+            "recall": 0.0,
+            "active_days": 0,
+            "raw_signal_trades": 0,
+            "max_capital_drawdown": 0.0,
+            "average_profit_after_fee_and_slippage": 0.0,
+            "total_profit_after_fee_and_slippage": 0.0,
+            "symbol_trade_concentration_top1": 0.0,
+            "symbol_profit_concentration_top1": 0.0,
+            "symbol_profit_concentration_top3": 0.0,
+        }
+        runtime_args = SimpleNamespace(
+            threshold_max_trade_top1_concentration=0.77375,
+            threshold_trade_top1_concentration_penalty=0.0,
+            threshold_max_top1_concentration=0.0,
+            threshold_max_top3_concentration=0.0,
+            threshold_top1_concentration_penalty=0.0,
+            threshold_top3_concentration_penalty=0.0,
+            threshold_concentration_cap_mode="hard",
+            threshold_tiebreaker="fewer_trades",
+            threshold_tie_epsilon=1e-9,
+            threshold_target_trades=0,
+            threshold_target_active_days=0,
+            target_validation_trades=0,
+            threshold_objective="profit",
+        )
+        with mock.patch.object(pipeline, "evaluate", side_effect=[dict(candidate_metrics), dict(fallback_metrics)]):
+            selection = pipeline.tune_threshold(
+                rows,
+                [0.8],
+                [0.77],
+                "profit",
+                0.0,
+                0.0,
+                1,
+                0,
+                0.0,
+                "explore",
+                10000.0,
+                0.10,
+                0.01,
+                10,
+                60,
+                5,
+                hybrid_runtime_args=runtime_args,
+            )
+        self.assertEqual(selection["threshold"], 1.01)
+        self.assertEqual(selection["validation_metrics"]["selected_threshold_tie_rank_reason"], "no_trade_fallback")
+
+    def test_metrics_record_captures_diversity_runtime_settings(self):
+        parser = pipeline.build_parser()
+        args = parser.parse_args([
+            "--prefer-unique-symbols",
+            "--symbol-reentry-cooldown-minutes", "15",
+            "--symbol-dominance-penalty-validation-weight", "0.6",
+            "--symbol-dominance-penalty-recent-weight", "0.9",
+            "--symbol-dominance-penalty-grace", "0.2",
+        ])
+        record = pipeline.metrics_record(
+            "gbdt",
+            "fixed",
+            "profit_balanced",
+            0.05,
+            [],
+            [],
+            [],
+            {},
+            args,
+        )
+        self.assertEqual(record["prefer_unique_symbols"], 1)
+        self.assertEqual(record["symbol_reentry_cooldown_minutes"], 15)
+        self.assertAlmostEqual(record["symbol_dominance_penalty_validation_weight"], 0.6)
+        self.assertAlmostEqual(record["symbol_dominance_penalty_recent_weight"], 0.9)
+        self.assertAlmostEqual(record["symbol_dominance_penalty_grace"], 0.2)
+        self.assertEqual(record["threshold_concentration_cap_mode"], "soft")
+
+    def test_compare_threshold_results_diversified_prefers_lower_concentration_within_tolerance(self):
+        args = SimpleNamespace(
+            threshold_tiebreaker="diversified",
+            threshold_tie_epsilon=1e-9,
+            threshold_diversity_profit_tolerance_ratio=0.25,
+            threshold_diversity_min_profit_top1_improvement=0.05,
+            threshold_diversity_min_trade_top1_improvement=0.05,
+            threshold_target_trades=0,
+            threshold_target_active_days=0,
+            target_validation_trades=0,
+            threshold_objective="profit_balanced",
+        )
+        best_result = {
+            "objective_score": 314.0,
+            "validation_metrics": {
+                "predicted_trades": 54,
+                "portfolio_profit": 314.0,
+                "precision": 0.37,
+                "active_days": 8,
+                "max_capital_drawdown": 0.1,
+                "symbol_profit_concentration_top1": 0.75,
+                "symbol_trade_concentration_top1": 0.85,
+            },
+        }
+        candidate_result = {
+            "objective_score": 249.0,
+            "validation_metrics": {
+                "predicted_trades": 70,
+                "portfolio_profit": 249.0,
+                "precision": 0.31,
+                "active_days": 8,
+                "max_capital_drawdown": 0.1,
+                "symbol_profit_concentration_top1": 0.46,
+                "symbol_trade_concentration_top1": 0.55,
+            },
+        }
+        better, reason = pipeline.compare_threshold_results(candidate_result, best_result, args, 20, 8000)
+        self.assertTrue(better)
+        self.assertEqual(reason, "diversified_tolerance")
+
+    def test_compare_threshold_results_diversified_preserves_more_diverse_best_within_tolerance(self):
+        args = SimpleNamespace(
+            threshold_tiebreaker="diversified",
+            threshold_tie_epsilon=1e-9,
+            threshold_diversity_profit_tolerance_ratio=0.25,
+            threshold_diversity_min_profit_top1_improvement=0.05,
+            threshold_diversity_min_trade_top1_improvement=0.05,
+            threshold_target_trades=0,
+            threshold_target_active_days=0,
+            target_validation_trades=0,
+            threshold_objective="profit_balanced",
+        )
+        best_result = {
+            "objective_score": 249.0,
+            "validation_metrics": {
+                "predicted_trades": 70,
+                "portfolio_profit": 249.0,
+                "precision": 0.31,
+                "active_days": 8,
+                "max_capital_drawdown": 0.1,
+                "symbol_profit_concentration_top1": 0.46,
+                "symbol_trade_concentration_top1": 0.55,
+            },
+        }
+        candidate_result = {
+            "objective_score": 314.0,
+            "validation_metrics": {
+                "predicted_trades": 54,
+                "portfolio_profit": 314.0,
+                "precision": 0.37,
+                "active_days": 8,
+                "max_capital_drawdown": 0.1,
+                "symbol_profit_concentration_top1": 0.75,
+                "symbol_trade_concentration_top1": 0.85,
+            },
+        }
+        better, reason = pipeline.compare_threshold_results(candidate_result, best_result, args, 20, 8000)
+        self.assertFalse(better)
+        self.assertEqual(reason, "diversified")
+
+    def test_compare_threshold_results_prefers_non_floor_snap_when_scores_are_close(self):
+        args = SimpleNamespace(
+            threshold_tiebreaker="balanced",
+            threshold_tie_epsilon=1e-9,
+            threshold_floor_snap_score_tolerance_ratio=0.10,
+            threshold_target_trades=0,
+            threshold_target_active_days=0,
+            target_validation_trades=0,
+            threshold_objective="profit_balanced",
+        )
+        best_result = {
+            "objective_score": 100.0,
+            "penalized_objective_score": 100.0,
+            "validation_metrics": {
+                "predicted_trades": 40,
+                "portfolio_profit": 100.0,
+                "precision": 0.4,
+                "active_days": 8,
+                "max_capital_drawdown": 0.1,
+                "symbol_profit_concentration_top1": 0.4,
+                "symbol_trade_concentration_top1": 0.4,
+                "threshold_floor_snap_applied": 1,
+            },
+        }
+        candidate_result = {
+            "objective_score": 94.0,
+            "penalized_objective_score": 94.0,
+            "validation_metrics": {
+                "predicted_trades": 34,
+                "portfolio_profit": 94.0,
+                "precision": 0.41,
+                "active_days": 8,
+                "max_capital_drawdown": 0.1,
+                "symbol_profit_concentration_top1": 0.4,
+                "symbol_trade_concentration_top1": 0.4,
+                "threshold_floor_snap_applied": 0,
+            },
+        }
+        better, reason = pipeline.compare_threshold_results(candidate_result, best_result, args, 20, 8000)
+        self.assertTrue(better)
+        self.assertEqual(reason, "avoid_floor_snap")
+
+    def test_metrics_record_carries_validation_concentration_controls(self):
+        parser = pipeline.build_parser()
+        args = parser.parse_args(["--input", self.csv_path])
+        metrics = {
+            "portfolio_profit": -10.0,
+            "portfolio_return": -0.001,
+            "precision": 0.1,
+            "recall": 0.02,
+            "predicted_trades": 5,
+            "symbol_profit_concentration_top1": 0.9,
+            "symbol_profit_concentration_top3": 1.0,
+            "symbol_trade_concentration_top1": 0.8,
+        }
+        validation_metrics = {
+            "predicted_trades": 12,
+            "precision": 0.4,
+            "recall": 0.08,
+            "average_profit_after_fee_and_slippage": 0.01,
+            "total_profit_after_fee_and_slippage": 0.12,
+            "portfolio_profit": 25.0,
+            "portfolio_return": 0.0025,
+            "selected_validation_trade_count": 12,
+            "selected_validation_portfolio_profit": 25.0,
+            "selected_validation_portfolio_return": 0.0025,
+            "selected_validation_precision": 0.4,
+            "selected_validation_recall": 0.08,
+            "selected_validation_active_days": 4,
+            "selected_validation_profit_per_active_day": 6.25,
+            "symbol_profit_concentration_top1": 0.62,
+            "symbol_profit_concentration_top3": 0.88,
+            "symbol_trade_concentration_top1": 0.5,
+            "rejected_over_top1_concentration_count": 3,
+            "rejected_over_top3_concentration_count": 2,
+            "closest_top1_concentration": 0.81,
+            "closest_top1_concentration_threshold": 0.04,
+            "closest_top3_concentration": 0.97,
+            "closest_top3_concentration_threshold": 0.03,
+            "threshold_rejection_diagnostics": [{"threshold": 0.04, "rejected_over_top1_concentration": 1}],
+        }
+        record = pipeline.metrics_record(
+            "gbdt_lightgbm",
+            "fixed",
+            "profit_balanced",
+            0.05,
+            [row(1600000000000)],
+            [row(1600000060000)],
+            [row(1600000120000)],
+            metrics,
+            args,
+            validation_metrics,
+            1.23,
+        )
+        self.assertAlmostEqual(record["selected_validation_symbol_profit_concentration_top1"], 0.62)
+        self.assertAlmostEqual(record["selected_validation_symbol_profit_concentration_top3"], 0.88)
+        self.assertAlmostEqual(record["selected_validation_symbol_trade_concentration_top1"], 0.5)
+        self.assertEqual(record["selected_validation_symbol_count"], 0)
+        self.assertEqual(record["rejected_over_top1_concentration_count"], 3)
+        self.assertEqual(record["rejected_over_top3_concentration_count"], 2)
+        self.assertEqual(record["threshold_rejection_diagnostics"][0]["threshold"], 0.04)
+
+    def test_portfolio_execution_emits_ranking_and_score_diagnostics(self):
+        base = 1600000000000
+        rows = [
+            row(base, quote_volume=1000000000.0, trade_return=0.01),
+            row(base, quote_volume=1000000000.0, trade_return=0.02),
+            row(base, quote_volume=1000000000.0, trade_return=-0.01),
+        ]
+        execution = pipeline.portfolio_execution(
+            rows,
+            [0.95, 0.90, 0.85],
+            0.5,
+            0.0,
+            0.0,
+            10000.0,
+            0.10,
+            0.01,
+            10,
+            60,
+            5,
+            trade_selection="topk_score",
+            top_k_per_minute=1,
+            objective_mode="classification",
+            trade_score_name="probability",
+        )
+        self.assertEqual(execution["ranking_candidate_count"], 3)
+        self.assertEqual(execution["ranking_selected_candidate_count"], 1)
+        self.assertEqual(execution["ranking_rejected_candidate_count"], 2)
+        self.assertEqual(execution["execution_rejected_candidate_count"], 0)
+        self.assertEqual(execution["raw_candidate_score_count"], 3)
+        self.assertEqual(execution["executed_trade_score_count"], 1)
+        self.assertEqual(execution["rejected_trade_score_count"], 2)
+
+    def test_feature_usage_summary_reports_nonzero_features(self):
+        class DummyModel(object):
+            def feature_importance(self, feature_names):
+                return [
+                    (feature_names[0], 6.0, 0.60),
+                    (feature_names[1], 4.0, 0.40),
+                    (feature_names[2], 0.0, 0.0),
+                ]
+
+        summary = pipeline.feature_usage_summary(DummyModel(), ["ret_1m", "ret_5m", "ret_15m"])
+        self.assertEqual(summary["nonzero_feature_count"], 2)
+        self.assertEqual(summary["zero_importance_feature_count"], 1)
+        self.assertIn("ret_1m", summary["top_nonzero_features"])
 
     def test_prediction_bundle_for_models_reuses_memory_cache(self):
         class DummyModel(object):
@@ -3211,6 +4210,44 @@ class PipelineTests(unittest.TestCase):
         finally:
             pipeline.psutil = previous_psutil
 
+    def test_current_rss_gib_uses_psutil_and_updates_peak(self):
+        class FakeMemoryInfo:
+            rss = 2 * 1024 ** 3
+
+        class FakeProcess:
+            def memory_info(self):
+                return FakeMemoryInfo()
+
+        class FakePsutil:
+            @staticmethod
+            def Process(pid):
+                del pid
+                return FakeProcess()
+
+        previous_psutil = pipeline.psutil
+        previous_peak = pipeline.MAX_RSS_GIB_OBSERVED
+        previous_stage = pipeline.MAX_RSS_STAGE
+        previous_profile_enabled = pipeline.PROFILE_ENABLED
+        previous_records = list(pipeline.PROFILE_RECORDS)
+        try:
+            pipeline.psutil = FakePsutil()
+            pipeline.MAX_RSS_GIB_OBSERVED = 0.0
+            pipeline.MAX_RSS_STAGE = ""
+            pipeline.profile_reset(True)
+            self.assertAlmostEqual(pipeline.current_rss_gib("fake-psutil"), 2.0)
+            self.assertAlmostEqual(pipeline.MAX_RSS_GIB_OBSERVED, 2.0)
+            self.assertEqual(pipeline.MAX_RSS_STAGE, "fake-psutil")
+            pipeline.record_profile_stage("manual-stage", 0.5, rows_processed=10)
+            self.assertEqual(pipeline.PROFILE_RECORDS[-1]["stage_name"], "manual-stage")
+            self.assertAlmostEqual(pipeline.PROFILE_RECORDS[-1]["rss_gb_end"], 2.0)
+        finally:
+            pipeline.psutil = previous_psutil
+            pipeline.MAX_RSS_GIB_OBSERVED = previous_peak
+            pipeline.MAX_RSS_STAGE = previous_stage
+            pipeline.PROFILE_ENABLED = previous_profile_enabled
+            del pipeline.PROFILE_RECORDS[:]
+            pipeline.PROFILE_RECORDS.extend(previous_records)
+
     def test_atomic_write_path_produces_valid_json(self):
         output_path = os.path.join(self.temp.name, "atomic.json")
         def write_one(path):
@@ -3232,6 +4269,49 @@ class PipelineTests(unittest.TestCase):
                 matched = True
                 break
         self.assertTrue(matched)
+
+    def test_make_model_uses_native_lightgbm_for_classification(self):
+        params = {
+            "n_estimators": 10,
+            "learning_rate": 0.1,
+            "num_leaves": 15,
+            "max_depth": 5,
+            "subsample": 0.9,
+            "colsample_bytree": 0.85,
+            "min_child_samples": 20,
+            "min_split_gain": 0.0,
+            "reg_alpha": 0.0,
+            "reg_lambda": 1.0,
+            "max_bin": 63,
+            "subsample_for_bin": 1000,
+            "histogram_pool_size": 128.0,
+            "n_jobs": 2,
+        }
+        model = pipeline.make_model("lightgbm", params, 3.0, objective_mode="classification")
+        self.assertIsInstance(model, pipeline.NativeLightGBMModel)
+        self.assertEqual(model.task, "classification")
+        self.assertAlmostEqual(model.positive_weight, 3.0)
+
+    def test_make_model_uses_native_lightgbm_for_regression(self):
+        params = {
+            "n_estimators": 10,
+            "learning_rate": 0.1,
+            "num_leaves": 15,
+            "max_depth": 5,
+            "subsample": 0.9,
+            "colsample_bytree": 0.85,
+            "min_child_samples": 20,
+            "min_split_gain": 0.0,
+            "reg_alpha": 0.0,
+            "reg_lambda": 1.0,
+            "max_bin": 63,
+            "subsample_for_bin": 1000,
+            "histogram_pool_size": 128.0,
+            "n_jobs": 2,
+        }
+        model = pipeline.make_model("lightgbm", params, 1.0, objective_mode="regression")
+        self.assertIsInstance(model, pipeline.NativeLightGBMModel)
+        self.assertEqual(model.task, "regression")
 
     def test_apply_split_embargo_removes_boundary_rows(self):
         train_rows = [row(0), row(4 * 60 * 1000), row(8 * 60 * 1000)]
@@ -3266,6 +4346,75 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("brier_score", summary)
         self.assertGreaterEqual(summary["expected_calibration_error"], 0.0)
         self.assertTrue(any(row["probability_source"] == "calibrated_probability" for row in rows))
+
+    def test_ranking_report_from_predictions_scores_top_tail(self):
+        path = os.path.join(self.temp.name, "rank_predictions.csv")
+        fieldnames = [
+            "symbol",
+            "month",
+            "month_index",
+            "open_time",
+            "label",
+            "probability",
+            "calibrated_probability",
+            "hybrid_score",
+            "expected_value",
+            "predicted_net_return",
+            "trade_score",
+            "predicted",
+            "position_size",
+            "forward_return",
+            "trade_return",
+        ]
+        records = []
+        for index in range(20):
+            records.append({
+                "symbol": "AAAUSDT" if index < 2 else "BBBUSDT",
+                "month": "2026-01" if index < 2 else "2026-02",
+                "month_index": index,
+                "open_time": 1704067200000 + index * 60000,
+                "label": 1 if index < 2 else 0,
+                "probability": 0.9 - index * 0.01,
+                "calibrated_probability": 0.85 - index * 0.01,
+                "hybrid_score": 1.0 - index * 0.01,
+                "expected_value": 0.05 - index * 0.002,
+                "predicted_net_return": 0.04 - index * 0.002,
+                "trade_score": 1.0 - index * 0.01,
+                "predicted": 1 if index < 3 else 0,
+                "position_size": 1000.0 if index == 0 else 0.0,
+                "forward_return": 0.01 if index < 2 else -0.005,
+                "trade_return": 0.02 if index == 0 else (0.03 if index == 1 else -0.01),
+            })
+        with open(path, "w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(records)
+        args = SimpleNamespace(
+            fee=0.001,
+            slippage=0.0005,
+            test_slippage_multiplier=1.0,
+            latency_penalty_bps=0.0,
+            fee_mode="fixed",
+            initial_capital=10000.0,
+            max_position_fraction=0.10,
+        )
+        report_rows, summary = pipeline.ranking_report_from_predictions(path, args)
+        top_decile = next(
+            row
+            for row in report_rows
+            if row["score_source"] == "trade_score"
+            and row["bucket_type"] == "score_decile"
+            and row["bucket"] == "score_decile_01"
+        )
+        self.assertEqual(top_decile["rows"], 2)
+        self.assertEqual(top_decile["predicted_trades"], 2)
+        self.assertAlmostEqual(top_decile["avg_net_return_after_costs"], 0.0235)
+        self.assertAlmostEqual(top_decile["portfolio_profit_if_selected"], 47.0)
+        self.assertEqual(top_decile["top_symbol"], "AAAUSDT")
+        self.assertAlmostEqual(top_decile["top_symbol_share"], 1.0)
+        self.assertEqual(summary["ranking_report_rows_available"], 20)
+        self.assertIn("trade_score", summary["ranking_report_score_sources"])
+        self.assertAlmostEqual(summary["ranking_trade_score_top_decile_avg_net_return"], 0.0235)
 
     def test_portfolio_execution_blocks_symbol_during_loss_cooldown(self):
         base_time = 1600000000000
@@ -3306,6 +4455,243 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(len(execution["executed"]), 2)
         self.assertEqual(execution["cooldown_after_loss_blocked"], 1)
 
+    def test_fixed_horizon_exit_policy_reproduces_trade_return(self):
+        row_item = future_path_row("BTCUSDT", 1600000000000, [0.003, 0.006, 0.01], trade_return=0.01)
+        args = SimpleNamespace(
+            exit_policy="fixed_horizon",
+            holding_period_minutes=3,
+            max_holding_period_minutes=0,
+            fee_mode="fixed",
+            position_sizing_mode="fixed_fraction",
+            min_order_notional=0.0,
+            lot_size_step=0.0,
+            tick_size=0.0,
+            latency_penalty_bps=0.0,
+            partial_fill_mode="none",
+            max_open_positions=0,
+            max_daily_loss_fraction=0.0,
+            cooldown_after_loss_minutes=0,
+            meta_filter="none",
+            volatility_high_threshold=0.02,
+            upside_target=0.05,
+        )
+        execution = pipeline.portfolio_execution(
+            [row_item],
+            pipeline.build_prediction_bundle(probability=[1.0], calibrated_probability=[1.0]),
+            0.5,
+            0.0,
+            0.0,
+            100.0,
+            1.0,
+            1.0,
+            0,
+            60,
+            3,
+            hybrid_runtime_args=args,
+        )
+        self.assertEqual(execution["exit_policy"], "fixed_horizon")
+        self.assertEqual(execution["executed_exit_minutes"][0], 3)
+        self.assertEqual(execution["executed_exit_reasons"][0], "fixed_horizon")
+        self.assertAlmostEqual(execution["executed_dynamic_trade_returns"][0], 0.01)
+        self.assertAlmostEqual(execution["portfolio_profit"], 1.0)
+
+    def test_trailing_stop_does_not_activate_before_activation_return(self):
+        details = pipeline.trailing_stop_exit_details(
+            [0.005, 0.009, 0.0085, 0.008],
+            0.008,
+            0.01,
+            0.003,
+            0.02,
+            4,
+        )
+        self.assertEqual(details["exit_reason"], "max_holding_time")
+        self.assertEqual(details["exit_minutes"], 4)
+
+    def test_trailing_stop_loss_fires_before_activation(self):
+        details = pipeline.trailing_stop_exit_details(
+            [-0.021, -0.015, 0.01],
+            0.01,
+            0.01,
+            0.003,
+            0.02,
+            3,
+        )
+        self.assertEqual(details["exit_reason"], "stop_loss")
+        self.assertEqual(details["exit_minutes"], 1)
+        self.assertAlmostEqual(details["dynamic_trade_return"], -0.021)
+
+    def test_trailing_stop_activates_after_positive_one_percent(self):
+        details = pipeline.trailing_stop_exit_details(
+            [0.011, 0.0115, 0.0112],
+            0.0112,
+            0.01,
+            0.003,
+            0.02,
+            3,
+        )
+        self.assertEqual(details["exit_reason"], "max_holding_time")
+        self.assertEqual(details["exit_minutes"], 3)
+        self.assertGreater(details["max_favorable_excursion_before_exit"], 0.01)
+
+    def test_trailing_stop_exits_after_drawdown_from_best_return(self):
+        details = pipeline.trailing_stop_exit_details(
+            [0.011, 0.015, 0.012],
+            0.012,
+            0.01,
+            0.003,
+            0.02,
+            3,
+        )
+        self.assertEqual(details["exit_reason"], "trailing_stop")
+        self.assertEqual(details["exit_minutes"], 3)
+        self.assertAlmostEqual(details["dynamic_trade_return"], 0.012)
+
+    def test_trailing_stop_exits_at_max_holding_when_no_event_occurs(self):
+        details = pipeline.trailing_stop_exit_details(
+            [0.001, 0.002, 0.0015, 0.0025],
+            0.0025,
+            0.01,
+            0.003,
+            0.02,
+            4,
+        )
+        self.assertEqual(details["exit_reason"], "max_holding_time")
+        self.assertEqual(details["exit_minutes"], 4)
+        self.assertAlmostEqual(details["dynamic_trade_return"], 0.0025)
+
+    def test_trailing_stop_releases_capital_at_dynamic_exit_time(self):
+        base_time = 1600000000000
+        rows = [
+            future_path_row("AAAUSDT", base_time, [0.011, 0.007, 0.006, 0.005], trade_return=0.005),
+            future_path_row("BBBUSDT", base_time + 3 * 60 * 1000, [0.002, 0.002, 0.002, 0.002], trade_return=0.002),
+        ]
+        args = SimpleNamespace(
+            exit_policy="trailing_stop",
+            holding_period_minutes=5,
+            max_holding_period_minutes=4,
+            trailing_activation_return=0.01,
+            trailing_drawdown=0.003,
+            stop_loss=0.02,
+            dynamic_exit_price_source="existing_rows",
+            fee_mode="fixed",
+            position_sizing_mode="fixed_fraction",
+            min_order_notional=0.0,
+            lot_size_step=0.0,
+            tick_size=0.0,
+            latency_penalty_bps=0.0,
+            partial_fill_mode="none",
+            max_open_positions=1,
+            max_daily_loss_fraction=0.0,
+            cooldown_after_loss_minutes=0,
+            meta_filter="none",
+            volatility_high_threshold=0.02,
+            upside_target=0.05,
+        )
+        execution = pipeline.portfolio_execution(
+            rows,
+            pipeline.build_prediction_bundle(probability=[1.0, 1.0], calibrated_probability=[1.0, 1.0]),
+            0.5,
+            0.0,
+            0.0,
+            100.0,
+            1.0,
+            1.0,
+            0,
+            60,
+            5,
+            hybrid_runtime_args=args,
+        )
+        self.assertEqual(len(execution["executed"]), 2)
+        self.assertEqual(execution["executed_exit_minutes"][0], 2)
+        self.assertIn(1, execution["executed"])
+
+    def test_trailing_stop_fails_clearly_without_ordered_future_path(self):
+        rows = [symbol_row("BTCUSDT", 1600000000000, trade_return=0.01)]
+        args = SimpleNamespace(
+            exit_policy="trailing_stop",
+            holding_period_minutes=5,
+            max_holding_period_minutes=5,
+            trailing_activation_return=0.01,
+            trailing_drawdown=0.003,
+            stop_loss=0.02,
+            dynamic_exit_price_source="existing_rows",
+            fee_mode="fixed",
+            position_sizing_mode="fixed_fraction",
+            min_order_notional=0.0,
+            lot_size_step=0.0,
+            tick_size=0.0,
+            latency_penalty_bps=0.0,
+            partial_fill_mode="none",
+            max_open_positions=0,
+            max_daily_loss_fraction=0.0,
+            cooldown_after_loss_minutes=0,
+            meta_filter="none",
+            volatility_high_threshold=0.02,
+            upside_target=0.05,
+        )
+        with self.assertRaisesRegex(ValueError, "ordered future candle path"):
+            pipeline.portfolio_execution(
+                rows,
+                pipeline.build_prediction_bundle(probability=[1.0], calibrated_probability=[1.0]),
+                0.5,
+                0.0,
+                0.0,
+                100.0,
+                1.0,
+                1.0,
+                0,
+                60,
+                5,
+                hybrid_runtime_args=args,
+            )
+
+    def test_dynamic_exit_logic_does_not_write_cache_files(self):
+        cache_dir = os.path.join(self.temp.name, "cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        sentinel = os.path.join(cache_dir, "sentinel.txt")
+        with open(sentinel, "w", encoding="utf-8") as handle:
+            handle.write("keep")
+        before = sorted(os.listdir(cache_dir))
+        rows = [future_path_row("BTCUSDT", 1600000000000, [0.011, 0.007, 0.006], trade_return=0.006)]
+        args = SimpleNamespace(
+            exit_policy="trailing_stop",
+            holding_period_minutes=5,
+            max_holding_period_minutes=3,
+            trailing_activation_return=0.01,
+            trailing_drawdown=0.003,
+            stop_loss=0.02,
+            dynamic_exit_price_source="existing_rows",
+            fee_mode="fixed",
+            position_sizing_mode="fixed_fraction",
+            min_order_notional=0.0,
+            lot_size_step=0.0,
+            tick_size=0.0,
+            latency_penalty_bps=0.0,
+            partial_fill_mode="none",
+            max_open_positions=0,
+            max_daily_loss_fraction=0.0,
+            cooldown_after_loss_minutes=0,
+            meta_filter="none",
+            volatility_high_threshold=0.02,
+            upside_target=0.05,
+            cache_dir=cache_dir,
+        )
+        pipeline.portfolio_execution(
+            rows,
+            pipeline.build_prediction_bundle(probability=[1.0], calibrated_probability=[1.0]),
+            0.5,
+            0.0,
+            0.0,
+            100.0,
+            1.0,
+            1.0,
+            0,
+            60,
+            5,
+            hybrid_runtime_args=args,
+        )
+        self.assertEqual(before, sorted(os.listdir(cache_dir)))
+
     def test_summary_output_includes_new_fields(self):
         args = SimpleNamespace(
             split_mode="ratio",
@@ -3318,6 +4704,11 @@ class PipelineTests(unittest.TestCase):
             max_trades_per_period=10,
             trade_period_minutes=60,
             holding_period_minutes=5,
+            exit_policy="trailing_stop",
+            trailing_activation_return=0.01,
+            trailing_drawdown=0.003,
+            stop_loss=0.02,
+            max_holding_period_minutes=60,
             min_validation_trades=5,
             max_validation_trades=250,
             min_validation_precision=0.25,
@@ -3376,10 +4767,22 @@ class PipelineTests(unittest.TestCase):
             input=self.csv_path,
             run_summary_out=os.path.join(self.temp.name, "summary.json"),
             experiment_summary_out=os.path.join(self.temp.name, "summary.csv"),
+            calibration_report_out=os.path.join(self.temp.name, "calibration.csv"),
+            regime_report_out=os.path.join(self.temp.name, "regime.csv"),
+            symbol_report_out=os.path.join(self.temp.name, "symbol.csv"),
+            feature_stability_out=os.path.join(self.temp.name, "feature_stability.csv"),
+            baseline_report_out=os.path.join(self.temp.name, "baseline.csv"),
+            ranking_report_out=os.path.join(self.temp.name, "ranking.csv"),
+            experiment_report_out=os.path.join(self.temp.name, "experiment.md"),
             _explicit_flags={"memory_budget_gb", "max_rss_gb"},
         )
         fixed_record = {
             "selected_threshold": 0.95,
+            "exit_policy": "trailing_stop",
+            "trailing_activation_return": 0.01,
+            "trailing_drawdown": 0.003,
+            "stop_loss": 0.02,
+            "max_holding_period_minutes": 60,
             "portfolio_profit": 10.0,
             "portfolio_return": 0.01,
             "precision": 0.5,
@@ -3394,6 +4797,23 @@ class PipelineTests(unittest.TestCase):
             "conditional_payoff_positive_rows": 25,
             "conditional_payoff_negative_rows": 30,
             "conditional_payoff_source": "empirical_validation",
+            "rejected_over_top1_concentration_count": 2,
+            "rejected_over_top3_concentration_count": 1,
+            "closest_top1_concentration": 0.82,
+            "closest_top1_concentration_threshold": 0.04,
+            "closest_top3_concentration": 0.99,
+            "closest_top3_concentration_threshold": 0.03,
+            "selected_validation_symbol_profit_concentration_top1": 0.61,
+            "selected_validation_symbol_profit_concentration_top3": 0.90,
+            "selected_validation_symbol_trade_concentration_top1": 0.58,
+            "average_exit_minutes": 7.5,
+            "trailing_stop_exit_count": 2,
+            "stop_loss_exit_count": 1,
+            "max_holding_exit_count": 1,
+            "average_dynamic_trade_return": 0.012,
+            "average_fixed_horizon_trade_return": 0.01,
+            "dynamic_minus_fixed_avg_return": 0.002,
+            "threshold_rejection_diagnostics": [{"threshold": 0.04, "rejected_over_top1_concentration": 1}],
         }
         walk_records = [{
             "split": "walkforward_fold_1",
@@ -3418,27 +4838,44 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("accepted", summary["walk_forward_summary"])
         self.assertIn("active_fold_rate", summary["walk_forward_summary"])
         self.assertIn("strategy_strength", summary["walk_forward_summary"])
+        self.assertIn("walkforward_gate_status", summary["walk_forward_summary"])
         self.assertIsInstance(summary["args"]["_explicit_flags"], list)
         self.assertIn("normalized_microsecond_open_times", summary)
         self.assertIn("max_rss_stage", summary)
+        self.assertIn("ranking_summary", summary)
+        self.assertIn("ranking_report_rows_available", summary)
         self.assertEqual(summary["ev_upside_target_source"], "manifest")
         self.assertAlmostEqual(summary["effective_upside_target"], 0.02)
         self.assertTrue(summary["market_regime_features"])
+        self.assertAlmostEqual(summary["selected_threshold"], 0.95)
+        self.assertEqual(summary["rejected_over_top1_concentration_count"], 2)
+        self.assertAlmostEqual(summary["selected_validation_symbol_profit_concentration_top1"], 0.61)
+        self.assertEqual(summary["threshold_rejection_diagnostics"][0]["threshold"], 0.04)
+        self.assertEqual(summary["exit_policy"], "trailing_stop")
+        self.assertAlmostEqual(summary["average_exit_minutes"], 7.5)
+        self.assertIn("nonzero_feature_count", summary)
         with open(args.experiment_summary_out, newline="") as handle:
             rows = list(csv.DictReader(handle))
         self.assertIn("accepted", rows[0])
         self.assertIn("rejection_reason", rows[0])
         self.assertIn("active_fold_rate", rows[0])
         self.assertIn("strategy_strength", rows[0])
+        self.assertIn("walkforward_gate_status", rows[0])
         self.assertIn("normalized_microsecond_open_times", rows[0])
         self.assertIn("ev_upside_target_source", rows[0])
         self.assertIn("effective_upside_target", rows[0])
+        self.assertIn("ranking_report_rows_available", rows[0])
+        self.assertIn("ranking_trade_score_top_decile_avg_net_return", rows[0])
         self.assertIn("max_rss_stage", rows[0])
         self.assertIn("selected_score_name", rows[0])
         self.assertIn("selected_score_threshold", rows[0])
+        self.assertIn("exit_policy", rows[0])
+        self.assertIn("average_exit_minutes", rows[0])
         self.assertIn("hybrid_return_combination", rows[0])
         self.assertIn("hybrid_min_probability", rows[0])
         self.assertIn("conditional_payoff_source", rows[0])
+        self.assertIn("selected_validation_symbol_trade_concentration_top1", rows[0])
+        self.assertIn("nonzero_feature_count", rows[0])
 
     def test_fixed_split_summary_does_not_inherit_walkforward_rejection(self):
         args = SimpleNamespace(
@@ -3513,6 +4950,11 @@ class PipelineTests(unittest.TestCase):
             experiment_summary_out=os.path.join(self.temp.name, "fixed_summary.csv"),
             experiment_report_out=os.path.join(self.temp.name, "fixed_report.md"),
             calibration_report_out=os.path.join(self.temp.name, "fixed_calibration.csv"),
+            regime_report_out=os.path.join(self.temp.name, "fixed_regime.csv"),
+            symbol_report_out=os.path.join(self.temp.name, "fixed_symbol.csv"),
+            feature_stability_out=os.path.join(self.temp.name, "fixed_feature_stability.csv"),
+            baseline_report_out=os.path.join(self.temp.name, "fixed_baseline.csv"),
+            ranking_report_out=os.path.join(self.temp.name, "fixed_ranking.csv"),
             results_dir=self.temp.name,
             _explicit_flags={"memory_budget_gb", "max_rss_gb"},
         )
@@ -3555,7 +4997,73 @@ class PipelineTests(unittest.TestCase):
         with open(args.experiment_report_out, encoding="utf-8") as handle:
             report = handle.read()
         self.assertIn("Walk-forward acceptance: `n/a (disabled)`", report)
+        self.assertIn("Ranking / Tail Diagnostics", report)
         self.assertNotIn("no_walkforward_folds", report)
+
+    def test_print_comparison_omits_missing_logistic_file_warning_when_not_requested(self):
+        args = SimpleNamespace(
+            logistic_metrics_in=os.path.join(self.temp.name, "missing_logistic.csv"),
+            profit_safety="explore",
+            acceptance_tier="none",
+            _explicit_flags=set(),
+        )
+        gbdt_record = {
+            "model": "gbdt_lightgbm",
+            "selected_threshold": 0.5,
+            "precision": 0.3,
+            "recall": 0.1,
+            "portfolio_profit": 10.0,
+            "portfolio_return": 0.01,
+            "validation_predicted_trades": 5,
+            "validation_precision": 0.4,
+            "validation_recall": 0.2,
+            "validation_portfolio_profit": 12.0,
+            "validation_portfolio_return": 0.012,
+        }
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            pipeline.print_comparison(gbdt_record, [], args)
+        output = stdout.getvalue()
+        self.assertIn("Logistic: baseline unavailable for this run", output)
+        self.assertNotIn("metrics file not found", output)
+
+    def test_configure_output_paths_places_disk_prediction_bundle_cache_under_results_dir(self):
+        args = SimpleNamespace(
+            results_dir=os.path.join(self.temp.name, "results"),
+            prediction_bundle_cache="disk",
+            prediction_bundle_cache_dir="",
+            predictions_out="kline_growth_predictions_gbdt.csv",
+            metrics_out="kline_growth_metrics_gbdt.csv",
+            baseline_report_out="kline_growth_baseline_report.csv",
+            calibration_report_out="kline_growth_calibration_report.csv",
+            experiment_summary_out="kline_growth_experiment_summary.csv",
+            experiment_report_out="kline_growth_experiment_report.md",
+            feature_importance_out="kline_growth_feature_importance.csv",
+            feature_stability_out="kline_growth_feature_stability.csv",
+            regime_report_out="kline_growth_regime_report.csv",
+            run_summary_out="kline_growth_run_summary.json",
+            symbol_filter_diagnostics_out="kline_growth_symbol_filter_diagnostics.csv",
+            symbol_report_out="kline_growth_symbol_report.csv",
+            walkforward_diagnostics_out="kline_growth_walkforward_diagnostics.csv",
+            walkforward_metrics_out="kline_growth_walkforward_metrics.csv",
+        )
+        pipeline.configure_output_paths(args)
+        self.assertEqual(
+            args.prediction_bundle_cache_dir,
+            os.path.join(os.path.abspath(args.results_dir), "prediction_bundles"),
+        )
+
+    @unittest.skipUnless(pipeline.np is not None, "requires numpy-backed prediction cache")
+    def test_save_prediction_bundle_cache_ignores_cache_write_permission_errors(self):
+        args = SimpleNamespace(
+            prediction_bundle_cache="disk",
+            prediction_bundle_cache_dir=os.path.join(self.temp.name, "prediction_bundles"),
+            prediction_batch_rows=10,
+        )
+        selected = {}
+        rows = [row(1600000000000), row(1600000060000)]
+        bundle = pipeline.build_prediction_bundle(probability=[0.1, 0.2])
+        with mock.patch("gbdt_pipeline.atomic_write_path", side_effect=PermissionError("denied")):
+            pipeline.save_prediction_bundle_cache(selected, rows, "lightgbm", args, "test", bundle)
 
 
 if __name__ == "__main__":

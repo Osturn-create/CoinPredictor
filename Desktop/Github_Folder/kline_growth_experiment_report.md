@@ -1,7 +1,7 @@
 # CoinPredictor Experiment Report
 
 ## Dataset Summary
-- Input: `/tmp/tmp0vpwp_ik/synthetic.csv`
+- Input: `/tmp/tmp_ey6thq4/synthetic.csv`
 - Rows: `1`
 - Features: `1`
 - Symbols: `TESTUSDT`

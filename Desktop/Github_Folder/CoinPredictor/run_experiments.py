@@ -52,24 +52,46 @@ RESULT_COLUMNS = [
     "profile",
     "objective_mode",
     "trade_score",
+    "walk_train_months",
+    "walk_validation_months",
+    "walk_test_months",
     "regression_calibration",
     "regression_target",
+    "hybrid_return_combination",
+    "hybrid_min_probability",
     "hybrid_score_mode",
     "hybrid_uncertainty_method",
     "hybrid_uncertainty_penalty",
     "dynamic_hybrid_thresholds",
     "meta_filter",
     "meta_filter_min_probability",
+    "symbol_filter_stage",
+    "threshold_tiebreaker",
     "ensemble_windows",
     "ev_safety_margin",
     "min_selected_threshold",
     "min_validation_precision",
     "top_k_per_minute",
+    "top_k_per_symbol_minute",
     "max_trades_per_period",
     "max_validation_trades",
     "threshold_drawdown_penalty",
     "threshold_trade_count_penalty",
+    "threshold_burst_trades_per_day_penalty",
+    "threshold_burst_max_trades_in_day_penalty",
+    "threshold_floor_snap_penalty_weight",
+    "threshold_floor_snap_tolerance",
+    "threshold_floor_snap_score_tolerance_ratio",
+    "threshold_target_trades_per_day",
+    "threshold_target_max_trades_in_day",
+    "threshold_short_history_days",
+    "threshold_short_history_penalty",
     "target_validation_trades",
+    "calibration_window_mode",
+    "calibration_recent_ratio",
+    "calibration_recent_rows",
+    "walk_forward_start_fold",
+    "walk_forward_max_folds",
     "min_predicted_net_return",
     "hybrid_min_score",
     "total_profit",
@@ -96,9 +118,10 @@ RESULT_COLUMNS = [
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(description="Run same-spec experiment grids against gbdt_pipeline.py")
-    parser.add_argument("--profile", choices=["7.8gb", "7.8gb-overtrade-check", "hybrid-calibration", "hybrid-risk-adjusted", "hybrid-meta-filter", "hybrid-ensemble-small"], default="7.8gb")
+    parser.add_argument("--profile", choices=["7.8gb", "7.8gb-overtrade-check", "hybrid-calibration", "hybrid-risk-adjusted", "hybrid-meta-filter", "hybrid-ensemble-small", "hybrid-late-recent", "hybrid-late-recent-tuned"], default="7.8gb")
     parser.add_argument("--max-runs", type=int, default=6)
     parser.add_argument("--full-grid", action="store_true")
+    parser.add_argument("--input", default="")
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--pipeline-script", default="gbdt_pipeline.py")
     parser.add_argument("--summary-path", default="kline_growth_run_summary.json")
@@ -111,7 +134,7 @@ def parse_args(argv):
 
 
 def same_spec_profile_args(profile):
-    if profile not in ("7.8gb", "7.8gb-overtrade-check", "hybrid-calibration", "hybrid-risk-adjusted", "hybrid-meta-filter", "hybrid-ensemble-small"):
+    if profile not in ("7.8gb", "7.8gb-overtrade-check", "hybrid-calibration", "hybrid-risk-adjusted", "hybrid-meta-filter", "hybrid-ensemble-small", "hybrid-late-recent", "hybrid-late-recent-tuned"):
         raise ValueError("unsupported profile: {}".format(profile))
     return list(SAME_SPEC_PROFILE_7_8GB)
 
@@ -379,6 +402,119 @@ def hybrid_ensemble_small_experiments():
         }
 
 
+def hybrid_late_recent_experiments():
+    for burst_penalty, short_history_penalty, recent_rows in itertools.product(
+        (0.03, 0.04),
+        (0.12, 0.18),
+        (200000, 250000),
+    ):
+        yield {
+            "profile": "hybrid-late-recent",
+            "input": "shard_dataset_30_volatile_from_existing",
+            "cache_dir": ".gbdt_cache_full30_volatile",
+            "objective_mode": "hybrid",
+            "trade_score": "hybrid",
+            "regression_calibration": "linear",
+            "regression_target": "clipped_net_return",
+            "hybrid_score_mode": "risk_adjusted",
+            "hybrid_uncertainty_method": "bucket_residual",
+            "hybrid_uncertainty_penalty": 0.25,
+            "dynamic_hybrid_thresholds": "btc_volatility_regime",
+            "meta_filter": "logistic",
+            "meta_filter_min_probability": 0.55,
+            "ensemble_windows": "",
+            "walk_forward": True,
+            "walk_forward_start_fold": 70,
+            "walk_forward_max_folds": 10,
+            "ev_safety_margin": 0.0,
+            "min_selected_threshold": 0.0,
+            "min_validation_precision": 0.0,
+            "top_k_per_minute": 1,
+            "max_trades_per_period": 5,
+            "max_validation_trades": 150,
+            "threshold_drawdown_penalty": 0.05,
+            "threshold_trade_count_penalty": 0.0005,
+            "threshold_burst_trades_per_day_penalty": burst_penalty,
+            "threshold_burst_max_trades_in_day_penalty": burst_penalty * 0.5,
+            "threshold_target_trades_per_day": 3.5,
+            "threshold_target_max_trades_in_day": 6,
+            "threshold_short_history_days": 45.0,
+            "threshold_short_history_penalty": short_history_penalty,
+            "target_validation_trades": 100,
+            "calibration_window_mode": "recent",
+            "calibration_recent_ratio": 0.0,
+            "calibration_recent_rows": recent_rows,
+            "min_predicted_net_return": 0.0,
+            "hybrid_min_score": 0.001,
+            "hybrid_min_score_calibration_aware": True,
+            "hybrid_min_score_calibration_reference_scale": 0.20,
+            "hybrid_min_score_calibration_min_ratio": 0.25,
+            "hybrid_min_score_calibration_floor_min": 0.00025,
+        }
+
+
+def hybrid_late_recent_tuned_experiments():
+    for walk_train_months, floor_snap_penalty_weight in itertools.product(
+        (6, 8),
+        (0.04, 0.05),
+    ):
+        yield {
+            "profile": "hybrid-late-recent-tuned",
+            "input": "shard_dataset_30_volatile_from_existing",
+            "cache_dir": ".gbdt_cache_full30_volatile",
+            "objective_mode": "hybrid",
+            "trade_score": "hybrid",
+            "walk_train_months": walk_train_months,
+            "walk_validation_months": 1,
+            "walk_test_months": 1,
+            "walk_forward": True,
+            "walk_forward_start_fold": 88,
+            "walk_forward_max_folds": 10,
+            "regression_calibration": "linear",
+            "regression_target": "clipped_net_return",
+            "hybrid_return_combination": "expected_return",
+            "hybrid_min_probability": 0.03,
+            "hybrid_score_mode": "risk_adjusted",
+            "hybrid_uncertainty_method": "bucket_residual",
+            "hybrid_uncertainty_penalty": 0.10,
+            "dynamic_hybrid_thresholds": "none",
+            "meta_filter": "none",
+            "meta_filter_min_probability": 0.5,
+            "symbol_filter_stage": "candidate_blend",
+            "threshold_tiebreaker": "balanced",
+            "ensemble_windows": "",
+            "ev_safety_margin": 0.0,
+            "min_selected_threshold": 0.0005,
+            "min_validation_precision": 0.02,
+            "top_k_per_minute": 2,
+            "top_k_per_symbol_minute": 1,
+            "max_trades_per_period": 0,
+            "max_validation_trades": 400,
+            "threshold_drawdown_penalty": 0.02,
+            "threshold_trade_count_penalty": 0.00025,
+            "threshold_burst_trades_per_day_penalty": 0.01,
+            "threshold_burst_max_trades_in_day_penalty": 0.005,
+            "threshold_floor_snap_penalty_weight": floor_snap_penalty_weight,
+            "threshold_floor_snap_tolerance": 0.0003,
+            "threshold_floor_snap_score_tolerance_ratio": 0.10,
+            "threshold_target_trades_per_day": 5.0,
+            "threshold_target_max_trades_in_day": 10,
+            "threshold_short_history_days": 45.0,
+            "threshold_short_history_penalty": 0.06,
+            "target_validation_trades": 220,
+            "calibration_window_mode": "recent",
+            "calibration_recent_ratio": 0.0,
+            "calibration_recent_rows": 250000,
+            "min_predicted_net_return": 0.0,
+            "hybrid_min_score": 0.0001,
+            "hybrid_min_score_calibration_aware": True,
+            "hybrid_min_score_calibration_reference_scale": 0.10,
+            "hybrid_min_score_calibration_min_ratio": 0.05,
+            "hybrid_min_score_calibration_floor_min": -0.0012,
+            "hybrid_min_score_calibration_floor_max": -0.0007,
+        }
+
+
 def build_experiment_grid_for_profile(profile, full_grid=False, max_runs=6):
     if profile == "7.8gb-overtrade-check":
         experiments = overtrade_check_experiments()
@@ -391,6 +527,10 @@ def build_experiment_grid_for_profile(profile, full_grid=False, max_runs=6):
         return list(hybrid_meta_filter_experiments())[:max(0, max_runs)]
     if profile == "hybrid-ensemble-small":
         return list(hybrid_ensemble_small_experiments())[:max(0, max_runs)]
+    if profile == "hybrid-late-recent":
+        return list(hybrid_late_recent_experiments())[:max(0, max_runs)]
+    if profile == "hybrid-late-recent-tuned":
+        return list(hybrid_late_recent_tuned_experiments())[:max(0, max_runs)]
     experiments = list(classification_experiments())
     experiments.extend(return_regression_experiments())
     experiments.extend(hybrid_experiments())
@@ -422,6 +562,18 @@ def experiment_name(experiment):
     if experiment.get("profile") == "hybrid-ensemble-small":
         label = experiment["ensemble_windows"].replace(",", "_") or "none"
         return "hyb_ens_{}".format(label)
+    if experiment.get("profile") == "hybrid-late-recent":
+        return "hyb_late_recent_b{}_s{}_rows{}".format(
+            str(experiment["threshold_burst_trades_per_day_penalty"]).replace(".", "p"),
+            str(experiment["threshold_short_history_penalty"]).replace(".", "p"),
+            experiment["calibration_recent_rows"],
+        )
+    if experiment.get("profile") == "hybrid-late-recent-tuned":
+        return "hyb_late_tuned_{}m_sf{}_f{}".format(
+            experiment.get("walk_train_months", 6),
+            str(experiment.get("threshold_floor_snap_penalty_weight", 0.0)).replace(".", "p"),
+            experiment.get("walk_forward_start_fold", 88),
+        )
     if experiment["objective_mode"] == "classification":
         return "cls_ev_m{}_thr{}_prec{}_topk{}".format(
             str(experiment["ev_safety_margin"]).replace(".", "p"),
@@ -447,6 +599,19 @@ def build_command(args, experiment):
     command = [args.python, pipeline_path]
     command.extend(same_spec_profile_args(args.profile))
     command.extend(COMMON_TRADING_ARGS)
+    input_path = experiment.get("input") or args.input
+    if input_path:
+        command.extend(["--input", input_path])
+    cache_dir = experiment.get("cache_dir", "")
+    if cache_dir:
+        replaced = False
+        for index, value in enumerate(command[:-1]):
+            if value == "--cache-dir":
+                command[index + 1] = cache_dir
+                replaced = True
+                break
+        if not replaced:
+            command.extend(["--cache-dir", cache_dir])
     command.append("--cache-only")
     if not experiment.get("walk_forward", True):
         command = [value for value in command if value != "--walk-forward"]
@@ -454,7 +619,11 @@ def build_command(args, experiment):
         "--objective-mode", experiment["objective_mode"],
         "--trade-selection", "topk_score",
         "--trade-score", experiment["trade_score"],
+        "--walk-train-months", str(experiment.get("walk_train_months", 6)),
+        "--walk-validation-months", str(experiment.get("walk_validation_months", 1)),
+        "--walk-test-months", str(experiment.get("walk_test_months", 1)),
         "--top-k-per-minute", str(experiment["top_k_per_minute"]),
+        "--top-k-per-symbol-minute", str(experiment.get("top_k_per_symbol_minute", 0)),
         "--max-trades-per-period", str(experiment.get("max_trades_per_period", 10)),
         "--max-validation-trades", str(experiment.get("max_validation_trades", 250)),
         "--threshold-drawdown-penalty", str(experiment.get("threshold_drawdown_penalty", 0.0)),
@@ -462,6 +631,8 @@ def build_command(args, experiment):
         "--target-validation-trades", str(experiment.get("target_validation_trades", 0)),
         "--acceptance-tier", args.acceptance_tier,
         "--run-summary-out", args.summary_path,
+        "--walk-forward-start-fold", str(experiment.get("walk_forward_start_fold", 0)),
+        "--walk-forward-max-folds", str(experiment.get("walk_forward_max_folds", 0)),
         "--regression-calibration", experiment.get("regression_calibration", "none"),
         "--regression-target", experiment.get("regression_target", "trade_return"),
         "--hybrid-score-mode", experiment.get("hybrid_score_mode", "basic"),
@@ -470,6 +641,17 @@ def build_command(args, experiment):
         "--dynamic-hybrid-thresholds", experiment.get("dynamic_hybrid_thresholds", "none"),
         "--meta-filter", experiment.get("meta_filter", "none"),
         "--meta-filter-min-probability", str(experiment.get("meta_filter_min_probability", 0.5)),
+        "--threshold-burst-trades-per-day-penalty", str(experiment.get("threshold_burst_trades_per_day_penalty", 0.0)),
+        "--threshold-burst-max-trades-in-day-penalty", str(experiment.get("threshold_burst_max_trades_in_day_penalty", 0.0)),
+        "--threshold-floor-snap-penalty-weight", str(experiment.get("threshold_floor_snap_penalty_weight", 0.0)),
+        "--threshold-floor-snap-tolerance", str(experiment.get("threshold_floor_snap_tolerance", 0.0)),
+        "--threshold-floor-snap-score-tolerance-ratio", str(experiment.get("threshold_floor_snap_score_tolerance_ratio", 0.0)),
+        "--threshold-target-trades-per-day", str(experiment.get("threshold_target_trades_per_day", 0.0)),
+        "--threshold-target-max-trades-in-day", str(experiment.get("threshold_target_max_trades_in_day", 0)),
+        "--threshold-short-history-days", str(experiment.get("threshold_short_history_days", 0.0)),
+        "--threshold-short-history-penalty", str(experiment.get("threshold_short_history_penalty", 0.0)),
+        "--symbol-filter-stage", experiment.get("symbol_filter_stage", "executed"),
+        "--threshold-tiebreaker", experiment.get("threshold_tiebreaker", "fewer_trades"),
     ])
     if experiment.get("ensemble_windows", ""):
         command.extend(["--ensemble-windows", experiment["ensemble_windows"]])
@@ -478,6 +660,9 @@ def build_command(args, experiment):
             "--threshold-objective", "ev",
             "--calibration", "platt",
             "--calibration-max-rows", "500000",
+            "--calibration-window-mode", experiment.get("calibration_window_mode", "all"),
+            "--calibration-recent-ratio", str(experiment.get("calibration_recent_ratio", 0.0)),
+            "--calibration-recent-rows", str(experiment.get("calibration_recent_rows", 0)),
             "--ev-safety-margin", str(experiment["ev_safety_margin"]),
             "--min-selected-threshold", str(experiment["min_selected_threshold"]),
             "--min-validation-precision", str(experiment["min_validation_precision"]),
@@ -490,7 +675,22 @@ def build_command(args, experiment):
         command.extend([
             "--calibration", "platt",
             "--calibration-max-rows", "500000",
+            "--calibration-window-mode", experiment.get("calibration_window_mode", "all"),
+            "--calibration-recent-ratio", str(experiment.get("calibration_recent_ratio", 0.0)),
+            "--calibration-recent-rows", str(experiment.get("calibration_recent_rows", 0)),
+            "--hybrid-return-combination", experiment.get("hybrid_return_combination", "probability_times_return"),
+            "--hybrid-min-probability", str(experiment.get("hybrid_min_probability", 0.0)),
             "--hybrid-min-score", str(experiment["hybrid_min_score"]),
+            "--min-selected-threshold", str(experiment.get("min_selected_threshold", 0.0)),
+            "--min-validation-precision", str(experiment.get("min_validation_precision", 0.0)),
+        ])
+        if experiment.get("hybrid_min_score_calibration_aware"):
+            command.append("--hybrid-min-score-calibration-aware")
+        command.extend([
+            "--hybrid-min-score-calibration-reference-scale", str(experiment.get("hybrid_min_score_calibration_reference_scale", 0.20)),
+            "--hybrid-min-score-calibration-min-ratio", str(experiment.get("hybrid_min_score_calibration_min_ratio", 0.25)),
+            "--hybrid-min-score-calibration-floor-min", str(experiment.get("hybrid_min_score_calibration_floor_min", 0.0)),
+            "--hybrid-min-score-calibration-floor-max", str(experiment.get("hybrid_min_score_calibration_floor_max", 0.0)),
         ])
     return command
 
@@ -518,24 +718,46 @@ def summary_record(experiment, summary, run_exit_code):
         "profile": experiment.get("profile", ""),
         "objective_mode": experiment["objective_mode"],
         "trade_score": experiment["trade_score"],
+        "walk_train_months": experiment.get("walk_train_months", 6),
+        "walk_validation_months": experiment.get("walk_validation_months", 1),
+        "walk_test_months": experiment.get("walk_test_months", 1),
         "regression_calibration": experiment.get("regression_calibration", "none"),
         "regression_target": experiment.get("regression_target", "trade_return"),
+        "hybrid_return_combination": experiment.get("hybrid_return_combination", "probability_times_return"),
+        "hybrid_min_probability": experiment.get("hybrid_min_probability", 0.0),
         "hybrid_score_mode": experiment.get("hybrid_score_mode", "basic"),
         "hybrid_uncertainty_method": experiment.get("hybrid_uncertainty_method", "none"),
         "hybrid_uncertainty_penalty": experiment.get("hybrid_uncertainty_penalty", 0.0),
         "dynamic_hybrid_thresholds": experiment.get("dynamic_hybrid_thresholds", "none"),
         "meta_filter": experiment.get("meta_filter", "none"),
         "meta_filter_min_probability": experiment.get("meta_filter_min_probability", 0.5),
+        "symbol_filter_stage": experiment.get("symbol_filter_stage", "executed"),
+        "threshold_tiebreaker": experiment.get("threshold_tiebreaker", "fewer_trades"),
         "ensemble_windows": experiment.get("ensemble_windows", ""),
         "ev_safety_margin": experiment["ev_safety_margin"],
         "min_selected_threshold": experiment["min_selected_threshold"],
         "min_validation_precision": experiment["min_validation_precision"],
         "top_k_per_minute": experiment["top_k_per_minute"],
+        "top_k_per_symbol_minute": experiment.get("top_k_per_symbol_minute", 0),
         "max_trades_per_period": experiment.get("max_trades_per_period", 10),
         "max_validation_trades": experiment.get("max_validation_trades", 250),
         "threshold_drawdown_penalty": experiment.get("threshold_drawdown_penalty", 0.0),
         "threshold_trade_count_penalty": experiment.get("threshold_trade_count_penalty", 0.0),
+        "threshold_burst_trades_per_day_penalty": experiment.get("threshold_burst_trades_per_day_penalty", 0.0),
+        "threshold_burst_max_trades_in_day_penalty": experiment.get("threshold_burst_max_trades_in_day_penalty", 0.0),
+        "threshold_floor_snap_penalty_weight": experiment.get("threshold_floor_snap_penalty_weight", 0.0),
+        "threshold_floor_snap_tolerance": experiment.get("threshold_floor_snap_tolerance", 0.0),
+        "threshold_floor_snap_score_tolerance_ratio": experiment.get("threshold_floor_snap_score_tolerance_ratio", 0.0),
+        "threshold_target_trades_per_day": experiment.get("threshold_target_trades_per_day", 0.0),
+        "threshold_target_max_trades_in_day": experiment.get("threshold_target_max_trades_in_day", 0),
+        "threshold_short_history_days": experiment.get("threshold_short_history_days", 0.0),
+        "threshold_short_history_penalty": experiment.get("threshold_short_history_penalty", 0.0),
         "target_validation_trades": experiment.get("target_validation_trades", 0),
+        "calibration_window_mode": experiment.get("calibration_window_mode", "all"),
+        "calibration_recent_ratio": experiment.get("calibration_recent_ratio", 0.0),
+        "calibration_recent_rows": experiment.get("calibration_recent_rows", 0),
+        "walk_forward_start_fold": experiment.get("walk_forward_start_fold", 0),
+        "walk_forward_max_folds": experiment.get("walk_forward_max_folds", 0),
         "min_predicted_net_return": experiment["min_predicted_net_return"],
         "hybrid_min_score": experiment["hybrid_min_score"],
         "total_profit": float_value(source.get("portfolio_profit", 0.0)),

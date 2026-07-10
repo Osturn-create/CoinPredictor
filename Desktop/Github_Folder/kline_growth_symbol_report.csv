@@ -1,0 +1,2 @@
+symbol,rows,predicted_trades,actual_positive_rows,win_rate,avg_forward_return,avg_trade_return,total_profit_after_fee,total_profit_after_fee_and_slippage,profit_factor,avg_position_size,portfolio_profit_contribution,skipped_reason
+,,,,,,,,,,,,prediction_output_missing

@@ -9,11 +9,12 @@ symbol's month_index.
 import argparse
 from array import array
 import bisect
-from collections import deque
+from collections import Counter, deque
 import csv
 import datetime
 import gc
 import hashlib
+import heapq
 import importlib.util
 import json
 import math
@@ -26,6 +27,7 @@ import tempfile
 import time
 import warnings
 import gzip
+import zipfile
 
 try:
     import numpy as np
@@ -285,6 +287,69 @@ def apply_memory_budget_defaults(args, explicit_flags):
     return True
 
 
+def apply_diversity_selection_defaults(args, explicit_flags):
+    diversity_controls_enabled = any((
+        float(getattr(args, "threshold_top1_concentration_penalty", 0.0)) > 0.0,
+        float(getattr(args, "threshold_top3_concentration_penalty", 0.0)) > 0.0,
+        float(getattr(args, "threshold_trade_top1_concentration_penalty", 0.0)) > 0.0,
+        float(getattr(args, "threshold_max_top1_concentration", 0.0)) > 0.0,
+        float(getattr(args, "threshold_max_top3_concentration", 0.0)) > 0.0,
+        float(getattr(args, "threshold_max_trade_top1_concentration", 0.0)) > 0.0,
+        int(getattr(args, "symbol_filter_min_active_days", 0)) > 0,
+        float(getattr(args, "symbol_filter_max_executed_trade_share", 0.0)) > 0.0,
+    ))
+    if not diversity_controls_enabled:
+        return False
+
+    changed = False
+    if "threshold_tiebreaker" not in explicit_flags and getattr(args, "threshold_tiebreaker", "fewer_trades") == "fewer_trades":
+        args.threshold_tiebreaker = "diversified"
+        changed = True
+    if "threshold_diversity_profit_tolerance_ratio" not in explicit_flags and float(getattr(args, "threshold_diversity_profit_tolerance_ratio", 0.0)) <= 0.0:
+        args.threshold_diversity_profit_tolerance_ratio = 0.25
+        changed = True
+    if "threshold_diversity_penalty_weight" not in explicit_flags and float(getattr(args, "threshold_diversity_penalty_weight", 0.0)) <= 0.0:
+        args.threshold_diversity_penalty_weight = 0.01
+        changed = True
+    if "threshold_concentration_cap_mode" not in explicit_flags and getattr(args, "threshold_concentration_cap_mode", "soft") != "soft":
+        args.threshold_concentration_cap_mode = "soft"
+        changed = True
+    if "threshold_diversity_min_profit_top1_improvement" not in explicit_flags and float(getattr(args, "threshold_diversity_min_profit_top1_improvement", 0.0)) <= 0.0:
+        args.threshold_diversity_min_profit_top1_improvement = 0.05
+        changed = True
+    if "threshold_diversity_min_trade_top1_improvement" not in explicit_flags and float(getattr(args, "threshold_diversity_min_trade_top1_improvement", 0.0)) <= 0.0:
+        args.threshold_diversity_min_trade_top1_improvement = 0.05
+        changed = True
+    if "symbol_validation_filter" not in explicit_flags and getattr(args, "symbol_validation_filter", "none") == "none":
+        args.symbol_validation_filter = "positive_avg_profit"
+        changed = True
+    if "symbol_filter_stage" not in explicit_flags and getattr(args, "symbol_filter_stage", "executed") == "executed":
+        args.symbol_filter_stage = "candidate_blend"
+        changed = True
+    if "symbol_filter_min_active_days" not in explicit_flags and int(getattr(args, "symbol_filter_min_active_days", 0)) <= 0:
+        args.symbol_filter_min_active_days = 3
+        changed = True
+    if "symbol_filter_max_executed_trade_share" not in explicit_flags and float(getattr(args, "symbol_filter_max_executed_trade_share", 0.0)) <= 0.0:
+        args.symbol_filter_max_executed_trade_share = 0.55
+        changed = True
+    if "symbol_dominance_penalty_validation_weight" not in explicit_flags and float(getattr(args, "symbol_dominance_penalty_validation_weight", 0.0)) <= 0.0:
+        args.symbol_dominance_penalty_validation_weight = 0.35
+        changed = True
+    if "symbol_dominance_penalty_recent_weight" not in explicit_flags and float(getattr(args, "symbol_dominance_penalty_recent_weight", 0.0)) <= 0.0:
+        args.symbol_dominance_penalty_recent_weight = 0.50
+        changed = True
+    if "symbol_dominance_penalty_grace" not in explicit_flags and float(getattr(args, "symbol_dominance_penalty_grace", 0.0)) <= 0.0:
+        args.symbol_dominance_penalty_grace = 0.35
+        changed = True
+    if "prefer_unique_symbols" not in explicit_flags and not bool(getattr(args, "prefer_unique_symbols", False)):
+        args.prefer_unique_symbols = True
+        changed = True
+    if "symbol_reentry_cooldown_minutes" not in explicit_flags and int(getattr(args, "symbol_reentry_cooldown_minutes", 0)) <= 0:
+        args.symbol_reentry_cooldown_minutes = 15
+        changed = True
+    return changed
+
+
 def print_memory_budget_summary(args, budget_applied):
     if not budget_applied:
         return
@@ -305,6 +370,12 @@ def print_memory_budget_summary(args, budget_applied):
 
 def current_rss_gib(stage=None):
     if psutil is None:
+        return None
+    try:
+        rss_gib = psutil.Process(os.getpid()).memory_info().rss / float(1024 ** 3)
+        update_peak_rss(rss_gib, stage)
+        return rss_gib
+    except Exception:
         return None
 
 
@@ -383,12 +454,6 @@ def record_profile_stage(stage_name, elapsed_seconds, rows_processed=0, extra_in
         "rows_per_second_if_available": rows_per_second,
         "extra_info": extra_info,
     })
-    try:
-        rss_gib = psutil.Process(os.getpid()).memory_info().rss / float(1024 ** 3)
-        update_peak_rss(rss_gib, stage)
-        return rss_gib
-    except Exception:
-        return None
 
 
 def check_memory_limit(stage, args):
@@ -451,6 +516,7 @@ def output_path_args():
         "symbol_report_out",
         "feature_stability_out",
         "baseline_report_out",
+        "ranking_report_out",
         "experiment_report_out",
         "run_summary_out",
         "experiment_summary_out",
@@ -464,6 +530,7 @@ DEFAULT_REPORT_FILENAMES = {
     "symbol_report_out": "kline_growth_symbol_report.csv",
     "feature_stability_out": "kline_growth_feature_stability.csv",
     "baseline_report_out": "kline_growth_baseline_report.csv",
+    "ranking_report_out": "kline_growth_ranking_report.csv",
     "experiment_report_out": "kline_growth_experiment_report.md",
 }
 
@@ -480,6 +547,8 @@ def configure_output_paths(args):
         return
     results_dir = os.path.abspath(args.results_dir)
     os.makedirs(results_dir, exist_ok=True)
+    if getattr(args, "prediction_bundle_cache", "") == "disk" and not getattr(args, "prediction_bundle_cache_dir", ""):
+        args.prediction_bundle_cache_dir = os.path.join(results_dir, "prediction_bundles")
     for name in output_path_args():
         value = getattr(args, name, "")
         if not value:
@@ -1255,17 +1324,23 @@ def fit_regression_calibration(predicted_trade_returns, rows, args):
     mode = getattr(args, "regression_calibration", "none")
     if mode == "none" or predicted_trade_returns is None:
         return None
-    actuals = actual_trade_returns(rows)
+    calibration_predictions, calibration_rows = recent_calibration_subset(predicted_trade_returns, rows, args)
+    actuals = actual_trade_returns(calibration_rows)
     if mode == "linear":
-        return fit_linear_regression_calibration(predicted_trade_returns, actuals, args.regression_calibration_max_rows)
-    if mode == "isotonic-lite":
-        return fit_isotonic_lite_regression_calibration(
-            predicted_trade_returns,
+        calibration = fit_linear_regression_calibration(calibration_predictions, actuals, args.regression_calibration_max_rows)
+    elif mode == "isotonic-lite":
+        calibration = fit_isotonic_lite_regression_calibration(
+            calibration_predictions,
             actuals,
             args.regression_calibration_max_rows,
             args.regression_calibration_buckets,
         )
-    return None
+    else:
+        return None
+    calibration["window_mode"] = getattr(args, "calibration_window_mode", "all")
+    calibration["recent_ratio"] = float(getattr(args, "calibration_recent_ratio", 0.0))
+    calibration["recent_rows"] = int(getattr(args, "calibration_recent_rows", 0))
+    return calibration
 
 
 def apply_regression_calibration(values, calibration, batch_size=200000):
@@ -1377,8 +1452,13 @@ def apply_platt_calibration(probabilities, a_value, b_value, batch_size=200000):
 def fit_calibration(probabilities, rows, args):
     if args.calibration != "platt":
         return None
-    labels_values = rows.labels_array() if is_compact_rows(rows) else [row.label for row in rows]
-    return fit_platt_calibration(probabilities, labels_values, args.calibration_max_rows)
+    calibration_probabilities, calibration_rows = recent_calibration_subset(probabilities, rows, args)
+    labels_values = calibration_rows.labels_array() if is_compact_rows(calibration_rows) else [row.label for row in calibration_rows]
+    calibration = fit_platt_calibration(calibration_probabilities, labels_values, args.calibration_max_rows)
+    calibration["window_mode"] = getattr(args, "calibration_window_mode", "all")
+    calibration["recent_ratio"] = float(getattr(args, "calibration_recent_ratio", 0.0))
+    calibration["recent_rows"] = int(getattr(args, "calibration_recent_rows", 0))
+    return calibration
 
 
 def calibrate_probabilities(probabilities, calibration):
@@ -2235,37 +2315,12 @@ def fit_meta_filter(rows, bundle, threshold, args, symbol_filter_info=None):
                 "meta-filter-lightgbm-missing",
                 "Warning: --meta-filter lightgbm requested but LightGBM is unavailable; falling back to logistic meta filter.",
             )
-            mode = "logistic"
         else:
-            from lightgbm import LGBMClassifier
-            model = LGBMClassifier(
-                n_estimators=80,
-                learning_rate=0.05,
-                num_leaves=15,
-                max_depth=4,
-                subsample=0.9,
-                subsample_freq=1,
-                colsample_bytree=0.85,
-                min_child_samples=10,
-                reg_alpha=0.25,
-                reg_lambda=1.0,
-                n_jobs=max(1, int(getattr(args, "n_jobs", 1))),
-                objective="binary",
-                random_state=17,
-                verbosity=-1,
-                force_col_wise=True,
+            warn_once(
+                "meta-filter-lightgbm-unsupported",
+                "Warning: --meta-filter lightgbm is disabled in this project configuration; falling back to logistic meta filter.",
             )
-            model.fit(x_train, y_train)
-            eval_probabilities = np.asarray(model.predict_proba(x_eval)[:, 1], dtype=np.float32) if np is not None else [float(row[1]) for row in model.predict_proba(x_eval)]
-            return {
-                "mode": "lightgbm",
-                "enabled": True,
-                "rows": len(candidate_indices),
-                "positive_rate": positive_rate,
-                "accuracy": meta_accuracy(eval_probabilities, y_eval, args.meta_filter_min_probability),
-                "auc": 0.0,
-                "model": model,
-            }
+        mode = "logistic"
     model = InternalMetaLogistic()
     model.fit(x_train, y_train)
     eval_probabilities = model.predict_proba(x_eval)
@@ -2420,6 +2475,14 @@ def recalibrate_meta_filter_validation(rows, bundle, threshold, args, selection,
         selected_score_name,
         args.min_validation_trades,
         args.max_validation_trades,
+        getattr(args, "threshold_top1_concentration_penalty", 0.0),
+        getattr(args, "threshold_top3_concentration_penalty", 0.0),
+        getattr(args, "threshold_trade_top1_concentration_penalty", 0.0),
+        getattr(args, "threshold_max_top1_concentration", 0.0),
+        getattr(args, "threshold_max_top3_concentration", 0.0),
+        getattr(args, "threshold_max_trade_top1_concentration", 0.0),
+        getattr(args, "threshold_concentration_cap_mode", "soft"),
+        getattr(args, "threshold_diversity_penalty_weight", 0.0),
     )
     trade_count = int(meta_selection["validation_metrics"].get("predicted_trades", 0))
     raw_signal_count = int(meta_selection["validation_metrics"].get("raw_signal_trades", 0))
@@ -3165,6 +3228,7 @@ def discover_sharded_dataset_shards(path, dataset_manifest):
             if not symbol or not month:
                 raise ValueError("{} contains a shard inventory entry missing symbol/month".format(training_manifest_path(path)))
             csv_path = resolve_dataset_relative_path(dataset_dir, item.get("csv_path"))
+            meta_path = resolve_dataset_relative_path(dataset_dir, item.get("meta_path"))
             if not csv_path:
                 compression = str(item.get("compression", "") or "")
                 filename = "{}.csv.gz".format(month) if compression == "gzip" else "{}.csv".format(month)
@@ -3173,11 +3237,13 @@ def discover_sharded_dataset_shards(path, dataset_manifest):
                     gz_path = os.path.join(shard_root, symbol, "{}.csv.gz".format(month))
                     if os.path.exists(gz_path):
                         csv_path = gz_path
+            if not meta_path:
+                meta_path = os.path.join(shard_root, symbol, "{}.meta.json".format(month))
             candidate_paths.append((
                 csv_path,
-                os.path.join(shard_root, symbol, "{}.meta.json".format(month)),
+                meta_path,
             ))
-    else:
+    if not candidate_paths:
         for root, _, files in os.walk(shard_root):
             for name in files:
                 if not (name.endswith(".csv") or name.endswith(".csv.gz")):
@@ -3195,6 +3261,8 @@ def discover_sharded_dataset_shards(path, dataset_manifest):
         if manifest_csv_path and manifest_csv_path != os.path.abspath(csv_path):
             if os.path.exists(manifest_csv_path):
                 csv_path = manifest_csv_path
+            elif os.path.exists(csv_path):
+                pass
             else:
                 raise ValueError("shard manifest {} references missing csv_path {}".format(meta_path, manifest_csv_path))
         if not os.path.exists(csv_path):
@@ -4228,14 +4296,20 @@ def source_csv_info(path, training_manifest=None, manifest_path=None, manifest_s
 def cache_manifest_matches(manifest, path, dtype, paths, training_manifest=None, manifest_path=None,
                            manifest_signature_override=None):
     source = source_csv_info(path, training_manifest, manifest_path, manifest_signature_override)
+    source_manifest_signature = source.get("training_manifest_signature")
+    cached_manifest_signature = manifest.get("training_manifest_signature")
+    if manifest_signature_override is not None and source_manifest_signature:
+        training_manifest_path_matches = cached_manifest_signature == source_manifest_signature
+    else:
+        training_manifest_path_matches = manifest.get("training_manifest_path") == source.get("training_manifest_path")
     return (
         manifest.get("version") == CACHE_VERSION
         and manifest.get("source_csv_path") == source["source_csv_path"]
         and manifest.get("source_csv_mtime_ns") == source["source_csv_mtime_ns"]
         and manifest.get("source_csv_size") == source["source_csv_size"]
-        and manifest.get("training_manifest_path") == source.get("training_manifest_path")
+        and training_manifest_path_matches
         and manifest.get("training_manifest_mtime_ns") == source.get("training_manifest_mtime_ns")
-        and manifest.get("training_manifest_signature") == source.get("training_manifest_signature")
+        and cached_manifest_signature == source_manifest_signature
         and manifest.get("feature_dtype") == np.dtype(dtype).name
         and manifest.get("row_count", 0) >= 0
         and bool(manifest.get("feature_columns"))
@@ -4433,13 +4507,55 @@ def sharded_dataset_cache_paths(path, cache_dir, dtype):
     return paths
 
 
-def sharded_aggregate_manifest_matches(manifest, path, dtype, paths, dataset_manifest, shards):
+def sharded_aggregate_paths_from_manifest_path(manifest_path):
+    manifest_path = os.path.abspath(manifest_path)
+    if not manifest_path.endswith(".aggregate.manifest.json"):
+        raise ValueError("unsupported aggregate manifest path {}".format(manifest_path))
+    prefix = manifest_path[:-len(".aggregate.manifest.json")]
+    paths = build_flat_cache_paths(prefix + ".aggregate", manifest_path)
+    paths["shard_cache_dir"] = prefix + ".shards"
+    return paths
+
+
+def normalized_path_basename(path):
+    if not path:
+        return ""
+    return os.path.basename(os.path.normpath(os.path.abspath(path))).casefold()
+
+
+def sharded_dataset_identity_matches_without_inventory(manifest, path, dataset_manifest):
+    requested_dataset_path = os.path.abspath(path)
+    requested_manifest_path = os.path.abspath(training_manifest_path(path))
+    manifest_dataset_path = manifest.get("dataset_path")
+    manifest_manifest_path = manifest.get("dataset_manifest_path")
+    if (
+        manifest_dataset_path
+        and manifest_manifest_path
+        and os.path.abspath(manifest_dataset_path) == requested_dataset_path
+        and os.path.abspath(manifest_manifest_path) == requested_manifest_path
+    ):
+        return True
+    if normalized_path_basename(manifest_dataset_path) != normalized_path_basename(requested_dataset_path):
+        return False
+    if normalized_path_basename(manifest_manifest_path) != normalized_path_basename(requested_manifest_path):
+        return False
+    expected_shard_count = len(dataset_manifest.get("shards", [])) if isinstance(dataset_manifest, dict) else 0
+    manifest_shard_count = manifest.get("shard_count")
+    if expected_shard_count and manifest_shard_count not in (None, expected_shard_count):
+        return False
+    return True
+
+
+def sharded_dataset_identity_matches(manifest, path, dataset_manifest, shards):
+    if not sharded_dataset_identity_matches_without_inventory(manifest, path, dataset_manifest):
+        return False
+    return manifest.get("inventory_signature") == sharded_inventory_signature(shards)
+
+
+def sharded_aggregate_manifest_common_matches(manifest, dtype, paths, dataset_manifest):
     return (
         manifest.get("version") == SHARDED_AGGREGATE_CACHE_VERSION
-        and manifest.get("dataset_path") == os.path.abspath(path)
-        and manifest.get("dataset_manifest_path") == os.path.abspath(training_manifest_path(path))
         and manifest.get("dataset_manifest_signature") == manifest_compatibility_signature(dataset_manifest)
-        and manifest.get("inventory_signature") == sharded_inventory_signature(shards)
         and manifest.get("feature_dtype") == np.dtype(dtype).name
         and manifest.get("row_count", 0) >= 0
         and bool(manifest.get("feature_columns"))
@@ -4448,7 +4564,22 @@ def sharded_aggregate_manifest_matches(manifest, path, dtype, paths, dataset_man
     )
 
 
-def inspect_sharded_binary_cache(path, feature_storage, cache_dir, dataset_manifest, shards, require_cache_hit=False):
+def sharded_aggregate_manifest_matches(manifest, path, dtype, paths, dataset_manifest, shards):
+    return (
+        sharded_aggregate_manifest_common_matches(manifest, dtype, paths, dataset_manifest)
+        and sharded_dataset_identity_matches(manifest, path, dataset_manifest, shards)
+    )
+
+
+def sharded_aggregate_manifest_matches_without_inventory(manifest, path, dtype, paths, dataset_manifest):
+    return (
+        sharded_aggregate_manifest_common_matches(manifest, dtype, paths, dataset_manifest)
+        and sharded_dataset_identity_matches_without_inventory(manifest, path, dataset_manifest)
+    )
+
+
+def inspect_sharded_binary_cache(path, feature_storage, cache_dir, dataset_manifest, shards,
+                                 require_cache_hit=False, allow_missing_inventory=False):
     if np is None:
         raise ValueError("binary cache inspection requires numpy")
     if feature_storage not in ("memmap32", "memmap64"):
@@ -4457,8 +4588,48 @@ def inspect_sharded_binary_cache(path, feature_storage, cache_dir, dataset_manif
     resolved_cache_dir = resolve_cache_dir(path, cache_dir)
     paths = sharded_dataset_cache_paths(path, resolved_cache_dir, dtype)
     manifest, manifest_load_seconds = load_cache_manifest_file(paths["manifest"])
+    manifest_matches = False
+    if manifest:
+        if allow_missing_inventory:
+            manifest_matches = sharded_aggregate_manifest_matches_without_inventory(
+                manifest, path, dtype, paths, dataset_manifest
+            )
+        else:
+            manifest_matches = sharded_aggregate_manifest_matches(
+                manifest, path, dtype, paths, dataset_manifest, shards
+            )
+    if not manifest_matches:
+        compatible_candidates = []
+        for candidate_manifest_path in aggregate_cache_manifest_paths(resolved_cache_dir):
+            if os.path.abspath(candidate_manifest_path) == os.path.abspath(paths["manifest"]):
+                continue
+            candidate_manifest, candidate_load_seconds = load_cache_manifest_file(candidate_manifest_path)
+            manifest_load_seconds += candidate_load_seconds
+            if not candidate_manifest:
+                continue
+            candidate_paths = sharded_aggregate_paths_from_manifest_path(candidate_manifest_path)
+            if allow_missing_inventory:
+                candidate_matches = sharded_aggregate_manifest_matches_without_inventory(
+                    candidate_manifest, path, dtype, candidate_paths, dataset_manifest
+                )
+            else:
+                candidate_matches = sharded_aggregate_manifest_matches(
+                    candidate_manifest, path, dtype, candidate_paths, dataset_manifest, shards
+                )
+            if candidate_matches:
+                compatible_candidates.append((candidate_manifest_path, candidate_manifest, candidate_paths))
+        if len(compatible_candidates) == 1:
+            _, manifest, paths = compatible_candidates[0]
+            manifest_matches = True
+            warn_once(
+                "relocated_sharded_cache:" + os.path.abspath(path),
+                "warning: using compatible aggregate cache built for {} from {}".format(
+                    os.path.abspath(path),
+                    manifest.get("dataset_path", ""),
+                ),
+            )
     print("Cache manifest load time: {:.3f}s".format(manifest_load_seconds), flush=True)
-    if not manifest or not sharded_aggregate_manifest_matches(manifest, path, dtype, paths, dataset_manifest, shards):
+    if not manifest_matches:
         if require_cache_hit:
             raise ValueError(cache_only_missing_message(resolved_cache_dir))
         return None
@@ -4538,41 +4709,30 @@ def build_sharded_aggregate_cache(path, feature_storage, cache_dir, dataset_mani
     shard_signature_override = manifest_compatibility_signature(dataset_manifest)
     cache_build_token = start_profile_stage("cache_build", os.path.abspath(path))
 
-    shard_rows = []
-    feature_columns = None
-    has_returns = False
-    total_rows = 0
-    all_month_names = set()
+    if not shards:
+        raise ValueError("{} does not contain any readable shard rows".format(path))
+    total_rows = sum(int(shard.get("row_count", 0)) for shard in shards)
+    all_month_names = set(str(shard.get("month", "")) for shard in shards if str(shard.get("month", "")).strip())
     shard_cache_hits = 0
     shard_cache_rebuilt = 0
-    for shard in shards:
-        rows, shard_feature_columns, shard_has_returns = load_cached_compact_rows(
-            shard["csv_path"],
-            feature_storage,
-            paths["shard_cache_dir"],
-            rebuild_cache=False,
-            training_manifest=dataset_manifest,
-            manifest_path=training_manifest_path(path),
-            cache_only=False,
-            manifest_signature_override=shard_signature_override,
-            use_shard_cache_layout=True,
-        )
-        shard_status = CACHE_LOAD_INFO.get("status", "")
-        if shard_status == "hit":
-            shard_cache_hits += 1
-        elif shard_status == "rebuilt":
-            shard_cache_rebuilt += 1
-        if feature_columns is None:
-            feature_columns = list(shard_feature_columns)
-        elif list(shard_feature_columns) != feature_columns:
-            raise ValueError("shard {} has incompatible feature columns".format(shard["csv_path"]))
-        has_returns = has_returns or shard_has_returns
-        total_rows += len(rows)
-        all_month_names.update(rows.table.months)
-        shard_rows.append(rows)
 
-    if feature_columns is None:
-        raise ValueError("{} does not contain any readable shard rows".format(path))
+    first_rows, feature_columns, has_returns = load_cached_compact_rows(
+        shards[0]["csv_path"],
+        feature_storage,
+        paths["shard_cache_dir"],
+        rebuild_cache=False,
+        training_manifest=dataset_manifest,
+        manifest_path=training_manifest_path(path),
+        cache_only=False,
+        manifest_signature_override=shard_signature_override,
+        use_shard_cache_layout=True,
+    )
+    shard_status = CACHE_LOAD_INFO.get("status", "")
+    if shard_status == "hit":
+        shard_cache_hits += 1
+    elif shard_status == "rebuilt":
+        shard_cache_rebuilt += 1
+    feature_columns = list(feature_columns)
 
     symbol_lookup = {}
     symbols = []
@@ -4597,7 +4757,32 @@ def build_sharded_aggregate_cache(path, feature_storage, cache_dir, dataset_mani
 
     offset = 0
     try:
-        for rows in shard_rows:
+        for shard_index, shard in enumerate(shards):
+            if shard_index == 0:
+                rows = first_rows
+                shard_feature_columns = feature_columns
+                shard_has_returns = has_returns
+            else:
+                rows, shard_feature_columns, shard_has_returns = load_cached_compact_rows(
+                    shard["csv_path"],
+                    feature_storage,
+                    paths["shard_cache_dir"],
+                    rebuild_cache=False,
+                    training_manifest=dataset_manifest,
+                    manifest_path=training_manifest_path(path),
+                    cache_only=False,
+                    manifest_signature_override=shard_signature_override,
+                    use_shard_cache_layout=True,
+                )
+                shard_status = CACHE_LOAD_INFO.get("status", "")
+                if shard_status == "hit":
+                    shard_cache_hits += 1
+                elif shard_status == "rebuilt":
+                    shard_cache_rebuilt += 1
+            if list(shard_feature_columns) != feature_columns:
+                rows.cleanup()
+                raise ValueError("shard {} has incompatible feature columns".format(shard["csv_path"]))
+            has_returns = has_returns or shard_has_returns
             table = rows.table
             count = len(table.labels)
             for symbol_name in table.symbols:
@@ -4629,6 +4814,11 @@ def build_sharded_aggregate_cache(path, feature_storage, cache_dir, dataset_mani
             rows.cleanup()
         feature_values.flush()
     except Exception:
+        if first_rows is not None:
+            try:
+                first_rows.cleanup()
+            except Exception:
+                pass
         close_memmap(feature_values)
         raise
 
@@ -4692,7 +4882,12 @@ def load_sharded_rows(path, feature_storage="float32", memmap_dir=None, cache_di
         training_manifest, manifest_path = load_training_manifest(path)
     elif manifest_path is None:
         manifest_path = training_manifest_path(path)
-    shards = discover_sharded_dataset_shards(path, training_manifest)
+    shards = None
+    shard_discovery_error = None
+    try:
+        shards = discover_sharded_dataset_shards(path, training_manifest)
+    except ValueError as error:
+        shard_discovery_error = error
     if feature_storage in ("memmap32", "memmap64") and not disable_cache:
         resolved_cache_dir = resolve_cache_dir(path, cache_dir)
         if rebuild_cache and cache_only:
@@ -4702,10 +4897,18 @@ def load_sharded_rows(path, feature_storage="float32", memmap_dir=None, cache_di
             feature_storage,
             resolved_cache_dir,
             training_manifest,
-            shards,
+            shards or [],
             require_cache_hit=cache_only,
+            allow_missing_inventory=shard_discovery_error is not None,
         )
         if cache_hit:
+            if shard_discovery_error is not None:
+                warn_once(
+                    "sharded_cache_without_source:" + os.path.abspath(path),
+                    "warning: source shard files for {} are unavailable; using existing aggregate cache without rebuilding".format(
+                        os.path.abspath(path)
+                    ),
+                )
             manifest = cache_hit["manifest"]
             metadata = cache_hit["metadata"]
             table = CompactTable(
@@ -4731,6 +4934,10 @@ def load_sharded_rows(path, feature_storage="float32", memmap_dir=None, cache_di
             rows = CompactRows(table)
             validate_rows_against_training_manifest(path, rows, training_manifest)
             return rows, list(manifest["feature_columns"]), bool(manifest.get("has_returns"))
+        if shard_discovery_error is not None:
+            if cache_only:
+                raise ValueError(cache_only_missing_message(resolved_cache_dir))
+            raise shard_discovery_error
         if cache_only:
             raise ValueError(cache_only_missing_message(resolved_cache_dir))
         log_memory("Building aggregate sharded cache from shard caches")
@@ -4743,6 +4950,9 @@ def load_sharded_rows(path, feature_storage="float32", memmap_dir=None, cache_di
         )
         validate_rows_against_training_manifest(path, rows, training_manifest)
         return rows, feature_columns, has_returns
+
+    if shard_discovery_error is not None:
+        raise shard_discovery_error
 
     combined_rows = []
     feature_columns = None
@@ -5266,6 +5476,31 @@ def row_open_time_array(rows):
     return [int(row.open_time) for row in rows]
 
 
+def recent_calibration_mask(rows, args):
+    mode = getattr(args, "calibration_window_mode", "all") if args is not None else "all"
+    if mode != "recent" or not rows:
+        return None
+    row_count = len(rows)
+    recent_ratio = float(getattr(args, "calibration_recent_ratio", 0.0)) if args is not None else 0.0
+    recent_rows = int(getattr(args, "calibration_recent_rows", 0)) if args is not None else 0
+    keep_count = 0
+    if recent_ratio > 0.0:
+        keep_count = max(keep_count, int(math.ceil(row_count * min(1.0, recent_ratio))))
+    if recent_rows > 0:
+        keep_count = max(keep_count, recent_rows)
+    keep_count = min(row_count, keep_count if keep_count > 0 else row_count)
+    if keep_count >= row_count:
+        return None
+    if np is not None:
+        mask = np.zeros(row_count, dtype=bool)
+        mask[-keep_count:] = True
+        return mask
+    mask = [False] * row_count
+    for index in range(row_count - keep_count, row_count):
+        mask[index] = True
+    return mask
+
+
 def subset_rows_by_mask(rows, keep_mask):
     if is_compact_rows(rows):
         if np is None:
@@ -5275,6 +5510,17 @@ def subset_rows_by_mask(rows, keep_mask):
             return rows.subset(np.nonzero(mask)[0].astype(np.int32, copy=False))
         return rows.subset(np.asarray(rows.indices, dtype=np.int32)[mask])
     return [row for row, keep in zip(rows, keep_mask) if keep]
+
+
+def recent_calibration_subset(values, rows, args):
+    mask = recent_calibration_mask(rows, args)
+    if mask is None:
+        return values, rows
+    if np is not None and isinstance(values, np.ndarray):
+        subset_values = values[np.asarray(mask, dtype=bool)]
+    else:
+        subset_values = [value for value, keep in zip(values, mask) if keep]
+    return subset_values, subset_rows_by_mask(rows, mask)
 
 
 def earliest_open_time(rows):
@@ -5396,6 +5642,42 @@ def median(values):
     return (ordered[middle - 1] + ordered[middle]) / 2.0
 
 
+def percentile(values, fraction):
+    if not values:
+        return 0.0
+    ordered = sorted(float(value) for value in values)
+    if len(ordered) == 1:
+        return ordered[0]
+    clipped_fraction = min(1.0, max(0.0, float(fraction)))
+    position = clipped_fraction * float(len(ordered) - 1)
+    lower_index = int(math.floor(position))
+    upper_index = int(math.ceil(position))
+    if lower_index == upper_index:
+        return ordered[lower_index]
+    lower_weight = float(upper_index) - position
+    upper_weight = position - float(lower_index)
+    return ordered[lower_index] * lower_weight + ordered[upper_index] * upper_weight
+
+
+def score_distribution_summary(values, prefix):
+    ordered = [float(value) for value in values]
+    if not ordered:
+        return {
+            "{}_count".format(prefix): 0,
+            "{}_min".format(prefix): 0.0,
+            "{}_p50".format(prefix): 0.0,
+            "{}_p90".format(prefix): 0.0,
+            "{}_max".format(prefix): 0.0,
+        }
+    return {
+        "{}_count".format(prefix): len(ordered),
+        "{}_min".format(prefix): min(ordered),
+        "{}_p50".format(prefix): percentile(ordered, 0.50),
+        "{}_p90".format(prefix): percentile(ordered, 0.90),
+        "{}_max".format(prefix): max(ordered),
+    }
+
+
 ACCEPTANCE_TIER_RULES = {
     "exploration": [
         ("walkforward_mean_portfolio_return", lambda value: value > 0.0, "mean_portfolio_return {:.4f} <= 0"),
@@ -5479,6 +5761,8 @@ def walkforward_acceptance_summary(records, args):
             "meta_filter_disabled_folds": 0,
             "acceptance_tier": acceptance_tier,
             "walkforward_acceptance_passed": 0,
+            "walkforward_gate_status": "failed",
+            "walkforward_gate_failed": 1,
             "walkforward_acceptance_reasons": "no_walkforward_folds",
             "accepted": 0 if acceptance_tier != "none" or getattr(args, "require_positive_walkforward", False) else 1,
             "rejection_reason": "no_walkforward_folds" if acceptance_tier != "none" or getattr(args, "require_positive_walkforward", False) else "",
@@ -5550,6 +5834,8 @@ def walkforward_acceptance_summary(records, args):
         "meta_filter_disabled_folds": total_folds - meta_filter_enabled_folds,
         "acceptance_tier": acceptance_tier,
         "walkforward_acceptance_passed": 1,
+        "walkforward_gate_status": "passed",
+        "walkforward_gate_failed": 0,
         "walkforward_acceptance_reasons": "",
         "accepted": 1,
         "rejection_reason": "",
@@ -5580,6 +5866,8 @@ def walkforward_acceptance_summary(records, args):
             )
         )
     summary["walkforward_acceptance_passed"] = 0 if gate_failures else 1
+    summary["walkforward_gate_failed"] = 1 if gate_failures else 0
+    summary["walkforward_gate_status"] = "failed" if gate_failures else "passed"
     summary["walkforward_acceptance_reasons"] = "; ".join(gate_failures)
 
     if acceptance_tier != "none":
@@ -5607,6 +5895,8 @@ def resolved_walkforward_summary(walk_records, args):
         summary["failed_acceptance_checks"] = ""
         summary["strategy_strength"] = "not_checked"
         summary["walkforward_acceptance_reasons"] = ""
+        summary["walkforward_gate_status"] = "not_applicable"
+        summary["walkforward_gate_failed"] = 0
     return summary
 
 
@@ -5703,6 +5993,11 @@ WALKFORWARD_DIAGNOSTIC_COLUMNS = [
     "validation_positive_rate",
     "test_positive_rate",
     "selected_threshold",
+    "exit_policy",
+    "trailing_activation_return",
+    "trailing_drawdown",
+    "stop_loss",
+    "max_holding_period_minutes",
     "selected_score_name",
     "selected_score_threshold",
     "selected_ev_safety_margin",
@@ -5722,6 +6017,10 @@ WALKFORWARD_DIAGNOSTIC_COLUMNS = [
     "median_expected_value",
     "average_trade_return",
     "median_trade_return",
+    "average_dynamic_trade_return",
+    "median_dynamic_trade_return",
+    "average_fixed_horizon_trade_return",
+    "dynamic_minus_fixed_avg_return",
     "avg_trade_return",
     "total_profit_after_fee",
     "total_profit_after_fee_and_slippage",
@@ -5737,6 +6036,11 @@ WALKFORWARD_DIAGNOSTIC_COLUMNS = [
     "trades_per_day",
     "max_trades_in_day",
     "trades_per_active_day",
+    "average_exit_minutes",
+    "median_exit_minutes",
+    "trailing_stop_exit_count",
+    "stop_loss_exit_count",
+    "max_holding_exit_count",
     "active_days",
     "profitable_days",
     "losing_days",
@@ -5753,6 +6057,9 @@ WALKFORWARD_DIAGNOSTIC_COLUMNS = [
     "selected_validation_portfolio_return",
     "selected_validation_precision",
     "selected_validation_recall",
+    "selected_validation_symbol_profit_concentration_top1",
+    "selected_validation_symbol_profit_concentration_top3",
+    "selected_validation_symbol_trade_concentration_top1",
     "selected_validation_active_days",
     "selected_validation_profit_per_active_day",
     "selected_validation_average_profit_after_fee_and_slippage",
@@ -5787,6 +6094,25 @@ WALKFORWARD_DIAGNOSTIC_COLUMNS = [
     "risk_adjusted_return_feature",
     "hybrid_return_combination",
     "hybrid_min_probability",
+    "configured_hybrid_min_score",
+    "effective_hybrid_min_score",
+    "hybrid_min_score_floor_scale",
+    "hybrid_min_score_floor_source",
+    "hybrid_min_score_floor_reference_scale",
+    "hybrid_min_score_floor_min_ratio",
+    "hybrid_min_score_floor_min",
+    "hybrid_min_score_floor_max",
+    "hybrid_min_score_calibration_aware",
+    "hybrid_min_score_regression_scale",
+    "hybrid_min_score_regression_source",
+    "hybrid_gate_score_count",
+    "hybrid_gate_score_min",
+    "hybrid_gate_score_p50",
+    "hybrid_gate_score_p90",
+    "hybrid_gate_score_max",
+    "hybrid_gate_rows_above_configured_floor",
+    "hybrid_gate_rows_above_effective_floor",
+    "hybrid_gate_rows_between_effective_and_configured_floor",
     "hybrid_score_mode",
     "hybrid_uncertainty_method",
     "hybrid_uncertainty_penalty",
@@ -5874,6 +6200,11 @@ def build_walkforward_diagnostic_record(fold_index, split_name, train_rows, vali
         "validation_positive_rate": positive_label_count(validation_rows) / float(len(validation_rows)) if validation_rows else 0.0,
         "test_positive_rate": positive_label_count(test_rows) / float(len(test_rows)) if test_rows else 0.0,
         "selected_threshold": validation_metrics.get("selected_threshold", selected_threshold),
+        "exit_policy": metrics.get("exit_policy", getattr(args, "exit_policy", "fixed_horizon")),
+        "trailing_activation_return": metrics.get("trailing_activation_return", getattr(args, "trailing_activation_return", 0.01)),
+        "trailing_drawdown": metrics.get("trailing_drawdown", getattr(args, "trailing_drawdown", 0.003)),
+        "stop_loss": metrics.get("stop_loss", getattr(args, "stop_loss", getattr(args, "downside_stop", 0.02))),
+        "max_holding_period_minutes": metrics.get("max_holding_period_minutes", getattr(args, "max_holding_period_minutes", getattr(args, "holding_period_minutes", 0))),
         "selected_score_name": validation_metrics.get("selected_score_name", "probability"),
         "selected_score_threshold": validation_metrics.get("selected_score_threshold", selected_threshold),
         "selected_ev_safety_margin": metrics.get("selected_ev_safety_margin", 0.0),
@@ -5893,6 +6224,10 @@ def build_walkforward_diagnostic_record(fold_index, split_name, train_rows, vali
         "median_expected_value": metrics.get("median_expected_value", 0.0),
         "average_trade_return": metrics.get("average_trade_return", 0.0),
         "median_trade_return": metrics.get("median_trade_return", 0.0),
+        "average_dynamic_trade_return": metrics.get("average_dynamic_trade_return", 0.0),
+        "median_dynamic_trade_return": metrics.get("median_dynamic_trade_return", 0.0),
+        "average_fixed_horizon_trade_return": metrics.get("average_fixed_horizon_trade_return", 0.0),
+        "dynamic_minus_fixed_avg_return": metrics.get("dynamic_minus_fixed_avg_return", 0.0),
         "avg_trade_return": metrics.get("average_trade_return", 0.0),
         "total_profit_after_fee": metrics.get("total_profit_after_fee", 0.0),
         "total_profit_after_fee_and_slippage": metrics.get("total_profit_after_fee_and_slippage", 0.0),
@@ -5908,6 +6243,11 @@ def build_walkforward_diagnostic_record(fold_index, split_name, train_rows, vali
         "trades_per_day": metrics.get("trades_per_day", 0.0),
         "max_trades_in_day": metrics.get("max_trades_in_any_day", 0),
         "trades_per_active_day": metrics.get("trades_per_active_day", 0.0),
+        "average_exit_minutes": metrics.get("average_exit_minutes", 0.0),
+        "median_exit_minutes": metrics.get("median_exit_minutes", 0.0),
+        "trailing_stop_exit_count": metrics.get("trailing_stop_exit_count", 0),
+        "stop_loss_exit_count": metrics.get("stop_loss_exit_count", 0),
+        "max_holding_exit_count": metrics.get("max_holding_exit_count", 0),
         "active_days": metrics.get("active_days", 0),
         "profitable_days": metrics.get("profitable_days", 0),
         "losing_days": metrics.get("losing_days", 0),
@@ -5924,6 +6264,10 @@ def build_walkforward_diagnostic_record(fold_index, split_name, train_rows, vali
         "selected_validation_portfolio_return": validation_metrics.get("selected_validation_portfolio_return", 0.0),
         "selected_validation_precision": validation_metrics.get("selected_validation_precision", 0.0),
         "selected_validation_recall": validation_metrics.get("selected_validation_recall", 0.0),
+        "selected_validation_symbol_profit_concentration_top1": validation_metrics.get("symbol_profit_concentration_top1", 0.0),
+        "selected_validation_symbol_profit_concentration_top3": validation_metrics.get("symbol_profit_concentration_top3", 0.0),
+        "selected_validation_symbol_trade_concentration_top1": validation_metrics.get("symbol_trade_concentration_top1", 0.0),
+        "selected_validation_symbol_count": validation_metrics.get("selected_validation_symbol_count", 0),
         "selected_validation_active_days": validation_metrics.get("selected_validation_active_days", 0),
         "selected_validation_profit_per_active_day": validation_metrics.get("selected_validation_profit_per_active_day", 0.0),
         "selected_validation_average_profit_after_fee_and_slippage": validation_metrics.get(
@@ -5964,6 +6308,25 @@ def build_walkforward_diagnostic_record(fold_index, split_name, train_rows, vali
         "risk_adjusted_return_feature": calibration_info.get("risk_adjusted_return_feature", ""),
         "hybrid_return_combination": calibration_info.get("hybrid_return_combination", getattr(args, "hybrid_return_combination", "probability_times_return")),
         "hybrid_min_probability": calibration_info.get("hybrid_min_probability", getattr(args, "hybrid_min_probability", 0.0)),
+        "configured_hybrid_min_score": calibration_info.get("configured_hybrid_min_score", validation_metrics.get("configured_hybrid_min_score", getattr(args, "hybrid_min_score", 0.0))),
+        "effective_hybrid_min_score": calibration_info.get("effective_hybrid_min_score", validation_metrics.get("effective_hybrid_min_score", getattr(args, "hybrid_min_score", 0.0))),
+        "hybrid_min_score_floor_scale": calibration_info.get("hybrid_min_score_floor_scale", validation_metrics.get("hybrid_min_score_floor_scale", 1.0)),
+        "hybrid_min_score_floor_source": calibration_info.get("hybrid_min_score_floor_source", validation_metrics.get("hybrid_min_score_floor_source", "configured")),
+        "hybrid_min_score_floor_reference_scale": calibration_info.get("hybrid_min_score_floor_reference_scale", validation_metrics.get("hybrid_min_score_floor_reference_scale", getattr(args, "hybrid_min_score_calibration_reference_scale", 0.20))),
+        "hybrid_min_score_floor_min_ratio": calibration_info.get("hybrid_min_score_floor_min_ratio", validation_metrics.get("hybrid_min_score_floor_min_ratio", getattr(args, "hybrid_min_score_calibration_min_ratio", 0.25))),
+        "hybrid_min_score_floor_min": calibration_info.get("hybrid_min_score_floor_min", validation_metrics.get("hybrid_min_score_floor_min", getattr(args, "hybrid_min_score_calibration_floor_min", 0.0))),
+        "hybrid_min_score_floor_max": calibration_info.get("hybrid_min_score_floor_max", validation_metrics.get("hybrid_min_score_floor_max", getattr(args, "hybrid_min_score_calibration_floor_max", 0.0))),
+        "hybrid_min_score_calibration_aware": calibration_info.get("hybrid_min_score_calibration_aware", validation_metrics.get("hybrid_min_score_calibration_aware", int(bool(getattr(args, "hybrid_min_score_calibration_aware", False))))),
+        "hybrid_min_score_regression_scale": calibration_info.get("hybrid_min_score_regression_scale", validation_metrics.get("hybrid_min_score_regression_scale", 0.0)),
+        "hybrid_min_score_regression_source": calibration_info.get("hybrid_min_score_regression_source", validation_metrics.get("hybrid_min_score_regression_source", "none")),
+        "hybrid_gate_score_count": calibration_info.get("hybrid_gate_score_count", validation_metrics.get("hybrid_gate_score_count", 0)),
+        "hybrid_gate_score_min": calibration_info.get("hybrid_gate_score_min", validation_metrics.get("hybrid_gate_score_min", 0.0)),
+        "hybrid_gate_score_p50": calibration_info.get("hybrid_gate_score_p50", validation_metrics.get("hybrid_gate_score_p50", 0.0)),
+        "hybrid_gate_score_p90": calibration_info.get("hybrid_gate_score_p90", validation_metrics.get("hybrid_gate_score_p90", 0.0)),
+        "hybrid_gate_score_max": calibration_info.get("hybrid_gate_score_max", validation_metrics.get("hybrid_gate_score_max", 0.0)),
+        "hybrid_gate_rows_above_configured_floor": calibration_info.get("hybrid_gate_rows_above_configured_floor", validation_metrics.get("hybrid_gate_rows_above_configured_floor", 0)),
+        "hybrid_gate_rows_above_effective_floor": calibration_info.get("hybrid_gate_rows_above_effective_floor", validation_metrics.get("hybrid_gate_rows_above_effective_floor", 0)),
+        "hybrid_gate_rows_between_effective_and_configured_floor": calibration_info.get("hybrid_gate_rows_between_effective_and_configured_floor", validation_metrics.get("hybrid_gate_rows_between_effective_and_configured_floor", 0)),
         "hybrid_score_mode": calibration_info.get("hybrid_score_mode", getattr(args, "hybrid_score_mode", "basic")),
         "hybrid_uncertainty_method": calibration_info.get("hybrid_uncertainty_method", getattr(args, "hybrid_uncertainty_method", "none")),
         "hybrid_uncertainty_penalty": calibration_info.get("hybrid_uncertainty_penalty", getattr(args, "hybrid_uncertainty_penalty", 0.0)),
@@ -5997,6 +6360,9 @@ def build_walkforward_diagnostic_record(fold_index, split_name, train_rows, vali
         "symbol_filter_candidate_weight": calibration_info.get("symbol_filter_candidate_weight", getattr(args, "symbol_filter_candidate_weight", 0.5)),
         "symbol_filter_executed_weight": calibration_info.get("symbol_filter_executed_weight", getattr(args, "symbol_filter_executed_weight", 0.5)),
         "symbol_filter_shrinkage": calibration_info.get("symbol_filter_shrinkage", getattr(args, "symbol_filter_shrinkage", 50.0)),
+        "symbol_dominance_penalty_validation_weight": calibration_info.get("symbol_dominance_penalty_validation_weight", getattr(args, "symbol_dominance_penalty_validation_weight", 0.0)),
+        "symbol_dominance_penalty_recent_weight": calibration_info.get("symbol_dominance_penalty_recent_weight", getattr(args, "symbol_dominance_penalty_recent_weight", 0.0)),
+        "symbol_dominance_penalty_grace": calibration_info.get("symbol_dominance_penalty_grace", getattr(args, "symbol_dominance_penalty_grace", 0.0)),
         "symbol_filter_enabled": calibration_info.get("symbol_filter_enabled", 0),
         "symbol_filter_allowed_symbols": calibration_info.get("symbol_filter_allowed_symbols", 0),
         "symbol_filter_total_symbols": calibration_info.get("symbol_filter_total_symbols", 0),
@@ -6114,6 +6480,316 @@ def row_open_time_value(rows, local_index):
     return int(rows[local_index].open_time)
 
 
+def resolved_exit_policy(args):
+    return getattr(args, "exit_policy", "fixed_horizon") if args is not None else "fixed_horizon"
+
+
+def resolved_max_holding_period_minutes(args):
+    if args is None:
+        return 0
+    configured = int(getattr(args, "max_holding_period_minutes", 0) or 0)
+    if configured > 0:
+        return configured
+    return max(0, int(getattr(args, "holding_period_minutes", 0)))
+
+
+def resolved_stop_loss(args, downside_stop):
+    configured = getattr(args, "stop_loss", None) if args is not None else None
+    if configured is not None:
+        return float(configured)
+    if args is not None:
+        return float(getattr(args, "effective_downside_stop", getattr(args, "downside_stop", downside_stop)))
+    return float(downside_stop)
+
+
+def fixed_horizon_exit_details(fixed_trade_return, fixed_mfe, fixed_mae, holding_period_minutes):
+    return {
+        "exit_policy": "fixed_horizon",
+        "exit_minutes": int(holding_period_minutes),
+        "exit_reason": "fixed_horizon",
+        "dynamic_trade_return": float(fixed_trade_return),
+        "fixed_horizon_trade_return": float(fixed_trade_return),
+        "max_favorable_excursion_before_exit": float(fixed_mfe),
+        "max_adverse_excursion_before_exit": float(fixed_mae),
+    }
+
+
+def trailing_stop_exit_details(return_path, fixed_trade_return, trailing_activation_return,
+                               trailing_drawdown, stop_loss, max_holding_period_minutes):
+    path = [float(value) for value in return_path]
+    if len(path) < int(max_holding_period_minutes):
+        raise ValueError(
+            "trailing_stop requires ordered future candle path; no shard/cache modification was performed. "
+            "Only {} future minutes were available but {} are required.".format(
+                len(path),
+                int(max_holding_period_minutes),
+            )
+        )
+    best_return = 0.0
+    trailing_active = False
+    max_favorable = 0.0
+    max_adverse = 0.0
+    for minute, current_return in enumerate(path[:int(max_holding_period_minutes)], 1):
+        current_return = float(current_return)
+        max_favorable = max(max_favorable, current_return)
+        max_adverse = min(max_adverse, current_return)
+        if current_return <= -float(stop_loss):
+            return {
+                "exit_policy": "trailing_stop",
+                "exit_minutes": minute,
+                "exit_reason": "stop_loss",
+                "dynamic_trade_return": current_return,
+                "fixed_horizon_trade_return": float(fixed_trade_return),
+                "max_favorable_excursion_before_exit": max_favorable,
+                "max_adverse_excursion_before_exit": max_adverse,
+            }
+        if current_return >= float(trailing_activation_return):
+            trailing_active = True
+        if trailing_active:
+            best_return = max(best_return, current_return)
+            if current_return <= best_return - float(trailing_drawdown):
+                return {
+                    "exit_policy": "trailing_stop",
+                    "exit_minutes": minute,
+                    "exit_reason": "trailing_stop",
+                    "dynamic_trade_return": current_return,
+                    "fixed_horizon_trade_return": float(fixed_trade_return),
+                    "max_favorable_excursion_before_exit": max_favorable,
+                    "max_adverse_excursion_before_exit": max_adverse,
+                }
+    return {
+        "exit_policy": "trailing_stop",
+        "exit_minutes": int(max_holding_period_minutes),
+        "exit_reason": "max_holding_time",
+        "dynamic_trade_return": float(path[int(max_holding_period_minutes) - 1]),
+        "fixed_horizon_trade_return": float(fixed_trade_return),
+        "max_favorable_excursion_before_exit": max_favorable,
+        "max_adverse_excursion_before_exit": max_adverse,
+    }
+
+
+def existing_row_future_return_path(rows, local_index, max_holding_period_minutes):
+    if is_compact_rows(rows):
+        return None
+    row = rows[local_index]
+    for attr_name in ("future_candle_returns", "future_close_returns", "future_return_path"):
+        values = getattr(row, attr_name, None)
+        if values is None:
+            continue
+        path = [float(value) for value in values]
+        if len(path) < int(max_holding_period_minutes):
+            raise ValueError(
+                "trailing_stop requires ordered future candle path; no shard/cache modification was performed. "
+                "Row for {} at {} only exposes {} future minutes.".format(
+                    getattr(row, "symbol", ""),
+                    getattr(row, "open_time", 0),
+                    len(path),
+                )
+            )
+        return path[:int(max_holding_period_minutes)]
+    future_close_prices = getattr(row, "future_close_prices", None)
+    entry_price = float(getattr(row, "entry_price", 0.0) or 0.0)
+    if future_close_prices is not None and entry_price > 0.0:
+        path = [float(value) / entry_price - 1.0 for value in future_close_prices]
+        if len(path) < int(max_holding_period_minutes):
+            raise ValueError(
+                "trailing_stop requires ordered future candle path; no shard/cache modification was performed. "
+                "Row for {} at {} only exposes {} future close prices.".format(
+                    getattr(row, "symbol", ""),
+                    getattr(row, "open_time", 0),
+                    len(path),
+                )
+            )
+        return path[:int(max_holding_period_minutes)]
+    return None
+
+
+class RawKlineExecutionPriceSource(object):
+    def __init__(self, raw_kline_dir):
+        self.raw_kline_dir = os.path.abspath(raw_kline_dir)
+        self._symbol_file_cache = {}
+        self._symbol_candles = {}
+
+    def _candidate_files_for_symbol(self, symbol):
+        cached = self._symbol_file_cache.get(symbol)
+        if cached is not None:
+            return cached
+        symbol_lower = str(symbol).casefold()
+        symbol_prefix = symbol_lower + "-1m-"
+        matches = []
+        for root, _, files in os.walk(self.raw_kline_dir):
+            for name in files:
+                lowered = name.casefold()
+                if not lowered.endswith((".csv", ".csv.gz", ".zip")):
+                    continue
+                root_lower = root.casefold().replace("\\", "/")
+                symbol_dir_match = "/{}/1m".format(symbol_lower) in root_lower
+                file_match = lowered.startswith(symbol_prefix)
+                if symbol_dir_match or file_match:
+                    matches.append(os.path.join(root, name))
+        matches.sort()
+        self._symbol_file_cache[symbol] = matches
+        return matches
+
+    def _iter_csv_rows(self, path):
+        if path.endswith(".zip"):
+            with zipfile.ZipFile(path) as archive:
+                member_names = sorted(
+                    name for name in archive.namelist()
+                    if not name.endswith("/") and name.casefold().endswith(".csv")
+                )
+                if not member_names:
+                    return
+                for member_name in member_names:
+                    with archive.open(member_name, "r") as handle:
+                        for raw_line in handle:
+                            yield raw_line.decode("utf-8", errors="ignore")
+            return
+        if path.endswith(".gz"):
+            with gzip.open(path, "rt", encoding="utf-8", newline="") as handle:
+                for line in handle:
+                    yield line
+            return
+        with open(path, encoding="utf-8", newline="") as handle:
+            for line in handle:
+                yield line
+
+    def _load_symbol(self, symbol):
+        cached = self._symbol_candles.get(symbol)
+        if cached is not None:
+            return cached
+        files = self._candidate_files_for_symbol(symbol)
+        if not files:
+            raise ValueError(
+                "trailing_stop requires ordered future candle path; no shard/cache modification was performed. "
+                "No raw kline files were found for {} under {}. Provide --raw-kline-dir with extracted Binance 1m kline CSV/CSV.GZ/ZIP files.".format(
+                    symbol,
+                    self.raw_kline_dir,
+                )
+            )
+        candles = {}
+        for path in files:
+            for line in self._iter_csv_rows(path):
+                line = line.strip()
+                if not line:
+                    continue
+                fields = next(csv.reader([line]))
+                if len(fields) < 5:
+                    continue
+                try:
+                    open_time = normalize_open_time_ms(int(float(fields[0])))
+                    open_price = float(fields[1])
+                    close_price = float(fields[4])
+                except (TypeError, ValueError):
+                    continue
+                if open_price <= 0.0 or close_price <= 0.0:
+                    continue
+                candles[open_time] = (open_price, close_price)
+        if not candles:
+            raise ValueError(
+                "trailing_stop requires ordered future candle path; no shard/cache modification was performed. "
+                "Raw kline files were found for {} under {}, but no readable 1m candles were parsed.".format(
+                    symbol,
+                    self.raw_kline_dir,
+                )
+            )
+        self._symbol_candles[symbol] = candles
+        return candles
+
+    def return_path(self, symbol, entry_open_time, max_holding_period_minutes):
+        candles = self._load_symbol(symbol)
+        entry_time = normalize_open_time_ms(entry_open_time)
+        entry_candle = candles.get(entry_time)
+        if entry_candle is None:
+            raise ValueError(
+                "trailing_stop requires ordered future candle path; no shard/cache modification was performed. "
+                "Entry candle for {} at {} was not found under {}.".format(
+                    symbol,
+                    entry_time,
+                    self.raw_kline_dir,
+                )
+            )
+        entry_open = float(entry_candle[0])
+        if entry_open <= 0.0:
+            raise ValueError(
+                "trailing_stop requires ordered future candle path; no shard/cache modification was performed. "
+                "Entry candle for {} at {} has non-positive open price.".format(
+                    symbol,
+                    entry_time,
+                )
+            )
+        path = []
+        for minute in range(1, int(max_holding_period_minutes) + 1):
+            candle_time = entry_time + minute * 60 * 1000
+            candle = candles.get(candle_time)
+            if candle is None:
+                raise ValueError(
+                    "trailing_stop requires ordered future candle path; no shard/cache modification was performed. "
+                    "Missing minute {} for {} after entry at {} under {}.".format(
+                        minute,
+                        symbol,
+                        entry_time,
+                        self.raw_kline_dir,
+                    )
+                )
+            path.append(float(candle[1]) / entry_open - 1.0)
+        return path
+
+
+def raw_kline_execution_source(args):
+    if args is None:
+        return None
+    cached = getattr(args, "_raw_kline_execution_source", None)
+    if cached is not None:
+        return cached
+    raw_dir = getattr(args, "raw_kline_dir", "") or ""
+    if not raw_dir:
+        return None
+    source = RawKlineExecutionPriceSource(raw_dir)
+    setattr(args, "_raw_kline_execution_source", source)
+    return source
+
+
+def future_return_path_for_trade(rows, local_index, runtime_args, symbol_name, open_time_value,
+                                 max_holding_period_minutes):
+    source_mode = getattr(runtime_args, "dynamic_exit_price_source", "auto") if runtime_args is not None else "auto"
+    if source_mode == "disabled":
+        raise ValueError(
+            "trailing_stop requires ordered future candle path; no shard/cache modification was performed. "
+            "--dynamic-exit-price-source is disabled."
+        )
+    errors = []
+    if source_mode in ("auto", "existing_rows"):
+        existing_path = existing_row_future_return_path(rows, local_index, max_holding_period_minutes)
+        if existing_path is not None:
+            return existing_path
+        if source_mode == "existing_rows":
+            raise ValueError(
+                "trailing_stop requires ordered future candle path; no shard/cache modification was performed. "
+                "Existing runtime rows for {} at {} do not expose ordered future candles.".format(
+                    symbol_name,
+                    open_time_value,
+                )
+            )
+        errors.append("existing runtime rows do not expose ordered future candles")
+    if source_mode in ("auto", "raw_klines"):
+        raw_source = raw_kline_execution_source(runtime_args)
+        raw_dir = getattr(runtime_args, "raw_kline_dir", "") if runtime_args is not None else ""
+        if raw_source is None:
+            errors.append("--raw-kline-dir was not provided")
+        else:
+            return raw_source.return_path(symbol_name, open_time_value, max_holding_period_minutes)
+        if source_mode == "raw_klines":
+            raise ValueError(
+                "trailing_stop requires ordered future candle path; no shard/cache modification was performed. "
+                "{}.".format("; ".join(errors))
+            )
+    raise ValueError(
+        "trailing_stop requires ordered future candle path; no shard/cache modification was performed. "
+        "{}.".format("; ".join(errors) if errors else "No execution-time price path source succeeded")
+    )
+
+
 def compact_quote_volume(table, position):
     if table.quote_volumes is not None:
         raw_quote_volume = float(table.quote_volumes[position])
@@ -6131,29 +6807,158 @@ def compact_quote_volume(table, position):
     )
 
 
+def validation_symbol_dominance_shares(symbol_filter_info):
+    if not symbol_filter_info:
+        return {}
+    symbol_stats = symbol_filter_info.get("symbol_stats") or {}
+    if not isinstance(symbol_stats, dict) or not symbol_stats:
+        return {}
+    total_eligible = sum(max(0, int(stats.get("eligible_candidate_count", 0))) for stats in symbol_stats.values())
+    shares = {}
+    for symbol_name, stats in symbol_stats.items():
+        executed_share = float(stats.get("executed_trade_share", 0.0))
+        eligible_count = max(0, int(stats.get("eligible_candidate_count", 0)))
+        eligible_share = float(eligible_count) / float(total_eligible) if total_eligible > 0 else 0.0
+        shares[symbol_name] = max(executed_share, eligible_share)
+    return shares
+
+
+def symbol_dominance_lookback_minutes(trade_period_minutes, runtime_args):
+    trade_window = max(1, int(trade_period_minutes))
+    if runtime_args is None:
+        return trade_window
+    return max(
+        trade_window,
+        max(0, int(getattr(runtime_args, "symbol_reentry_cooldown_minutes", 0))),
+        resolved_max_holding_period_minutes(runtime_args),
+    )
+
+
+def recent_symbol_dominance_share(symbol_name, minute, recent_entry_minutes,
+                                  recent_entry_minutes_by_symbol, trade_period_minutes,
+                                  symbol_executed_counts, fold_trade_count,
+                                  runtime_args=None):
+    lookback_minutes = symbol_dominance_lookback_minutes(trade_period_minutes, runtime_args)
+    recent_total = 0
+    for recent_minute in recent_entry_minutes:
+        if int(recent_minute) > int(minute) - int(lookback_minutes):
+            recent_total += 1
+    recent_symbol_total = 0
+    for recent_minute in recent_entry_minutes_by_symbol.get(symbol_name, ()):
+        if int(recent_minute) > int(minute) - int(lookback_minutes):
+            recent_symbol_total += 1
+    recent_share = float(recent_symbol_total) / float(recent_total) if recent_total > 0 else 0.0
+    overall_share = float(symbol_executed_counts.get(symbol_name, 0)) / float(fold_trade_count) if fold_trade_count > 0 else 0.0
+    return max(recent_share, overall_share)
+
+
+def candidate_dominance_penalty(item, use_expected_value_ranking, trade_period_minutes,
+                                recent_entry_minutes, recent_entry_minutes_by_symbol,
+                                symbol_executed_counts, fold_trade_count,
+                                validation_dominance_shares, runtime_args):
+    del use_expected_value_ranking
+    if runtime_args is None:
+        return 0.0
+    symbol_name = item[3]
+    minute = int(item[1])
+    validation_weight = max(0.0, float(getattr(runtime_args, "symbol_dominance_penalty_validation_weight", 0.0)))
+    recent_weight = max(0.0, float(getattr(runtime_args, "symbol_dominance_penalty_recent_weight", 0.0)))
+    grace = max(0.0, float(getattr(runtime_args, "symbol_dominance_penalty_grace", 0.0)))
+    if validation_weight <= 0.0 and recent_weight <= 0.0:
+        return 0.0
+    validation_share = float(validation_dominance_shares.get(symbol_name, 0.0))
+    recent_share = recent_symbol_dominance_share(
+        symbol_name,
+        minute,
+        recent_entry_minutes,
+        recent_entry_minutes_by_symbol,
+        trade_period_minutes,
+        symbol_executed_counts,
+        fold_trade_count,
+        runtime_args,
+    )
+    penalty = 0.0
+    if validation_weight > 0.0:
+        penalty += validation_weight * max(0.0, validation_share - grace)
+    if recent_weight > 0.0:
+        penalty += recent_weight * max(0.0, recent_share - grace)
+    return max(0.0, penalty)
+
+
 def candidate_rank(bucket, trade_selection, use_expected_value_ranking, top_k_per_minute,
-                   top_k_per_symbol_minute, record_block):
+                   top_k_per_symbol_minute, record_block,
+                   trade_period_minutes=60,
+                   recent_entry_minutes=None,
+                   recent_entry_minutes_by_symbol=None,
+                   symbol_executed_counts=None,
+                   fold_trade_count=0,
+                   validation_dominance_shares=None,
+                   runtime_args=None,
+                   ranking_state=None):
     if trade_selection not in ("topk_ev", "topk_score"):
         return list(bucket)
+    recent_entry_minutes = recent_entry_minutes or ()
+    recent_entry_minutes_by_symbol = recent_entry_minutes_by_symbol or {}
+    symbol_executed_counts = symbol_executed_counts or {}
+    validation_dominance_shares = validation_dominance_shares or {}
+    if ranking_state is not None:
+        ranking_state.setdefault("candidate_indices", set()).update(int(item[0]) for item in bucket)
+    def sort_key(item):
+        primary_score = float(item[6]) if use_expected_value_ranking else float(item[7])
+        secondary_score = float(item[8])
+        penalty = candidate_dominance_penalty(
+            item,
+            use_expected_value_ranking,
+            trade_period_minutes,
+            recent_entry_minutes,
+            recent_entry_minutes_by_symbol,
+            symbol_executed_counts,
+            fold_trade_count,
+            validation_dominance_shares,
+            runtime_args,
+        )
+        adjustment = max(0.0, 1.0 - penalty)
+        adjusted_primary = primary_score * adjustment
+        adjusted_secondary = secondary_score * adjustment
+        if ranking_state is not None:
+            ranking_state.setdefault("dominance_penalty_by_index", {})[int(item[0])] = penalty
+            ranking_state.setdefault("adjusted_score_by_index", {})[int(item[0])] = adjusted_primary
+        return (-adjusted_primary, -adjusted_secondary, -primary_score, -secondary_score)
     if use_expected_value_ranking:
-        ranked = sorted(bucket, key=lambda item: (-item[6], -item[8]))
+        ranked = sorted(bucket, key=sort_key)
     else:
-        ranked = sorted(bucket, key=lambda item: (-item[7], -item[8]))
+        ranked = sorted(bucket, key=sort_key)
     limit = max(0, int(top_k_per_minute))
+    prefer_unique_symbols = bool(getattr(runtime_args, "prefer_unique_symbols", False)) and limit != 1
     chosen = []
     chosen_symbols = {}
-    for item in ranked:
+    deferred = []
+
+    def try_choose(item):
         symbol_name = item[3]
         if top_k_per_symbol_minute > 0 and chosen_symbols.get(symbol_name, 0) >= top_k_per_symbol_minute:
             record_block(int(item[0]), "symbol_minute_cap_blocked", symbol_name, int(item[1]))
-            continue
+            return False
         chosen.append(item)
         chosen_symbols[symbol_name] = chosen_symbols.get(symbol_name, 0) + 1
+        if ranking_state is not None:
+            ranking_state.setdefault("ranked_candidate_indices", set()).add(int(item[0]))
+        return True
+
+    for item in ranked:
+        symbol_name = item[3]
+        if prefer_unique_symbols and chosen_symbols.get(symbol_name, 0) > 0:
+            deferred.append(item)
+            continue
+        try_choose(item)
+        if limit > 0 and len(chosen) >= limit:
+            return chosen
+
+    for item in deferred:
+        try_choose(item)
         if limit > 0 and len(chosen) >= limit:
             break
-    if use_expected_value_ranking:
-        return sorted(chosen, key=lambda item: (-item[8], -item[7]))
-    return sorted(chosen, key=lambda item: (-item[7], -item[8]))
+    return chosen
 
 
 def symbol_limits_allow(state, item, initial_capital, max_trades_per_fold,
@@ -6181,6 +6986,10 @@ def symbol_limits_allow(state, item, initial_capital, max_trades_per_fold,
     symbol_pause_until = state["symbol_pause_until_minute"].get(symbol_name, 0)
     if symbol_pause_until and minute < symbol_pause_until:
         record_block(local_index, "cooldown_after_loss_blocked", symbol_name, minute)
+        return False
+    symbol_reentry_pause_until = state["symbol_reentry_pause_until_minute"].get(symbol_name, 0)
+    if symbol_reentry_pause_until and minute < symbol_reentry_pause_until:
+        record_block(local_index, "symbol_reentry_cooldown_blocked", symbol_name, minute)
         return False
     if max_open_positions > 0 and len(state["open_positions"]) >= max_open_positions:
         record_block(local_index, "max_open_positions_blocked", symbol_name, minute)
@@ -6236,18 +7045,44 @@ def capital_allocation(cash, invested, quote_volume_value, max_volume_fraction,
 def execution_stats_result(executed, executed_pnls, executed_minutes, executed_trade_day_ids,
                            executed_expected_values, executed_trade_scores,
                            executed_selection_ranks, executed_selected_by_topk,
-                           executed_selected_by_meta_filter, raw_selected, blocked_flags,
+                           executed_selected_by_meta_filter, executed_exit_minutes,
+                           executed_exit_reasons, executed_dynamic_trade_returns,
+                           executed_fixed_horizon_trade_returns,
+                           executed_max_favorable_excursion_before_exit,
+                           executed_max_adverse_excursion_before_exit,
+                           raw_selected, raw_candidate_trade_scores,
+                           ranked_candidate_trade_scores, blocked_flags,
                            blocked_by_symbol, blocked_by_bucket, cash, initial_capital,
                            effective_fee, position_sizing_mode, max_drawdown,
                            blocked_counts, fold_trade_count, entries_by_day,
-                           realized_pnl_by_day):
+                           realized_pnl_by_day, exit_policy,
+                           trailing_activation_return, trailing_drawdown,
+                           stop_loss, max_holding_period_minutes):
     portfolio_profit = cash - initial_capital
     position_sizes = list(executed.values())
+    exit_minute_values = [int(value) for value in executed_exit_minutes.values()]
+    dynamic_trade_return_values = [float(value) for value in executed_dynamic_trade_returns.values()]
+    fixed_trade_return_values = [float(value) for value in executed_fixed_horizon_trade_returns.values()]
     active_days = len(entries_by_day)
     realized_day_profits = list(realized_pnl_by_day.values())
     profitable_days = sum(1 for value in realized_day_profits if value > 0.0)
     losing_days = sum(1 for value in realized_day_profits if value < 0.0)
     max_trades_in_any_day = max(entries_by_day.values()) if entries_by_day else 0
+    raw_candidate_indices = set(int(index) for index in raw_selected)
+    ranked_candidate_indices = set(int(index) for index in ranked_candidate_trade_scores)
+    executed_indices = set(int(index) for index in executed)
+    rejected_trade_scores = [
+        float(score) for index, score in raw_candidate_trade_scores.items()
+        if int(index) not in executed_indices
+    ]
+    ranking_rejected_trade_scores = [
+        float(score) for index, score in raw_candidate_trade_scores.items()
+        if int(index) not in ranked_candidate_indices
+    ]
+    execution_rejected_trade_scores = [
+        float(score) for index, score in ranked_candidate_trade_scores.items()
+        if int(index) not in executed_indices
+    ]
     return {
         "executed": executed,
         "executed_pnls": executed_pnls,
@@ -6258,10 +7093,21 @@ def execution_stats_result(executed, executed_pnls, executed_minutes, executed_t
         "executed_selection_ranks": executed_selection_ranks,
         "executed_selected_by_topk": executed_selected_by_topk,
         "executed_selected_by_meta_filter": executed_selected_by_meta_filter,
+        "executed_exit_minutes": executed_exit_minutes,
+        "executed_exit_reasons": executed_exit_reasons,
+        "executed_dynamic_trade_returns": executed_dynamic_trade_returns,
+        "executed_fixed_horizon_trade_returns": executed_fixed_horizon_trade_returns,
+        "executed_max_favorable_excursion_before_exit": executed_max_favorable_excursion_before_exit,
+        "executed_max_adverse_excursion_before_exit": executed_max_adverse_excursion_before_exit,
         "raw_selected": raw_selected,
         "blocked_flags": blocked_flags or {},
         "blocked_by_symbol": blocked_by_symbol,
         "blocked_by_bucket": blocked_by_bucket,
+        "exit_policy": exit_policy,
+        "trailing_activation_return": trailing_activation_return,
+        "trailing_drawdown": trailing_drawdown,
+        "stop_loss": stop_loss,
+        "max_holding_period_minutes": max_holding_period_minutes,
         "ending_capital": cash,
         "portfolio_profit": portfolio_profit,
         "portfolio_return": portfolio_profit / initial_capital,
@@ -6282,12 +7128,18 @@ def execution_stats_result(executed, executed_pnls, executed_minutes, executed_t
         "max_open_positions_blocked": blocked_counts["max_open_positions_blocked"],
         "daily_loss_fraction_blocked": blocked_counts["daily_loss_fraction_blocked"],
         "cooldown_after_loss_blocked": blocked_counts["cooldown_after_loss_blocked"],
+        "period_trade_limit_blocked": blocked_counts["period_trade_limit_blocked"],
         "symbol_trade_limit_blocked": blocked_counts["symbol_trade_limit_blocked"],
+        "symbol_reentry_cooldown_blocked": blocked_counts["symbol_reentry_cooldown_blocked"],
         "symbol_minute_cap_blocked": blocked_counts["symbol_minute_cap_blocked"],
         "lot_size_adjusted": blocked_counts["lot_size_adjusted"],
         "tick_size_adjusted": blocked_counts["tick_size_adjusted"],
         "partial_fill_adjusted": blocked_counts["partial_fill_adjusted"],
         "latency_penalty_adjusted": blocked_counts["latency_penalty_adjusted"],
+        "ranking_candidate_count": len(raw_candidate_indices),
+        "ranking_selected_candidate_count": len(ranked_candidate_indices),
+        "ranking_rejected_candidate_count": max(0, len(raw_candidate_indices) - len(ranked_candidate_indices)),
+        "execution_rejected_candidate_count": max(0, len(ranked_candidate_indices) - len(executed_indices)),
         "blocked_trades_total": (
             blocked_counts["daily_trade_limit_blocked"]
             + blocked_counts["fold_trade_limit_blocked"]
@@ -6299,6 +7151,7 @@ def execution_stats_result(executed, executed_pnls, executed_minutes, executed_t
             + blocked_counts["daily_loss_fraction_blocked"]
             + blocked_counts["cooldown_after_loss_blocked"]
             + blocked_counts["symbol_trade_limit_blocked"]
+            + blocked_counts["symbol_reentry_cooldown_blocked"]
             + blocked_counts["symbol_minute_cap_blocked"]
         ),
         "blocked_by_trade_frequency": (
@@ -6307,17 +7160,35 @@ def execution_stats_result(executed, executed_pnls, executed_minutes, executed_t
             + blocked_counts["daily_loss_limit_blocked"]
             + blocked_counts["period_trade_limit_blocked"]
             + blocked_counts["symbol_trade_limit_blocked"]
+            + blocked_counts["symbol_reentry_cooldown_blocked"]
             + blocked_counts["symbol_minute_cap_blocked"]
         ),
         "blocked_by_drawdown": blocked_counts["daily_drawdown_limit_blocked"] + blocked_counts["daily_loss_fraction_blocked"],
         "max_trades_in_any_day": max_trades_in_any_day,
         "max_trades_in_any_fold": fold_trade_count,
         "trades_per_active_day": float(fold_trade_count) / active_days if active_days else 0.0,
+        "average_exit_minutes": sum(exit_minute_values) / float(len(exit_minute_values)) if exit_minute_values else 0.0,
+        "median_exit_minutes": median(exit_minute_values),
+        "trailing_stop_exit_count": sum(1 for reason in executed_exit_reasons.values() if reason == "trailing_stop"),
+        "stop_loss_exit_count": sum(1 for reason in executed_exit_reasons.values() if reason == "stop_loss"),
+        "max_holding_exit_count": sum(1 for reason in executed_exit_reasons.values() if reason == "max_holding_time"),
+        "average_dynamic_trade_return": sum(dynamic_trade_return_values) / float(len(dynamic_trade_return_values)) if dynamic_trade_return_values else 0.0,
+        "median_dynamic_trade_return": median(dynamic_trade_return_values),
+        "average_fixed_horizon_trade_return": sum(fixed_trade_return_values) / float(len(fixed_trade_return_values)) if fixed_trade_return_values else 0.0,
+        "dynamic_minus_fixed_avg_return": (
+            (sum(dynamic_trade_return_values) / float(len(dynamic_trade_return_values))) - (sum(fixed_trade_return_values) / float(len(fixed_trade_return_values)))
+        ) if dynamic_trade_return_values and fixed_trade_return_values else 0.0,
         "active_days": active_days,
         "profitable_days": profitable_days,
         "losing_days": losing_days,
         "worst_day_profit": min(realized_day_profits) if realized_day_profits else 0.0,
         "best_day_profit": max(realized_day_profits) if realized_day_profits else 0.0,
+        **score_distribution_summary(raw_candidate_trade_scores.values(), "raw_candidate_score"),
+        **score_distribution_summary(ranked_candidate_trade_scores.values(), "ranked_candidate_score"),
+        **score_distribution_summary(executed_trade_scores.values(), "executed_trade_score"),
+        **score_distribution_summary(rejected_trade_scores, "rejected_trade_score"),
+        **score_distribution_summary(ranking_rejected_trade_scores, "ranking_rejected_trade_score"),
+        **score_distribution_summary(execution_rejected_trade_scores, "execution_rejected_trade_score"),
     }
 
 
@@ -6389,13 +7260,15 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
         raise ValueError("--initial-capital must be positive")
     bundle = normalize_prediction_bundle(predictions)
     raw_selected = {}
+    raw_candidate_trade_scores = {}
+    ranked_candidate_trade_scores = {}
 
     cash = float(initial_capital)
     invested = 0.0
     peak_equity = float(initial_capital)
     max_drawdown = 0.0
     recent_entry_minutes = deque()
-    open_positions = deque()
+    open_positions = []
     executed = {}
     executed_pnls = {}
     executed_minutes = {}
@@ -6405,6 +7278,12 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
     executed_selection_ranks = {}
     executed_selected_by_topk = {}
     executed_selected_by_meta_filter = {}
+    executed_exit_minutes = {}
+    executed_exit_reasons = {}
+    executed_dynamic_trade_returns = {}
+    executed_fixed_horizon_trade_returns = {}
+    executed_max_favorable_excursion_before_exit = {}
+    executed_max_adverse_excursion_before_exit = {}
     blocked_flags = {} if capture_blocked_details else None
     blocked_by_symbol = {}
     blocked_by_bucket = {}
@@ -6419,6 +7298,7 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
         "daily_loss_fraction_blocked": 0,
         "cooldown_after_loss_blocked": 0,
         "symbol_trade_limit_blocked": 0,
+        "symbol_reentry_cooldown_blocked": 0,
         "symbol_minute_cap_blocked": 0,
         "lot_size_adjusted": 0,
         "tick_size_adjusted": 0,
@@ -6430,14 +7310,28 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
     realized_losing_trades_by_day = {}
     pause_until_minute_by_day = {}
     symbol_pause_until_minute = {}
+    symbol_reentry_pause_until_minute = {}
     recent_entry_minutes_by_symbol = {}
+    symbol_executed_counts = {}
     fold_trade_count = 0
+    ranking_state = {
+        "candidate_indices": set(),
+        "ranked_candidate_indices": set(),
+        "dominance_penalty_by_index": {},
+        "adjusted_score_by_index": {},
+    }
+    validation_dominance_shares = validation_symbol_dominance_shares(symbol_filter_info)
     use_expected_value_ranking = (
         trade_selection == "topk_ev"
         and bundle.get("probability") is not None
         and objective_mode == "classification"
     )
     effective_fee = resolve_execution_fee(fee, hybrid_runtime_args)
+    exit_policy = resolved_exit_policy(hybrid_runtime_args)
+    max_holding_period_minutes = resolved_max_holding_period_minutes(hybrid_runtime_args)
+    trailing_activation_return = float(getattr(hybrid_runtime_args, "trailing_activation_return", 0.01)) if hybrid_runtime_args is not None else 0.01
+    trailing_drawdown = float(getattr(hybrid_runtime_args, "trailing_drawdown", 0.003)) if hybrid_runtime_args is not None else 0.003
+    stop_loss = resolved_stop_loss(hybrid_runtime_args, downside_stop)
     position_sizing_mode = getattr(hybrid_runtime_args, "position_sizing_mode", "fixed_fraction") if hybrid_runtime_args is not None else "fixed_fraction"
     min_order_notional = max(0.0, float(getattr(hybrid_runtime_args, "min_order_notional", 0.0))) if hybrid_runtime_args is not None else 0.0
     lot_size_step = max(0.0, float(getattr(hybrid_runtime_args, "lot_size_step", 0.0))) if hybrid_runtime_args is not None else 0.0
@@ -6447,6 +7341,7 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
     max_open_positions = max(0, int(getattr(hybrid_runtime_args, "max_open_positions", 0))) if hybrid_runtime_args is not None else 0
     max_daily_loss_fraction = max(0.0, float(getattr(hybrid_runtime_args, "max_daily_loss_fraction", 0.0))) if hybrid_runtime_args is not None else 0.0
     cooldown_after_loss_minutes = max(0, int(getattr(hybrid_runtime_args, "cooldown_after_loss_minutes", 0))) if hybrid_runtime_args is not None else 0
+    symbol_reentry_cooldown_minutes = max(0, int(getattr(hybrid_runtime_args, "symbol_reentry_cooldown_minutes", 0))) if hybrid_runtime_args is not None else 0
     hybrid_score_mode = getattr(hybrid_runtime_args, "hybrid_score_mode", "basic") if hybrid_runtime_args is not None else "basic"
     hybrid_uncertainty_penalty = getattr(hybrid_runtime_args, "hybrid_uncertainty_penalty", 0.0) if hybrid_runtime_args is not None else 0.0
     meta_filter_mode = getattr(hybrid_runtime_args, "meta_filter", "none") if hybrid_runtime_args is not None else "none"
@@ -6500,7 +7395,7 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
     def release_positions(until_minute):
         nonlocal cash, invested, peak_equity, max_drawdown
         while open_positions and open_positions[0][0] <= until_minute:
-            release_minute, position_size, pnl, entry_day_id, symbol_name = open_positions.popleft()
+            release_minute, position_size, pnl, entry_day_id, symbol_name = heapq.heappop(open_positions)
             invested -= position_size
             cash += position_size + pnl
             day_id = entry_day_id if entry_day_id is not None else minute_day_id(release_minute)
@@ -6553,7 +7448,7 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
             day_id,
             symbol_name,
             quote_volume_value,
-            trade_return_value,
+            fixed_trade_return_value,
             expected_value,
             trade_score,
             calibrated_probability,
@@ -6571,6 +7466,7 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
                 "realized_pnl_by_day": realized_pnl_by_day,
                 "pause_until_minute_by_day": pause_until_minute_by_day,
                 "symbol_pause_until_minute": symbol_pause_until_minute,
+                "symbol_reentry_pause_until_minute": symbol_reentry_pause_until_minute,
                 "open_positions": open_positions,
                 "recent_entry_minutes_by_symbol": recent_entry_minutes_by_symbol,
                 "recent_entry_minutes": recent_entry_minutes,
@@ -6608,18 +7504,56 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
             return
         if position_size <= 0.0:
             return
+        if is_compact_rows(rows):
+            position = local_index if rows.indices is None else int(rows.indices[local_index])
+            fixed_mfe = float(rows.table.max_future_high_returns[position])
+            fixed_mae = float(rows.table.max_future_low_returns[position])
+            open_time_value = int(rows.table.open_times[position])
+        else:
+            fixed_mfe = float(rows[local_index].max_future_high_return)
+            fixed_mae = float(rows[local_index].max_future_low_return)
+            open_time_value = int(rows[local_index].open_time)
+        if exit_policy == "trailing_stop":
+            return_path = future_return_path_for_trade(
+                rows,
+                local_index,
+                hybrid_runtime_args,
+                symbol_name,
+                open_time_value,
+                max_holding_period_minutes,
+            )
+            exit_details = trailing_stop_exit_details(
+                return_path,
+                fixed_trade_return_value,
+                trailing_activation_return,
+                trailing_drawdown,
+                stop_loss,
+                max_holding_period_minutes,
+            )
+        else:
+            exit_details = fixed_horizon_exit_details(
+                fixed_trade_return_value,
+                fixed_mfe,
+                fixed_mae,
+                holding_period_minutes,
+            )
         cash -= position_size
         invested += position_size
-        net_return = trade_return_value - effective_fee - slippage - latency_penalty
+        net_return = float(exit_details["dynamic_trade_return"]) - effective_fee - slippage - latency_penalty
         if latency_penalty > 0.0:
             blocked_counts["latency_penalty_adjusted"] += 1
         pnl = position_size * net_return
-        open_positions.append((minute + holding_period_minutes, position_size, pnl, day_id, symbol_name))
-        if max_trades_per_period > 0:
-            recent_entry_minutes.append(minute)
-        if max_trades_per_symbol_period > 0:
-            recent_entry_minutes_by_symbol.setdefault(symbol_name, deque()).append(minute)
+        release_minute = minute + int(exit_details["exit_minutes"])
+        heapq.heappush(open_positions, (release_minute, position_size, pnl, day_id, symbol_name))
+        recent_entry_minutes.append(minute)
+        recent_entry_minutes_by_symbol.setdefault(symbol_name, deque()).append(minute)
+        if symbol_reentry_cooldown_minutes > 0:
+            symbol_reentry_pause_until_minute[symbol_name] = max(
+                symbol_reentry_pause_until_minute.get(symbol_name, 0),
+                minute + symbol_reentry_cooldown_minutes,
+            )
         fold_trade_count += 1
+        symbol_executed_counts[symbol_name] = symbol_executed_counts.get(symbol_name, 0) + 1
         entries_by_day[day_id] = entries_by_day.get(day_id, 0) + 1
         executed[local_index] = position_size
         executed_pnls[local_index] = pnl
@@ -6630,6 +7564,12 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
         executed_selection_ranks[local_index] = selection_rank
         executed_selected_by_topk[local_index] = selected_by_topk_flag
         executed_selected_by_meta_filter[local_index] = 1 if meta_filter_active else 0
+        executed_exit_minutes[local_index] = int(exit_details["exit_minutes"])
+        executed_exit_reasons[local_index] = str(exit_details["exit_reason"])
+        executed_dynamic_trade_returns[local_index] = float(exit_details["dynamic_trade_return"])
+        executed_fixed_horizon_trade_returns[local_index] = float(exit_details["fixed_horizon_trade_return"])
+        executed_max_favorable_excursion_before_exit[local_index] = float(exit_details["max_favorable_excursion_before_exit"])
+        executed_max_adverse_excursion_before_exit[local_index] = float(exit_details["max_adverse_excursion_before_exit"])
 
     def flush_bucket(bucket):
         if not bucket:
@@ -6642,8 +7582,17 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
                 top_k_per_minute,
                 top_k_per_symbol_minute,
                 record_block,
+                trade_period_minutes,
+                recent_entry_minutes,
+                recent_entry_minutes_by_symbol,
+                symbol_executed_counts,
+                fold_trade_count,
+                validation_dominance_shares,
+                hybrid_runtime_args,
+                ranking_state,
             )
             for rank, item in enumerate(chosen, 1):
+                ranked_candidate_trade_scores[int(item[0])] = float(item[7])
                 execute_candidate(item, rank, 1)
             return
 
@@ -6652,6 +7601,9 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
         else:
             ordered = sorted(bucket, key=lambda item: (-item[7], -item[8]))
         for item in ordered:
+            ranking_state["candidate_indices"].add(int(item[0]))
+            ranking_state["ranked_candidate_indices"].add(int(item[0]))
+            ranked_candidate_trade_scores[int(item[0])] = float(item[7])
             execute_candidate(item, 1, 0)
 
     current_minute = None
@@ -6667,6 +7619,7 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
             current_bucket = []
             current_minute = minute
         current_bucket.append(item)
+        raw_candidate_trade_scores[int(item[0])] = float(item[7])
 
     if is_compact_rows(rows):
         if np is not None:
@@ -6848,7 +7801,15 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
         executed_selection_ranks,
         executed_selected_by_topk,
         executed_selected_by_meta_filter,
+        executed_exit_minutes,
+        executed_exit_reasons,
+        executed_dynamic_trade_returns,
+        executed_fixed_horizon_trade_returns,
+        executed_max_favorable_excursion_before_exit,
+        executed_max_adverse_excursion_before_exit,
         raw_selected,
+        raw_candidate_trade_scores,
+        ranked_candidate_trade_scores,
         blocked_flags,
         blocked_by_symbol,
         blocked_by_bucket,
@@ -6861,6 +7822,11 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
         fold_trade_count,
         entries_by_day,
         realized_pnl_by_day,
+        exit_policy,
+        trailing_activation_return,
+        trailing_drawdown,
+        stop_loss,
+        max_holding_period_minutes,
     )
 
 
@@ -7040,6 +8006,45 @@ def execution_symbol_summary(rows, execution):
     }
 
 
+def execution_symbol_age_summary(rows, execution, short_history_days):
+    executed_indices = sorted(int(index) for index in execution.get("executed", {}).keys())
+    if not executed_indices:
+        return {
+            "short_history_symbol_trade_share": 0.0,
+            "short_history_symbol_count": 0,
+            "average_executed_symbol_age_days": 0.0,
+            "min_executed_symbol_age_days": 0.0,
+        }
+    first_seen_open_time = {}
+    for local_index in range(len(rows)):
+        symbol = row_symbol_name(rows, local_index)
+        open_time = row_open_time_value(rows, local_index)
+        if symbol not in first_seen_open_time or open_time < first_seen_open_time[symbol]:
+            first_seen_open_time[symbol] = open_time
+    total_age_days = 0.0
+    min_age_days = None
+    short_history_trades = 0
+    short_history_symbols = set()
+    for local_index in executed_indices:
+        symbol = row_symbol_name(rows, local_index)
+        open_time = row_open_time_value(rows, local_index)
+        age_ms = max(0, int(open_time) - int(first_seen_open_time.get(symbol, open_time)))
+        age_days = age_ms / float(24 * 60 * 60 * 1000)
+        total_age_days += age_days
+        if min_age_days is None or age_days < min_age_days:
+            min_age_days = age_days
+        if short_history_days > 0.0 and age_days < short_history_days:
+            short_history_trades += 1
+            short_history_symbols.add(symbol)
+    total_trades = len(executed_indices)
+    return {
+        "short_history_symbol_trade_share": float(short_history_trades) / float(total_trades) if total_trades else 0.0,
+        "short_history_symbol_count": len(short_history_symbols),
+        "average_executed_symbol_age_days": total_age_days / float(total_trades) if total_trades else 0.0,
+        "min_executed_symbol_age_days": float(min_age_days if min_age_days is not None else 0.0),
+    }
+
+
 def execution_rejection_diagnostics(execution):
     blocked_by_symbol = execution.get("blocked_by_symbol", {}) or {}
     blocked_by_bucket = execution.get("blocked_by_bucket", {}) or {}
@@ -7079,6 +8084,13 @@ def execution_rejection_diagnostics(execution):
 def finalize_evaluation_metrics(rows, metrics, execution, compute_auc, bundle):
     metrics.update(execution_frequency_metrics(execution))
     metrics.update(execution_symbol_summary(rows, execution))
+    metrics.update(
+        execution_symbol_age_summary(
+            rows,
+            execution,
+            float(bundle.get("short_history_days", 0.0)) if isinstance(bundle, dict) else 0.0,
+        )
+    )
     metrics.update(execution_rejection_diagnostics(execution))
     calibration_report = calibration_report_for_rows(rows, bundle, metrics.get("selected_threshold", 0.0))
     metrics["calibration_report"] = calibration_report
@@ -7108,6 +8120,7 @@ def evaluate_compact(rows, predictions, threshold, fee, slippage, compute_auc=Tr
                      pause_after_drawdown_minutes=0, hybrid_runtime_args=None,
                      symbol_filter_info=None):
     bundle = normalize_prediction_bundle(predictions)
+    bundle["short_history_days"] = float(getattr(hybrid_runtime_args, "threshold_short_history_days", 0.0)) if hybrid_runtime_args is not None else 0.0
     table = rows.table
     actual_positive = int(np.sum(rows.labels_array()))
     predicted_trades = 0
@@ -7189,9 +8202,10 @@ def evaluate_compact(rows, predictions, threshold, fee, slippage, compute_auc=Tr
         expected_value = execution["executed_expected_values"].get(local_index, 0.0)
 
         forward_return = float(table.forward_returns[position])
-        trade_return = float(table.trade_returns[position])
-        max_future_high_return = float(table.max_future_high_returns[position])
-        max_future_low_return = float(table.max_future_low_returns[position])
+        fixed_trade_return = float(table.trade_returns[position])
+        trade_return = float(execution["executed_dynamic_trade_returns"].get(local_index, fixed_trade_return))
+        max_future_high_return = float(execution["executed_max_favorable_excursion_before_exit"].get(local_index, table.max_future_high_returns[position]))
+        max_future_low_return = float(execution["executed_max_adverse_excursion_before_exit"].get(local_index, table.max_future_low_returns[position]))
         after_fee = trade_return - fee
         after_fee_slippage = trade_return - fee - slippage
         total_fee += after_fee
@@ -7273,7 +8287,9 @@ def evaluate_compact(rows, predictions, threshold, fee, slippage, compute_auc=Tr
         "max_open_positions_blocked": execution.get("max_open_positions_blocked", 0),
         "daily_loss_fraction_blocked": execution.get("daily_loss_fraction_blocked", 0),
         "cooldown_after_loss_blocked": execution.get("cooldown_after_loss_blocked", 0),
+        "period_trade_limit_blocked": execution.get("period_trade_limit_blocked", 0),
         "symbol_trade_limit_blocked": execution.get("symbol_trade_limit_blocked", 0),
+        "symbol_reentry_cooldown_blocked": execution.get("symbol_reentry_cooldown_blocked", 0),
         "symbol_minute_cap_blocked": execution.get("symbol_minute_cap_blocked", 0),
         "lot_size_adjusted": execution.get("lot_size_adjusted", 0),
         "tick_size_adjusted": execution.get("tick_size_adjusted", 0),
@@ -7294,6 +8310,13 @@ def evaluate_compact(rows, predictions, threshold, fee, slippage, compute_auc=Tr
         "selected_threshold": threshold,
     }
     metrics.update(raw_metrics)
+    metrics.update({
+        "exit_policy": execution.get("exit_policy", resolved_exit_policy(hybrid_runtime_args)),
+        "trailing_activation_return": execution.get("trailing_activation_return", float(getattr(hybrid_runtime_args, "trailing_activation_return", 0.01)) if hybrid_runtime_args is not None else 0.01),
+        "trailing_drawdown": execution.get("trailing_drawdown", float(getattr(hybrid_runtime_args, "trailing_drawdown", 0.003)) if hybrid_runtime_args is not None else 0.003),
+        "stop_loss": execution.get("stop_loss", resolved_stop_loss(hybrid_runtime_args, downside_stop)),
+        "max_holding_period_minutes": execution.get("max_holding_period_minutes", resolved_max_holding_period_minutes(hybrid_runtime_args)),
+    })
     return finalize_evaluation_metrics(rows, metrics, execution, compute_auc, bundle)
 
 
@@ -7343,6 +8366,7 @@ def evaluate(rows, predictions, threshold, fee, slippage, compute_auc=True, init
         )
 
     bundle = normalize_prediction_bundle(predictions)
+    bundle["short_history_days"] = float(getattr(hybrid_runtime_args, "threshold_short_history_days", 0.0)) if hybrid_runtime_args is not None else 0.0
     actual_positive = sum(row.label for row in rows)
     predicted_trades = 0
     tp = fp = tn = fn = 0
@@ -7418,19 +8442,21 @@ def evaluate(rows, predictions, threshold, fee, slippage, compute_auc=True, init
             fp += 1
 
         expected_value = execution["executed_expected_values"].get(index, 0.0)
-        after_fee = row.trade_return - fee
-        after_fee_slippage = row.trade_return - fee - slippage
+        fixed_trade_return = row.trade_return
+        trade_return = float(execution["executed_dynamic_trade_returns"].get(index, fixed_trade_return))
+        after_fee = trade_return - fee
+        after_fee_slippage = trade_return - fee - slippage
         total_fee += after_fee
         total_fee_slippage += after_fee_slippage
         sum_return += row.forward_return
-        sum_trade_return += row.trade_return
+        sum_trade_return += trade_return
         sum_expected_value += expected_value
-        sum_mfe += row.max_future_high_return
-        sum_mae += row.max_future_low_return
+        sum_mfe += float(execution["executed_max_favorable_excursion_before_exit"].get(index, row.max_future_high_return))
+        sum_mae += float(execution["executed_max_adverse_excursion_before_exit"].get(index, row.max_future_low_return))
         returns.append(row.forward_return)
-        trade_returns.append(row.trade_return)
+        trade_returns.append(trade_return)
         expected_values.append(expected_value)
-        if row.trade_return > 0.0:
+        if trade_return > 0.0:
             winning_trades += 1
         if after_fee_slippage >= 0.0:
             gross_profit += after_fee_slippage
@@ -7499,7 +8525,9 @@ def evaluate(rows, predictions, threshold, fee, slippage, compute_auc=True, init
         "max_open_positions_blocked": execution.get("max_open_positions_blocked", 0),
         "daily_loss_fraction_blocked": execution.get("daily_loss_fraction_blocked", 0),
         "cooldown_after_loss_blocked": execution.get("cooldown_after_loss_blocked", 0),
+        "period_trade_limit_blocked": execution.get("period_trade_limit_blocked", 0),
         "symbol_trade_limit_blocked": execution.get("symbol_trade_limit_blocked", 0),
+        "symbol_reentry_cooldown_blocked": execution.get("symbol_reentry_cooldown_blocked", 0),
         "symbol_minute_cap_blocked": execution.get("symbol_minute_cap_blocked", 0),
         "lot_size_adjusted": execution.get("lot_size_adjusted", 0),
         "tick_size_adjusted": execution.get("tick_size_adjusted", 0),
@@ -7520,6 +8548,13 @@ def evaluate(rows, predictions, threshold, fee, slippage, compute_auc=True, init
         "selected_threshold": threshold,
     }
     metrics.update(raw_metrics)
+    metrics.update({
+        "exit_policy": execution.get("exit_policy", resolved_exit_policy(hybrid_runtime_args)),
+        "trailing_activation_return": execution.get("trailing_activation_return", float(getattr(hybrid_runtime_args, "trailing_activation_return", 0.01)) if hybrid_runtime_args is not None else 0.01),
+        "trailing_drawdown": execution.get("trailing_drawdown", float(getattr(hybrid_runtime_args, "trailing_drawdown", 0.003)) if hybrid_runtime_args is not None else 0.003),
+        "stop_loss": execution.get("stop_loss", resolved_stop_loss(hybrid_runtime_args, downside_stop)),
+        "max_holding_period_minutes": execution.get("max_holding_period_minutes", resolved_max_holding_period_minutes(hybrid_runtime_args)),
+    })
     return finalize_evaluation_metrics(rows, metrics, execution, compute_auc, bundle)
 
 
@@ -8013,6 +9048,14 @@ def recalibrate_symbol_filter_validation(rows, bundle, threshold, args, selectio
         selected_score_name,
         args.min_validation_trades,
         args.max_validation_trades,
+        getattr(args, "threshold_top1_concentration_penalty", 0.0),
+        getattr(args, "threshold_top3_concentration_penalty", 0.0),
+        getattr(args, "threshold_trade_top1_concentration_penalty", 0.0),
+        getattr(args, "threshold_max_top1_concentration", 0.0),
+        getattr(args, "threshold_max_top3_concentration", 0.0),
+        getattr(args, "threshold_max_trade_top1_concentration", 0.0),
+        getattr(args, "threshold_concentration_cap_mode", "soft"),
+        getattr(args, "threshold_diversity_penalty_weight", 0.0),
     )
     trade_count = int(filtered_selection["validation_metrics"].get("predicted_trades", 0))
     precision = float(filtered_selection["validation_metrics"].get("precision", 0.0))
@@ -8329,12 +9372,211 @@ def threshold_score(metrics, objective, zero_trade_profit_score=0.0,
     return metrics["portfolio_profit"]
 
 
+def concentration_cap_overflow_penalty(actual_value, cap_value, configured_penalty):
+    actual = float(actual_value)
+    cap = float(cap_value)
+    if cap <= 0.0 or actual <= cap:
+        return 0.0
+    remaining_room = max(1e-9, 1.0 - cap)
+    overflow_ratio = (actual - cap) / remaining_room
+    return max(1.0, float(configured_penalty)) * overflow_ratio
+
+
+def threshold_diversity_penalty(metrics, base_score, diversity_penalty_weight=0.0):
+    weight = max(0.0, float(diversity_penalty_weight))
+    if weight <= 0.0 or int(metrics.get("predicted_trades", 0)) <= 0:
+        return 0.0
+    symbol_rows = metrics.get("symbol_execution_rows", []) or []
+    active_symbol_count = max(1, len(symbol_rows))
+    scarcity_penalty = 1.0 / float(active_symbol_count)
+    concentration_penalty = blended_top1_concentration(metrics)
+    scaled_base = max(1.0, abs(float(base_score)))
+    return weight * scaled_base * (0.7 * concentration_penalty + 0.3 * scarcity_penalty)
+
+
+def threshold_burst_penalty(metrics, base_score, trades_per_day_penalty=0.0,
+                            max_trades_in_day_penalty=0.0, target_trades_per_day=0.0,
+                            target_max_trades_in_day=0):
+    predicted_trades = int(metrics.get("predicted_trades", 0))
+    if predicted_trades <= 0:
+        return 0.0
+    scaled_base = max(1.0, abs(float(base_score)))
+    penalty = 0.0
+    if trades_per_day_penalty > 0.0 and target_trades_per_day > 0.0:
+        burst = max(0.0, float(metrics.get("trades_per_day", 0.0)) - float(target_trades_per_day))
+        penalty += trades_per_day_penalty * burst
+    if max_trades_in_day_penalty > 0.0 and target_max_trades_in_day > 0:
+        burst = max(0.0, int(metrics.get("max_trades_in_any_day", 0)) - int(target_max_trades_in_day))
+        penalty += max_trades_in_day_penalty * float(burst)
+    return penalty * scaled_base
+
+
+def threshold_short_history_penalty(metrics, base_score, short_history_penalty=0.0):
+    weight = max(0.0, float(short_history_penalty))
+    if weight <= 0.0 or int(metrics.get("predicted_trades", 0)) <= 0:
+        return 0.0
+    scaled_base = max(1.0, abs(float(base_score)))
+    return weight * scaled_base * float(metrics.get("short_history_symbol_trade_share", 0.0))
+
+
+def threshold_floor_snap_penalty(metrics, base_score, threshold, effective_floor=0.0,
+                                 snap_penalty_weight=0.0, snap_tolerance=0.0):
+    weight = max(0.0, float(snap_penalty_weight))
+    predicted_trades = int(metrics.get("predicted_trades", 0))
+    if weight <= 0.0 or predicted_trades <= 0:
+        return 0.0
+    floor_value = float(effective_floor)
+    threshold_value = float(threshold)
+    if floor_value >= 0.0 or threshold_value < floor_value - 1e-12:
+        return 0.0
+    tolerance = max(0.0, float(snap_tolerance))
+    gap = threshold_value - floor_value
+    if tolerance <= 0.0:
+        if abs(gap) > 1e-12:
+            return 0.0
+        closeness = 1.0
+    else:
+        if gap > tolerance + 1e-12:
+            return 0.0
+        closeness = max(0.0, 1.0 - (gap / tolerance))
+    scaled_base = max(1.0, abs(float(base_score)))
+    trades_per_day = max(0.0, float(metrics.get("trades_per_day", 0.0)))
+    max_trades_in_day = max(0, int(metrics.get("max_trades_in_any_day", 0)))
+    burst_intensity = 1.0 + max(0.0, trades_per_day - 1.0) + 0.25 * max(0, max_trades_in_day - 1)
+    return weight * closeness * scaled_base * burst_intensity
+
+
+def threshold_penalty_breakdown(metrics, base_score, drawdown_penalty=0.0,
+                                trade_count_penalty=0.0, target_validation_trades=0,
+                                top1_concentration_penalty=0.0,
+                                top3_concentration_penalty=0.0,
+                                trade_top1_concentration_penalty=0.0,
+                                top1_concentration_cap=0.0,
+                                top3_concentration_cap=0.0,
+                                trade_top1_concentration_cap=0.0,
+                                concentration_cap_mode="soft",
+                                diversity_penalty_weight=0.0,
+                                burst_trades_per_day_penalty=0.0,
+                                burst_max_trades_in_day_penalty=0.0,
+                                target_trades_per_day=0.0,
+                                target_max_trades_in_day=0,
+                                short_history_penalty=0.0,
+                                threshold=0.0,
+                                effective_floor=0.0,
+                                floor_snap_penalty_weight=0.0,
+                                floor_snap_tolerance=0.0):
+    components = {
+        "drawdown_penalty": 0.0,
+        "trade_count_penalty": 0.0,
+        "top1_concentration_penalty": 0.0,
+        "top3_concentration_penalty": 0.0,
+        "trade_top1_concentration_penalty": 0.0,
+        "top1_concentration_overflow_penalty": 0.0,
+        "top3_concentration_overflow_penalty": 0.0,
+        "trade_top1_concentration_overflow_penalty": 0.0,
+        "diversity_penalty": 0.0,
+        "burst_penalty": 0.0,
+        "short_history_penalty": 0.0,
+        "floor_snap_penalty": 0.0,
+    }
+    if int(metrics.get("predicted_trades", 0)) <= 0:
+        components["concentration_penalty_total"] = 0.0
+        components["total_penalty"] = 0.0
+        return components
+    if drawdown_penalty > 0.0:
+        components["drawdown_penalty"] = drawdown_penalty * abs(float(metrics.get("max_capital_drawdown", 0.0)))
+    if trade_count_penalty > 0.0 and target_validation_trades > 0:
+        excess_trades = max(0, int(metrics.get("predicted_trades", 0)) - int(target_validation_trades))
+        components["trade_count_penalty"] = trade_count_penalty * excess_trades
+    if top1_concentration_penalty > 0.0:
+        components["top1_concentration_penalty"] = top1_concentration_penalty * float(metrics.get("symbol_profit_concentration_top1", 0.0))
+    if top3_concentration_penalty > 0.0:
+        components["top3_concentration_penalty"] = top3_concentration_penalty * float(metrics.get("symbol_profit_concentration_top3", 0.0))
+    if trade_top1_concentration_penalty > 0.0:
+        components["trade_top1_concentration_penalty"] = trade_top1_concentration_penalty * float(metrics.get("symbol_trade_concentration_top1", 0.0))
+    if concentration_cap_mode == "soft":
+        components["top1_concentration_overflow_penalty"] = concentration_cap_overflow_penalty(
+            metrics.get("symbol_profit_concentration_top1", 0.0),
+            top1_concentration_cap,
+            top1_concentration_penalty,
+        )
+        components["top3_concentration_overflow_penalty"] = concentration_cap_overflow_penalty(
+            metrics.get("symbol_profit_concentration_top3", 0.0),
+            top3_concentration_cap,
+            top3_concentration_penalty,
+        )
+        components["trade_top1_concentration_overflow_penalty"] = concentration_cap_overflow_penalty(
+            metrics.get("symbol_trade_concentration_top1", 0.0),
+            trade_top1_concentration_cap,
+            trade_top1_concentration_penalty,
+        )
+    components["diversity_penalty"] = threshold_diversity_penalty(
+        metrics,
+        base_score,
+        diversity_penalty_weight,
+    )
+    components["burst_penalty"] = threshold_burst_penalty(
+        metrics,
+        base_score,
+        burst_trades_per_day_penalty,
+        burst_max_trades_in_day_penalty,
+        target_trades_per_day,
+        target_max_trades_in_day,
+    )
+    components["short_history_penalty"] = threshold_short_history_penalty(
+        metrics,
+        base_score,
+        short_history_penalty,
+    )
+    components["floor_snap_penalty"] = threshold_floor_snap_penalty(
+        metrics,
+        base_score,
+        threshold,
+        effective_floor,
+        floor_snap_penalty_weight,
+        floor_snap_tolerance,
+    )
+    components["concentration_penalty_total"] = (
+        components["top1_concentration_penalty"]
+        + components["top3_concentration_penalty"]
+        + components["trade_top1_concentration_penalty"]
+        + components["top1_concentration_overflow_penalty"]
+        + components["top3_concentration_overflow_penalty"]
+        + components["trade_top1_concentration_overflow_penalty"]
+    )
+    components["total_penalty"] = (
+        components["drawdown_penalty"]
+        + components["trade_count_penalty"]
+        + components["concentration_penalty_total"]
+        + components["diversity_penalty"]
+        + components["burst_penalty"]
+        + components["short_history_penalty"]
+        + components["floor_snap_penalty"]
+    )
+    return components
+
+
 def threshold_penalized_score(metrics, objective, zero_trade_profit_score=0.0,
                               drawdown_penalty=0.0, trade_count_penalty=0.0,
                               target_validation_trades=0,
                               min_validation_trades=0, max_validation_trades=0,
                               top1_concentration_penalty=0.0,
-                              top3_concentration_penalty=0.0):
+                              top3_concentration_penalty=0.0,
+                              trade_top1_concentration_penalty=0.0,
+                              top1_concentration_cap=0.0,
+                              top3_concentration_cap=0.0,
+                              trade_top1_concentration_cap=0.0,
+                              concentration_cap_mode="soft",
+                              diversity_penalty_weight=0.0,
+                              burst_trades_per_day_penalty=0.0,
+                              burst_max_trades_in_day_penalty=0.0,
+                              target_trades_per_day=0.0,
+                              target_max_trades_in_day=0,
+                              short_history_penalty=0.0,
+                              threshold=0.0,
+                              effective_floor=0.0,
+                              floor_snap_penalty_weight=0.0,
+                              floor_snap_tolerance=0.0):
     base_score = threshold_score(
         metrics,
         objective,
@@ -8343,17 +9585,31 @@ def threshold_penalized_score(metrics, objective, zero_trade_profit_score=0.0,
         min_validation_trades,
         max_validation_trades,
     )
-    penalized_score = base_score
-    if metrics["predicted_trades"] > 0:
-        if drawdown_penalty > 0.0:
-            penalized_score -= drawdown_penalty * abs(float(metrics.get("max_capital_drawdown", 0.0)))
-        if trade_count_penalty > 0.0 and target_validation_trades > 0:
-            excess_trades = max(0, int(metrics.get("predicted_trades", 0)) - int(target_validation_trades))
-            penalized_score -= trade_count_penalty * excess_trades
-        if top1_concentration_penalty > 0.0:
-            penalized_score -= top1_concentration_penalty * float(metrics.get("symbol_profit_concentration_top1", 0.0))
-        if top3_concentration_penalty > 0.0:
-            penalized_score -= top3_concentration_penalty * float(metrics.get("symbol_profit_concentration_top3", 0.0))
+    penalty_breakdown = threshold_penalty_breakdown(
+        metrics,
+        base_score,
+        drawdown_penalty,
+        trade_count_penalty,
+        target_validation_trades,
+        top1_concentration_penalty,
+        top3_concentration_penalty,
+        trade_top1_concentration_penalty,
+        top1_concentration_cap,
+        top3_concentration_cap,
+        trade_top1_concentration_cap,
+        concentration_cap_mode,
+        diversity_penalty_weight,
+        burst_trades_per_day_penalty,
+        burst_max_trades_in_day_penalty,
+        target_trades_per_day,
+        target_max_trades_in_day,
+        short_history_penalty,
+        threshold,
+        effective_floor,
+        floor_snap_penalty_weight,
+        floor_snap_tolerance,
+    )
+    penalized_score = base_score - float(penalty_breakdown.get("total_penalty", 0.0))
     return base_score, penalized_score
 
 
@@ -8405,21 +9661,48 @@ def active_day_tie_value(active_days, args):
     return int(active_days)
 
 
+def blended_top1_concentration(metrics):
+    profit_top1 = float(metrics.get("symbol_profit_concentration_top1", 0.0))
+    trade_top1 = float(metrics.get("symbol_trade_concentration_top1", 0.0))
+    return 0.6 * profit_top1 + 0.4 * trade_top1
+
+
 def compare_threshold_results(candidate_result, best_result, args, min_validation_trades, max_validation_trades):
     if best_result is None:
         return True, "initial_selection"
     candidate_score = float(candidate_result.get("penalized_objective_score", candidate_result.get("objective_score", -float("inf"))))
     best_score = float(best_result.get("penalized_objective_score", best_result.get("objective_score", -float("inf"))))
     epsilon = float(getattr(args, "threshold_tie_epsilon", 1e-9))
-    if candidate_score > best_score + epsilon:
-        return True, "higher_objective_score"
-    if candidate_score < best_score - epsilon:
-        return False, "lower_objective_score"
-
     tie_breaker = getattr(args, "threshold_tiebreaker", "fewer_trades")
-    target_trades = resolved_threshold_target_trades(args, min_validation_trades, max_validation_trades)
+    floor_snap_score_tolerance_ratio = max(0.0, float(getattr(args, "threshold_floor_snap_score_tolerance_ratio", 0.0)))
     candidate_metrics = candidate_result["validation_metrics"]
     best_metrics = best_result["validation_metrics"]
+    candidate_floor_snap = int(candidate_metrics.get("threshold_floor_snap_applied", 0)) > 0
+    best_floor_snap = int(best_metrics.get("threshold_floor_snap_applied", 0)) > 0
+    if floor_snap_score_tolerance_ratio > 0.0 and candidate_floor_snap != best_floor_snap:
+        score_tolerance = max(
+            epsilon,
+            max(abs(best_score), abs(candidate_score)) * floor_snap_score_tolerance_ratio,
+        )
+        if abs(candidate_score - best_score) <= score_tolerance:
+            return (not candidate_floor_snap), "avoid_floor_snap"
+    diversity_score_tolerance = None
+    if tie_breaker == "diversified":
+        diversity_score_tolerance = max(
+            epsilon,
+            max(abs(best_score), abs(candidate_score)) * max(0.0, float(getattr(args, "threshold_diversity_profit_tolerance_ratio", 0.0))),
+        )
+        if candidate_score - diversity_score_tolerance > best_score:
+            return True, "higher_objective_score"
+        if best_score - diversity_score_tolerance > candidate_score:
+            return False, "lower_objective_score"
+    else:
+        if candidate_score > best_score + epsilon:
+            return True, "higher_objective_score"
+        if candidate_score < best_score - epsilon:
+            return False, "lower_objective_score"
+
+    target_trades = resolved_threshold_target_trades(args, min_validation_trades, max_validation_trades)
     candidate_trades = int(candidate_metrics.get("predicted_trades", 0))
     best_trades = int(best_metrics.get("predicted_trades", 0))
     candidate_active_days = int(candidate_metrics.get("active_days", 0))
@@ -8428,10 +9711,18 @@ def compare_threshold_results(candidate_result, best_result, args, min_validatio
     best_drawdown = float(best_metrics.get("max_capital_drawdown", 0.0))
     candidate_profit_day = validation_profit_per_active_day(candidate_metrics)
     best_profit_day = validation_profit_per_active_day(best_metrics)
+    candidate_profit = float(candidate_metrics.get("portfolio_profit", 0.0))
+    best_profit = float(best_metrics.get("portfolio_profit", 0.0))
     candidate_gap = abs(candidate_trades - target_trades)
     best_gap = abs(best_trades - target_trades)
     candidate_active_value = active_day_tie_value(candidate_active_days, args)
     best_active_value = active_day_tie_value(best_active_days, args)
+    candidate_profit_top1 = float(candidate_metrics.get("symbol_profit_concentration_top1", 0.0))
+    best_profit_top1 = float(best_metrics.get("symbol_profit_concentration_top1", 0.0))
+    candidate_trade_top1 = float(candidate_metrics.get("symbol_trade_concentration_top1", 0.0))
+    best_trade_top1 = float(best_metrics.get("symbol_trade_concentration_top1", 0.0))
+    candidate_blended_concentration = blended_top1_concentration(candidate_metrics)
+    best_blended_concentration = blended_top1_concentration(best_metrics)
 
     if tie_breaker == "target_trades":
         candidate_tuple = (-candidate_gap, -candidate_drawdown, candidate_active_value, -candidate_trades)
@@ -8442,9 +9733,66 @@ def compare_threshold_results(candidate_result, best_result, args, min_validatio
         best_tuple = (best_active_value, -best_gap, -best_drawdown, -best_trades)
         return candidate_tuple > best_tuple, "active_days"
     if tie_breaker == "balanced":
-        candidate_tuple = (candidate_active_value, -candidate_gap, candidate_profit_day, -candidate_drawdown, -candidate_trades)
-        best_tuple = (best_active_value, -best_gap, best_profit_day, -best_drawdown, -best_trades)
+        candidate_tuple = (-candidate_blended_concentration, candidate_active_value, -candidate_gap, candidate_profit_day, -candidate_drawdown, -candidate_trades)
+        best_tuple = (-best_blended_concentration, best_active_value, -best_gap, best_profit_day, -best_drawdown, -best_trades)
         return candidate_tuple > best_tuple, "balanced"
+    if tie_breaker == "diversified":
+        profit_tolerance_ratio = max(0.0, float(getattr(args, "threshold_diversity_profit_tolerance_ratio", 0.0)))
+        min_profit_top1_improvement = max(0.0, float(getattr(args, "threshold_diversity_min_profit_top1_improvement", 0.0)))
+        min_trade_top1_improvement = max(0.0, float(getattr(args, "threshold_diversity_min_trade_top1_improvement", 0.0)))
+        score_tolerance = diversity_score_tolerance if diversity_score_tolerance is not None else max(
+            epsilon,
+            max(abs(best_score), abs(candidate_score)) * profit_tolerance_ratio,
+        )
+        profit_tolerance = max(abs(best_profit), abs(candidate_profit)) * profit_tolerance_ratio
+        score_close = abs(candidate_score - best_score) <= score_tolerance + epsilon
+        if best_profit > 0.0:
+            profit_close = candidate_profit + profit_tolerance >= best_profit and best_profit + profit_tolerance >= candidate_profit
+        else:
+            profit_close = abs(candidate_profit - best_profit) <= profit_tolerance + epsilon
+        profit_concentration_better = candidate_profit_top1 + min_profit_top1_improvement <= best_profit_top1
+        trade_concentration_better = candidate_trade_top1 + min_trade_top1_improvement <= best_trade_top1
+        blended_concentration_better = candidate_blended_concentration + epsilon < best_blended_concentration
+        if score_close and profit_close and blended_concentration_better and (
+            profit_concentration_better or trade_concentration_better
+        ):
+            candidate_tuple = (
+                -candidate_blended_concentration,
+                -candidate_profit_top1,
+                -candidate_trade_top1,
+                candidate_profit_day,
+                candidate_metrics.get("precision", 0.0),
+                -candidate_drawdown,
+                -candidate_trades,
+            )
+            best_tuple = (
+                -best_blended_concentration,
+                -best_profit_top1,
+                -best_trade_top1,
+                best_profit_day,
+                best_metrics.get("precision", 0.0),
+                -best_drawdown,
+                -best_trades,
+            )
+            if candidate_tuple > best_tuple:
+                return True, "diversified_tolerance"
+        candidate_tuple = (
+            -candidate_blended_concentration,
+            candidate_profit_day,
+            candidate_metrics.get("precision", 0.0),
+            -candidate_gap,
+            -candidate_drawdown,
+            -candidate_trades,
+        )
+        best_tuple = (
+            -best_blended_concentration,
+            best_profit_day,
+            best_metrics.get("precision", 0.0),
+            -best_gap,
+            -best_drawdown,
+            -best_trades,
+        )
+        return candidate_tuple > best_tuple, "diversified"
     candidate_tuple = threshold_rank(
         candidate_metrics,
         getattr(args, "threshold_objective", "profit_balanced"),
@@ -8475,9 +9823,27 @@ def selected_score_name_for_mode(args):
 
 
 def annotate_selected_validation_metrics(metrics, threshold, selected_score_name,
-                                         base_score, penalized_score):
+                                         base_score, penalized_score,
+                                         concentration_penalty_total=0.0,
+                                         diversity_penalty_total=0.0,
+                                         floor_snap_penalty_total=0.0,
+                                         effective_floor=0.0,
+                                         floor_snap_tolerance=0.0):
     selected_trade_count = int(metrics.get("predicted_trades", 0))
     selected_active_days = int(metrics.get("active_days", 0))
+    threshold_value = float(threshold)
+    effective_floor_value = float(effective_floor)
+    tolerance = max(0.0, float(floor_snap_tolerance))
+    floor_snap_gap = threshold_value - effective_floor_value
+    floor_snap_applied = (
+        selected_trade_count > 0
+        and effective_floor_value < 0.0
+        and floor_snap_gap >= -1e-12
+        and (
+            (tolerance <= 0.0 and abs(floor_snap_gap) <= 1e-12)
+            or (tolerance > 0.0 and floor_snap_gap <= tolerance + 1e-12)
+        )
+    )
     metrics["selected_threshold"] = threshold
     metrics["selected_score_name"] = selected_score_name
     metrics["selected_score_threshold"] = threshold
@@ -8496,9 +9862,15 @@ def annotate_selected_validation_metrics(metrics, threshold, selected_score_name
     metrics["selected_validation_total_profit_after_fee_and_slippage"] = float(
         metrics.get("total_profit_after_fee_and_slippage", 0.0)
     )
+    metrics["selected_validation_symbol_count"] = len(metrics.get("symbol_execution_rows", []) or [])
     metrics["selected_validation_max_drawdown"] = float(metrics.get("max_capital_drawdown", 0.0))
     metrics["selected_validation_active_days"] = selected_active_days
     metrics["selected_validation_profit_per_active_day"] = validation_profit_per_active_day(metrics)
+    metrics["selected_concentration_penalty_total"] = float(concentration_penalty_total)
+    metrics["selected_diversity_penalty_total"] = float(diversity_penalty_total)
+    metrics["selected_floor_snap_penalty_total"] = float(floor_snap_penalty_total)
+    metrics["threshold_floor_snap_applied"] = 1 if floor_snap_applied else 0
+    metrics["threshold_floor_snap_distance"] = float(floor_snap_gap)
     return metrics
 
 
@@ -8507,7 +9879,53 @@ def build_selected_threshold_result(threshold, metrics, objective, zero_trade_pr
                                     target_validation_trades, selected_score_name,
                                     min_validation_trades=0, max_validation_trades=0,
                                     top1_concentration_penalty=0.0,
-                                    top3_concentration_penalty=0.0):
+                                    top3_concentration_penalty=0.0,
+                                    trade_top1_concentration_penalty=0.0,
+                                    top1_concentration_cap=0.0,
+                                    top3_concentration_cap=0.0,
+                                    trade_top1_concentration_cap=0.0,
+                                    concentration_cap_mode="soft",
+                                    diversity_penalty_weight=0.0,
+                                    burst_trades_per_day_penalty=0.0,
+                                    burst_max_trades_in_day_penalty=0.0,
+                                    target_trades_per_day=0.0,
+                                    target_max_trades_in_day=0,
+                                    short_history_penalty=0.0,
+                                    effective_floor=0.0,
+                                    floor_snap_penalty_weight=0.0,
+                                    floor_snap_tolerance=0.0):
+    base_score = threshold_score(
+        metrics,
+        objective,
+        zero_trade_profit_score,
+        target_validation_trades,
+        min_validation_trades,
+        max_validation_trades,
+    )
+    penalty_breakdown = threshold_penalty_breakdown(
+        metrics,
+        base_score,
+        drawdown_penalty,
+        trade_count_penalty,
+        target_validation_trades,
+        top1_concentration_penalty,
+        top3_concentration_penalty,
+        trade_top1_concentration_penalty,
+        top1_concentration_cap,
+        top3_concentration_cap,
+        trade_top1_concentration_cap,
+        concentration_cap_mode,
+        diversity_penalty_weight,
+        burst_trades_per_day_penalty,
+        burst_max_trades_in_day_penalty,
+        target_trades_per_day,
+        target_max_trades_in_day,
+        short_history_penalty,
+        threshold,
+        effective_floor,
+        floor_snap_penalty_weight,
+        floor_snap_tolerance,
+    )
     base_score, penalized_score = threshold_penalized_score(
         metrics,
         objective,
@@ -8519,6 +9937,21 @@ def build_selected_threshold_result(threshold, metrics, objective, zero_trade_pr
         max_validation_trades,
         top1_concentration_penalty,
         top3_concentration_penalty,
+        trade_top1_concentration_penalty,
+        top1_concentration_cap,
+        top3_concentration_cap,
+        trade_top1_concentration_cap,
+        concentration_cap_mode,
+        diversity_penalty_weight,
+        burst_trades_per_day_penalty,
+        burst_max_trades_in_day_penalty,
+        target_trades_per_day,
+        target_max_trades_in_day,
+        short_history_penalty,
+        threshold,
+        effective_floor,
+        floor_snap_penalty_weight,
+        floor_snap_tolerance,
     )
     annotate_selected_validation_metrics(
         metrics,
@@ -8526,6 +9959,11 @@ def build_selected_threshold_result(threshold, metrics, objective, zero_trade_pr
         selected_score_name,
         base_score,
         penalized_score,
+        penalty_breakdown.get("concentration_penalty_total", 0.0),
+        penalty_breakdown.get("diversity_penalty", 0.0),
+        penalty_breakdown.get("floor_snap_penalty", 0.0),
+        effective_floor,
+        floor_snap_tolerance,
     )
     return {
         "threshold": threshold,
@@ -8535,6 +9973,10 @@ def build_selected_threshold_result(threshold, metrics, objective, zero_trade_pr
         "base_objective_score": base_score,
         "objective_score": penalized_score,
         "penalized_objective_score": penalized_score,
+        "quality_diversity_score": penalized_score,
+        "concentration_penalty_total": float(penalty_breakdown.get("concentration_penalty_total", 0.0)),
+        "diversity_penalty_total": float(penalty_breakdown.get("diversity_penalty", 0.0)),
+        "floor_snap_penalty_total": float(penalty_breakdown.get("floor_snap_penalty", 0.0)),
         "validation_trade_count": int(metrics.get("predicted_trades", 0)),
         "validation_raw_signal_count": int(metrics.get("raw_signal_trades", 0)),
         "validation_max_drawdown": float(metrics.get("max_capital_drawdown", 0.0)),
@@ -8558,6 +10000,7 @@ def tune_threshold(rows, predictions, thresholds, objective, fee, slippage,
                    threshold_trade_count_penalty=0.0, target_validation_trades=0,
                    hybrid_runtime_args=None):
     thresholds = sorted(set(float(value) for value in thresholds))
+    prediction_bundle = normalize_prediction_bundle(predictions)
     best_result = None
     profit_objective = objective in ("profit", "profit_balanced", "avg_profit", "ev")
     strict_profit = profit_objective and profit_safety == "strict"
@@ -8586,20 +10029,42 @@ def tune_threshold(rows, predictions, thresholds, objective, fee, slippage,
         "closest_under_min_precision_trades": 0,
         "rejected_over_top1_concentration_count": 0,
         "rejected_over_top3_concentration_count": 0,
+        "rejected_over_trade_top1_concentration_count": 0,
         "closest_top1_concentration": 0.0,
         "closest_top1_concentration_threshold": 0.0,
         "closest_top3_concentration": 0.0,
         "closest_top3_concentration_threshold": 0.0,
+        "closest_trade_top1_concentration": 0.0,
+        "closest_trade_top1_concentration_threshold": 0.0,
     }
     threshold_rejection_diagnostics = []
     closest_over_max_gap = None
     closest_under_precision_gap = None
     closest_top1_gap = None
     closest_top3_gap = None
+    closest_trade_top1_gap = None
     max_top1_concentration = float(getattr(hybrid_runtime_args, "threshold_max_top1_concentration", 0.0)) if hybrid_runtime_args is not None else 0.0
     max_top3_concentration = float(getattr(hybrid_runtime_args, "threshold_max_top3_concentration", 0.0)) if hybrid_runtime_args is not None else 0.0
     top1_concentration_penalty = float(getattr(hybrid_runtime_args, "threshold_top1_concentration_penalty", 0.0)) if hybrid_runtime_args is not None else 0.0
     top3_concentration_penalty = float(getattr(hybrid_runtime_args, "threshold_top3_concentration_penalty", 0.0)) if hybrid_runtime_args is not None else 0.0
+    max_trade_top1_concentration = float(getattr(hybrid_runtime_args, "threshold_max_trade_top1_concentration", 0.0)) if hybrid_runtime_args is not None else 0.0
+    trade_top1_concentration_penalty = float(getattr(hybrid_runtime_args, "threshold_trade_top1_concentration_penalty", 0.0)) if hybrid_runtime_args is not None else 0.0
+    diversity_penalty_weight = float(getattr(hybrid_runtime_args, "threshold_diversity_penalty_weight", 0.0)) if hybrid_runtime_args is not None else 0.0
+    burst_trades_per_day_penalty = float(getattr(hybrid_runtime_args, "threshold_burst_trades_per_day_penalty", 0.0)) if hybrid_runtime_args is not None else 0.0
+    burst_max_trades_in_day_penalty = float(getattr(hybrid_runtime_args, "threshold_burst_max_trades_in_day_penalty", 0.0)) if hybrid_runtime_args is not None else 0.0
+    target_trades_per_day = float(getattr(hybrid_runtime_args, "threshold_target_trades_per_day", 0.0)) if hybrid_runtime_args is not None else 0.0
+    target_max_trades_in_day = int(getattr(hybrid_runtime_args, "threshold_target_max_trades_in_day", 0)) if hybrid_runtime_args is not None else 0
+    short_history_penalty = float(getattr(hybrid_runtime_args, "threshold_short_history_penalty", 0.0)) if hybrid_runtime_args is not None else 0.0
+    floor_snap_penalty_weight = float(getattr(hybrid_runtime_args, "threshold_floor_snap_penalty_weight", 0.0)) if hybrid_runtime_args is not None else 0.0
+    floor_snap_tolerance = float(getattr(hybrid_runtime_args, "threshold_floor_snap_tolerance", 0.0)) if hybrid_runtime_args is not None else 0.0
+    concentration_cap_mode = getattr(hybrid_runtime_args, "threshold_concentration_cap_mode", "soft") if hybrid_runtime_args is not None else "soft"
+    concentration_cap_hard_reject = concentration_cap_mode == "hard"
+    effective_floor = float(
+        (prediction_bundle.get("hybrid_gate_diagnostics") or {}).get(
+            "effective_hybrid_min_score",
+            getattr(hybrid_runtime_args, "hybrid_min_score_effective", getattr(hybrid_runtime_args, "hybrid_min_score", hybrid_min_score)) if hybrid_runtime_args is not None else hybrid_min_score,
+        )
+    )
     if strict_profit:
         best_metrics = evaluate(
             rows,
@@ -8644,6 +10109,20 @@ def tune_threshold(rows, predictions, thresholds, objective, fee, slippage,
             max_validation_trades,
             top1_concentration_penalty,
             top3_concentration_penalty,
+            trade_top1_concentration_penalty,
+            max_top1_concentration,
+            max_top3_concentration,
+            max_trade_top1_concentration,
+            concentration_cap_mode,
+            diversity_penalty_weight,
+            burst_trades_per_day_penalty,
+            burst_max_trades_in_day_penalty,
+            target_trades_per_day,
+            target_max_trades_in_day,
+            short_history_penalty,
+            effective_floor,
+            floor_snap_penalty_weight,
+            floor_snap_tolerance,
         )
         best_result["tie_rank_reason"] = "strict_profit_no_trade_baseline"
         best_result["validation_metrics"]["selected_threshold_tie_rank_reason"] = "strict_profit_no_trade_baseline"
@@ -8691,11 +10170,26 @@ def tune_threshold(rows, predictions, thresholds, objective, fee, slippage,
             max_validation_trades,
             top1_concentration_penalty,
             top3_concentration_penalty,
+            trade_top1_concentration_penalty,
+            max_top1_concentration,
+            max_top3_concentration,
+            max_trade_top1_concentration,
+            concentration_cap_mode,
+            diversity_penalty_weight,
+            burst_trades_per_day_penalty,
+            burst_max_trades_in_day_penalty,
+            target_trades_per_day,
+            target_max_trades_in_day,
+            short_history_penalty,
+            effective_floor,
+            floor_snap_penalty_weight,
+            floor_snap_tolerance,
         )
         trade_count = int(metrics.get("predicted_trades", 0))
         precision = float(metrics.get("precision", 0.0))
         top1_concentration = float(metrics.get("symbol_profit_concentration_top1", 0.0))
         top3_concentration = float(metrics.get("symbol_profit_concentration_top3", 0.0))
+        trade_top1_concentration = float(metrics.get("symbol_trade_concentration_top1", 0.0))
         if rejection_summary["lowest_trade_count_seen"] == 0 or trade_count < rejection_summary["lowest_trade_count_seen"]:
             rejection_summary["lowest_trade_count_seen"] = trade_count
         if trade_count > rejection_summary["highest_trade_count_seen"]:
@@ -8708,6 +10202,7 @@ def tune_threshold(rows, predictions, thresholds, objective, fee, slippage,
         too_imprecise = metrics["predicted_trades"] > 0 and metrics["precision"] < min_validation_precision
         too_top1_concentrated = max_top1_concentration > 0.0 and top1_concentration > max_top1_concentration
         too_top3_concentrated = max_top3_concentration > 0.0 and top3_concentration > max_top3_concentration
+        too_trade_top1_concentrated = max_trade_top1_concentration > 0.0 and trade_top1_concentration > max_trade_top1_concentration
         if too_few:
             rejection_summary["rejected_under_min_trades_count"] += 1
         if too_many:
@@ -8726,20 +10221,27 @@ def tune_threshold(rows, predictions, thresholds, objective, fee, slippage,
                 rejection_summary["closest_under_min_precision"] = precision
                 rejection_summary["closest_under_min_precision_threshold"] = float(threshold)
                 rejection_summary["closest_under_min_precision_trades"] = int(metrics["predicted_trades"])
-        if too_top1_concentrated:
+        if concentration_cap_hard_reject and too_top1_concentrated:
             rejection_summary["rejected_over_top1_concentration_count"] += 1
             top1_gap = top1_concentration - max_top1_concentration
             if closest_top1_gap is None or top1_gap < closest_top1_gap:
                 closest_top1_gap = top1_gap
                 rejection_summary["closest_top1_concentration"] = top1_concentration
                 rejection_summary["closest_top1_concentration_threshold"] = float(threshold)
-        if too_top3_concentrated:
+        if concentration_cap_hard_reject and too_top3_concentrated:
             rejection_summary["rejected_over_top3_concentration_count"] += 1
             top3_gap = top3_concentration - max_top3_concentration
             if closest_top3_gap is None or top3_gap < closest_top3_gap:
                 closest_top3_gap = top3_gap
                 rejection_summary["closest_top3_concentration"] = top3_concentration
                 rejection_summary["closest_top3_concentration_threshold"] = float(threshold)
+        if concentration_cap_hard_reject and too_trade_top1_concentrated:
+            rejection_summary["rejected_over_trade_top1_concentration_count"] += 1
+            trade_top1_gap = trade_top1_concentration - max_trade_top1_concentration
+            if closest_trade_top1_gap is None or trade_top1_gap < closest_trade_top1_gap:
+                closest_trade_top1_gap = trade_top1_gap
+                rejection_summary["closest_trade_top1_concentration"] = trade_top1_concentration
+                rejection_summary["closest_trade_top1_concentration_threshold"] = float(threshold)
         threshold_rejection_diagnostics.append({
             "threshold": float(threshold),
             "predicted_trades": trade_count,
@@ -8747,21 +10249,47 @@ def tune_threshold(rows, predictions, thresholds, objective, fee, slippage,
             "portfolio_profit": float(metrics.get("portfolio_profit", 0.0)),
             "symbol_profit_concentration_top1": top1_concentration,
             "symbol_profit_concentration_top3": top3_concentration,
+            "symbol_trade_concentration_top1": trade_top1_concentration,
             "top_blocked_symbol": metrics.get("top_blocked_symbol", ""),
             "top_blocked_symbol_reason": metrics.get("top_blocked_symbol_reason", ""),
             "top_blocked_symbol_count": int(metrics.get("top_blocked_symbol_count", 0)),
             "top_blocked_bucket_start_minute": int(metrics.get("top_blocked_bucket_start_minute", 0)),
             "top_blocked_bucket_reason": metrics.get("top_blocked_bucket_reason", ""),
             "top_blocked_bucket_count": int(metrics.get("top_blocked_bucket_count", 0)),
+            "threshold_concentration_cap_mode": concentration_cap_mode,
+            "over_top1_concentration": 1 if too_top1_concentrated else 0,
+            "over_top3_concentration": 1 if too_top3_concentrated else 0,
+            "over_trade_top1_concentration": 1 if too_trade_top1_concentrated else 0,
+            "floor_snap_penalty_total": float(result.get("floor_snap_penalty_total", 0.0)),
+            "threshold_floor_snap_applied": int(metrics.get("threshold_floor_snap_applied", 0)),
+            "threshold_floor_snap_distance": float(metrics.get("threshold_floor_snap_distance", 0.0)),
             "rejected_under_min_trades": 1 if too_few else 0,
             "rejected_over_max_trades": 1 if too_many else 0,
             "rejected_under_min_precision": 1 if too_imprecise else 0,
-            "rejected_over_top1_concentration": 1 if too_top1_concentrated else 0,
-            "rejected_over_top3_concentration": 1 if too_top3_concentrated else 0,
+            "rejected_over_top1_concentration": 1 if concentration_cap_hard_reject and too_top1_concentrated else 0,
+            "rejected_over_top3_concentration": 1 if concentration_cap_hard_reject and too_top3_concentrated else 0,
+            "rejected_over_trade_top1_concentration": 1 if concentration_cap_hard_reject and too_trade_top1_concentrated else 0,
         })
-        if sum(1 for flag in (too_few, too_many, too_imprecise, too_top1_concentrated, too_top3_concentrated) if flag) > 1:
+        if sum(
+            1
+            for flag in (
+                too_few,
+                too_many,
+                too_imprecise,
+                concentration_cap_hard_reject and too_top1_concentrated,
+                concentration_cap_hard_reject and too_top3_concentrated,
+                concentration_cap_hard_reject and too_trade_top1_concentrated,
+            )
+            if flag
+        ) > 1:
             rejection_summary["rejected_mixed_constraints_count"] += 1
-        if too_many or too_imprecise or too_top1_concentrated or too_top3_concentrated:
+        if (
+            too_many
+            or too_imprecise
+            or (concentration_cap_hard_reject and too_top1_concentrated)
+            or (concentration_cap_hard_reject and too_top3_concentrated)
+            or (concentration_cap_hard_reject and too_trade_top1_concentrated)
+        ):
             continue
         if too_few:
             if metrics["predicted_trades"] > 0:
@@ -8851,6 +10379,20 @@ def tune_threshold(rows, predictions, thresholds, objective, fee, slippage,
                 max_validation_trades,
                 top1_concentration_penalty,
                 top3_concentration_penalty,
+                trade_top1_concentration_penalty,
+                max_top1_concentration,
+                max_top3_concentration,
+                max_trade_top1_concentration,
+                concentration_cap_mode,
+                diversity_penalty_weight,
+                burst_trades_per_day_penalty,
+                burst_max_trades_in_day_penalty,
+                target_trades_per_day,
+                target_max_trades_in_day,
+                short_history_penalty,
+                effective_floor,
+                floor_snap_penalty_weight,
+                floor_snap_tolerance,
             )
             best_result["tie_rank_reason"] = "no_trade_fallback"
             best_result["validation_metrics"]["selected_threshold_tie_rank_reason"] = "no_trade_fallback"
@@ -9001,46 +10543,83 @@ class InternalMeanRegressor(object):
         return None
 
 
-class ExternalModel(object):
-    def __init__(self, model, kind, task):
-        self.model = model
-        self.kind = kind
+class NativeLightGBMModel(object):
+    def __init__(self, params, positive_weight, task):
+        self.params = dict(params)
+        self.positive_weight = float(positive_weight)
         self.task = task
+        self.model = None
 
     def fit(self, x_train, y_train, feature_names, x_validation=None, y_validation=None, args=None):
-        del feature_names
-        fit_kwargs = {}
-        training_classes = np.unique(y_train) if np is not None else set(y_train)
+        import lightgbm as lgb
+        train_set = lgb.Dataset(
+            x_train,
+            label=y_train,
+            feature_name=list(feature_names) if feature_names else "auto",
+            free_raw_data=False,
+        )
         use_validation = x_validation is not None and y_validation is not None and len(y_validation)
-        if self.task == "classification" and use_validation and len(training_classes) > 1:
-            from lightgbm import early_stopping, log_evaluation
-            fit_kwargs["eval_set"] = [(x_validation, y_validation)]
-            fit_kwargs["eval_metric"] = args.eval_metric if args is not None else "binary_logloss"
-            callbacks = []
-            if args is not None and args.early_stopping_rounds > 0:
-                callbacks.append(early_stopping(args.early_stopping_rounds, verbose=False))
+        valid_sets = None
+        valid_names = None
+        callbacks = []
+        if use_validation:
+            valid_sets = [lgb.Dataset(
+                x_validation,
+                label=y_validation,
+                feature_name=list(feature_names) if feature_names else "auto",
+                reference=train_set,
+                free_raw_data=False,
+            )]
+            valid_names = ["validation"]
+            if self.task == "classification" and args is not None and args.early_stopping_rounds > 0:
+                callbacks.append(lgb.early_stopping(args.early_stopping_rounds, verbose=False))
             if args is not None:
-                callbacks.append(log_evaluation(args.log_evaluation_period))
-            if callbacks:
-                fit_kwargs["callbacks"] = callbacks
-        elif self.task == "regression" and use_validation:
-            fit_kwargs["eval_set"] = [(x_validation, y_validation)]
-            fit_kwargs["eval_metric"] = "l2"
-        self.model.fit(x_train, y_train, **fit_kwargs)
+                callbacks.append(lgb.log_evaluation(args.log_evaluation_period))
+        native_params = {
+            "objective": "binary" if self.task == "classification" else "regression",
+            "metric": (args.eval_metric if args is not None else "binary_logloss") if self.task == "classification" else "l2",
+            "learning_rate": self.params["learning_rate"],
+            "num_leaves": self.params["num_leaves"],
+            "max_depth": self.params["max_depth"],
+            "subsample": self.params["subsample"],
+            "subsample_freq": 1,
+            "colsample_bytree": self.params["colsample_bytree"],
+            "min_child_samples": self.params["min_child_samples"],
+            "min_split_gain": self.params["min_split_gain"],
+            "reg_alpha": self.params["reg_alpha"],
+            "reg_lambda": self.params["reg_lambda"],
+            "max_bin": self.params["max_bin"],
+            "subsample_for_bin": self.params["subsample_for_bin"],
+            "histogram_pool_size": self.params["histogram_pool_size"],
+            "num_threads": self.params["n_jobs"],
+            "force_col_wise": True,
+            "verbosity": -1,
+            "seed": 17,
+        }
+        if self.task == "classification":
+            native_params["scale_pos_weight"] = self.positive_weight
+        self.model = lgb.train(
+            native_params,
+            train_set,
+            num_boost_round=self.params["n_estimators"],
+            valid_sets=valid_sets,
+            valid_names=valid_names,
+            callbacks=callbacks or None,
+        )
         return self
 
     def predict_proba(self, x_rows):
-        best_iteration = getattr(self.model, "best_iteration_", None)
+        best_iteration = self.best_iteration()
         kwargs = {"num_iteration": best_iteration} if best_iteration else {}
-        probabilities = self.model.predict_proba(x_rows, **kwargs)
+        probabilities = self.model.predict(x_rows, **kwargs)
         if np is not None:
-            return np.asarray(probabilities)[:, 1].astype(np.float32, copy=True)
-        return [float(row[1]) for row in probabilities]
+            return np.asarray(probabilities, dtype=np.float32)
+        return [float(value) for value in probabilities]
 
     def predict_values(self, x_rows):
         if self.task == "classification":
             return self.predict_proba(x_rows)
-        best_iteration = getattr(self.model, "best_iteration_", None)
+        best_iteration = self.best_iteration()
         kwargs = {"num_iteration": best_iteration} if best_iteration else {}
         predictions = self.model.predict(x_rows, **kwargs)
         if np is not None:
@@ -9048,9 +10627,9 @@ class ExternalModel(object):
         return [float(value) for value in predictions]
 
     def feature_importance(self, feature_names):
-        importances = getattr(self.model, "feature_importances_", None)
-        if importances is None:
+        if self.model is None:
             return []
+        importances = self.model.feature_importance(importance_type="gain")
         total = float(sum(importances))
         return [
             (name, float(value), float(value) / total if total else 0.0)
@@ -9058,7 +10637,9 @@ class ExternalModel(object):
         ]
 
     def best_iteration(self):
-        value = getattr(self.model, "best_iteration_", None)
+        if self.model is None:
+            return None
+        value = getattr(self.model, "best_iteration", None)
         return int(value) if value else None
 
 
@@ -9112,53 +10693,8 @@ def class_weight_ratio_for_rows(rows, cap):
 def make_model(kind, params, positive_weight, objective_mode="classification"):
     if kind == "lightgbm":
         if objective_mode == "classification":
-            from lightgbm import LGBMClassifier
-            model = LGBMClassifier(
-                n_estimators=params["n_estimators"],
-                learning_rate=params["learning_rate"],
-                num_leaves=params["num_leaves"],
-                max_depth=params["max_depth"],
-                subsample=params["subsample"],
-                subsample_freq=1,
-                colsample_bytree=params["colsample_bytree"],
-                min_child_samples=params["min_child_samples"],
-                min_split_gain=params["min_split_gain"],
-                reg_alpha=params["reg_alpha"],
-                reg_lambda=params["reg_lambda"],
-                max_bin=params["max_bin"],
-                subsample_for_bin=params["subsample_for_bin"],
-                histogram_pool_size=params["histogram_pool_size"],
-                n_jobs=params["n_jobs"],
-                force_col_wise=True,
-                objective="binary",
-                scale_pos_weight=positive_weight,
-                random_state=17,
-                verbosity=-1,
-            )
-            return ExternalModel(model, kind, "classification")
-        from lightgbm import LGBMRegressor
-        model = LGBMRegressor(
-            n_estimators=params["n_estimators"],
-            learning_rate=params["learning_rate"],
-            num_leaves=params["num_leaves"],
-            max_depth=params["max_depth"],
-            subsample=params["subsample"],
-            subsample_freq=1,
-            colsample_bytree=params["colsample_bytree"],
-            min_child_samples=params["min_child_samples"],
-            min_split_gain=params["min_split_gain"],
-            reg_alpha=params["reg_alpha"],
-            reg_lambda=params["reg_lambda"],
-            max_bin=params["max_bin"],
-            subsample_for_bin=params["subsample_for_bin"],
-            histogram_pool_size=params["histogram_pool_size"],
-            n_jobs=params["n_jobs"],
-            force_col_wise=True,
-            objective="regression",
-            random_state=17,
-            verbosity=-1,
-        )
-        return ExternalModel(model, kind, "regression")
+            return NativeLightGBMModel(params, positive_weight, "classification")
+        return NativeLightGBMModel(params, positive_weight, "regression")
     if objective_mode == "classification":
         return InternalStumpGBDT(
             n_estimators=params["n_estimators"],
@@ -9431,7 +10967,16 @@ def save_prediction_bundle_cache(selected, rows, kind, args, stage_prefix, bundl
     def write_one(output_path):
         with open(output_path, "wb") as handle:
             np.savez(handle, **arrays)
-    atomic_write_path(cache_path, write_one)
+    try:
+        atomic_write_path(cache_path, write_one)
+    except OSError as error:
+        warn_once(
+            "prediction-bundle-cache-write-{}".format(cache_key),
+            "Warning: unable to persist prediction bundle cache at {} ({}); continuing without disk cache write.".format(
+                cache_path,
+                error,
+            ),
+        )
 
 
 def average_prediction_bundles(rows, args, bundles):
@@ -9579,6 +11124,7 @@ def prediction_bundle_for_models(selected, rows, kind, args, stage_prefix):
         hybrid_return_context=selected.get("hybrid_return_info"),
         uncertainty_context=selected.get("uncertainty_model"),
     )
+    bundle["regression_calibration"] = selected.get("regression_calibration") or {}
     meta_probability = apply_meta_filter(
         rows,
         bundle,
@@ -9596,9 +11142,25 @@ def prediction_bundle_for_models(selected, rows, kind, args, stage_prefix):
 def selected_thresholds_for_bundle(bundle, validation_rows, args):
     if args.objective_mode != "classification":
         threshold = threshold_for_mode(args)
+        if args.objective_mode == "hybrid":
+            threshold, threshold_diagnostics = resolved_hybrid_min_score_floor(bundle, args)
+            if args.disable_adaptive_thresholds:
+                bundle["hybrid_gate_diagnostics"] = dict(threshold_diagnostics)
+                return [threshold], threshold, None
+        else:
+            threshold_diagnostics = {}
         if args.disable_adaptive_thresholds:
             return [threshold], threshold, None
         score_values = score_values_for_bundle(validation_rows, bundle, args)
+        if args.objective_mode == "hybrid":
+            threshold_diagnostics.update(
+                hybrid_gate_score_diagnostics(
+                    score_values,
+                    float(getattr(args, "hybrid_min_score", 0.0)),
+                    float(threshold),
+                )
+            )
+            bundle["hybrid_gate_diagnostics"] = threshold_diagnostics
         thresholds = adaptive_score_thresholds(
             score_values,
             threshold,
@@ -9713,10 +11275,191 @@ def selection_is_no_trade_fallback(selection):
     )
 
 
+def finite_float_values(values):
+    if values is None:
+        return []
+    if np is not None and isinstance(values, np.ndarray):
+        if values.size <= 0:
+            return []
+        array_values = np.asarray(values, dtype=np.float32)
+        finite_mask = np.isfinite(array_values)
+        if not np.any(finite_mask):
+            return []
+        return [float(value) for value in array_values[finite_mask]]
+    result = []
+    for value in values:
+        numeric = safe_float(value, float("nan"))
+        if math.isfinite(numeric):
+            result.append(float(numeric))
+    return result
+
+
+def percentile_from_sorted(values, percentile):
+    if not values:
+        return 0.0
+    ordered = sorted(float(value) for value in values)
+    if len(ordered) == 1:
+        return ordered[0]
+    clamped = max(0.0, min(100.0, float(percentile)))
+    position = (clamped / 100.0) * float(len(ordered) - 1)
+    lower_index = int(math.floor(position))
+    upper_index = int(math.ceil(position))
+    if lower_index == upper_index:
+        return ordered[lower_index]
+    lower_value = ordered[lower_index]
+    upper_value = ordered[upper_index]
+    weight = position - float(lower_index)
+    return lower_value + (upper_value - lower_value) * weight
+
+
+def score_distribution_summary(values, prefix):
+    finite_values = finite_float_values(values)
+    if not finite_values:
+        return {
+            "{}_count".format(prefix): 0,
+            "{}_min".format(prefix): 0.0,
+            "{}_p50".format(prefix): 0.0,
+            "{}_p90".format(prefix): 0.0,
+            "{}_max".format(prefix): 0.0,
+        }
+    ordered = sorted(finite_values)
+    return {
+        "{}_count".format(prefix): len(ordered),
+        "{}_min".format(prefix): ordered[0],
+        "{}_p50".format(prefix): percentile_from_sorted(ordered, 50.0),
+        "{}_p90".format(prefix): percentile_from_sorted(ordered, 90.0),
+        "{}_max".format(prefix): ordered[-1],
+    }
+
+
+def resolved_hybrid_min_score_floor(bundle, args):
+    configured_floor = max(0.0, float(getattr(args, "hybrid_min_score", 0.0)))
+    diagnostics = {
+        "configured_hybrid_min_score": configured_floor,
+        "effective_hybrid_min_score": configured_floor,
+        "hybrid_min_score_floor_scale": 1.0,
+        "hybrid_min_score_floor_source": "configured",
+        "hybrid_min_score_floor_reference_scale": float(getattr(args, "hybrid_min_score_calibration_reference_scale", 0.20)),
+        "hybrid_min_score_floor_min_ratio": float(getattr(args, "hybrid_min_score_calibration_min_ratio", 0.25)),
+        "hybrid_min_score_floor_min": float(getattr(args, "hybrid_min_score_calibration_floor_min", 0.0)),
+        "hybrid_min_score_floor_max": float(getattr(args, "hybrid_min_score_calibration_floor_max", 0.0)),
+        "hybrid_min_score_calibration_aware": 0,
+        "hybrid_min_score_regression_scale": 0.0,
+        "hybrid_min_score_regression_source": "none",
+    }
+    if getattr(args, "objective_mode", "classification") != "hybrid" or configured_floor <= 0.0:
+        return configured_floor, diagnostics
+    if not bool(getattr(args, "hybrid_min_score_calibration_aware", False)):
+        return configured_floor, diagnostics
+    diagnostics["hybrid_min_score_calibration_aware"] = 1
+    if getattr(args, "calibration_window_mode", "all") != "recent":
+        diagnostics["hybrid_min_score_floor_source"] = "calibration_aware_nonrecent_passthrough"
+        return configured_floor, diagnostics
+
+    regression_scale = None
+    regression_calibration = (bundle or {}).get("regression_calibration") or {}
+    if regression_calibration and regression_calibration.get("mode", "none") not in ("", "none", None):
+        regression_scale = abs(float(regression_calibration.get("a", 0.0)))
+        diagnostics["hybrid_min_score_regression_source"] = "regression_calibration_a"
+    else:
+        raw_returns = finite_float_values((bundle or {}).get("raw_predicted_trade_return"))
+        calibrated_returns = finite_float_values((bundle or {}).get("predicted_trade_return"))
+        raw_abs = [abs(value) for value in raw_returns]
+        calibrated_abs = [abs(value) for value in calibrated_returns]
+        raw_reference = percentile_from_sorted(raw_abs, 90.0) if raw_abs else 0.0
+        calibrated_reference = percentile_from_sorted(calibrated_abs, 90.0) if calibrated_abs else 0.0
+        if raw_reference > 0.0:
+            regression_scale = calibrated_reference / raw_reference
+            diagnostics["hybrid_min_score_regression_source"] = "predicted_return_p90_ratio"
+    if regression_scale is None or not math.isfinite(regression_scale):
+        diagnostics["hybrid_min_score_floor_source"] = "calibration_aware_missing_scale_passthrough"
+        return configured_floor, diagnostics
+
+    reference_scale = max(1e-9, float(getattr(args, "hybrid_min_score_calibration_reference_scale", 0.20)))
+    min_ratio = max(0.0, min(1.0, float(getattr(args, "hybrid_min_score_calibration_min_ratio", 0.25))))
+    floor_min = float(getattr(args, "hybrid_min_score_calibration_floor_min", 0.0))
+    floor_max = float(getattr(args, "hybrid_min_score_calibration_floor_max", 0.0))
+    scaled_ratio = max(min_ratio, min(1.0, float(regression_scale) / reference_scale))
+    effective_floor = configured_floor * scaled_ratio
+    if abs(floor_min) > 1e-12:
+        effective_floor = max(effective_floor, floor_min)
+    if abs(floor_max) > 1e-12:
+        effective_floor = min(effective_floor, floor_max)
+    effective_floor = min(configured_floor, effective_floor)
+    diagnostics.update({
+        "effective_hybrid_min_score": effective_floor,
+        "hybrid_min_score_floor_scale": 0.0 if configured_floor <= 0.0 else (effective_floor / configured_floor),
+        "hybrid_min_score_floor_source": "recent_calibration_scaled",
+        "hybrid_min_score_regression_scale": float(regression_scale),
+    })
+    return effective_floor, diagnostics
+
+
+def hybrid_gate_score_diagnostics(score_values, configured_floor, effective_floor):
+    diagnostics = score_distribution_summary(score_values, "hybrid_gate_score")
+    finite_scores = finite_float_values(score_values)
+    diagnostics.update({
+        "configured_hybrid_min_score": float(configured_floor),
+        "effective_hybrid_min_score": float(effective_floor),
+        "hybrid_gate_rows_above_configured_floor": 0,
+        "hybrid_gate_rows_above_effective_floor": 0,
+        "hybrid_gate_rows_between_effective_and_configured_floor": 0,
+    })
+    if not finite_scores:
+        return diagnostics
+    above_configured = 0
+    above_effective = 0
+    rescued_between_floors = 0
+    for value in finite_scores:
+        if value >= float(configured_floor):
+            above_configured += 1
+        if value >= float(effective_floor):
+            above_effective += 1
+            if float(effective_floor) < float(configured_floor) and value < float(configured_floor):
+                rescued_between_floors += 1
+    diagnostics["hybrid_gate_rows_above_configured_floor"] = above_configured
+    diagnostics["hybrid_gate_rows_above_effective_floor"] = above_effective
+    diagnostics["hybrid_gate_rows_between_effective_and_configured_floor"] = rescued_between_floors
+    return diagnostics
+
+
+def apply_hybrid_gate_diagnostics(selection, bundle):
+    if not isinstance(selection, dict):
+        return selection
+    diagnostics = (bundle or {}).get("hybrid_gate_diagnostics") or {}
+    if not diagnostics:
+        return selection
+    selection["effective_hybrid_min_score"] = float(
+        diagnostics.get("effective_hybrid_min_score", selection.get("effective_hybrid_min_score", 0.0))
+    )
+    metrics = selection.setdefault("validation_metrics", {})
+    metrics.update(diagnostics)
+    return selection
+
+
+def runtime_args_for_selected_hybrid_floor(args, selected):
+    effective_floor = float(
+        (selected or {}).get(
+            "effective_hybrid_min_score",
+            ((selected or {}).get("validation_metrics") or {}).get(
+                "effective_hybrid_min_score",
+                getattr(args, "hybrid_min_score", 0.0),
+            ),
+        )
+    )
+    configured_floor = float(getattr(args, "hybrid_min_score", 0.0))
+    if abs(effective_floor - configured_floor) <= 1e-12:
+        return args
+    runtime_args = argparse.Namespace(**vars(args))
+    runtime_args.hybrid_min_score = effective_floor
+    runtime_args.hybrid_min_score_effective = effective_floor
+    return runtime_args
+
+
 def tune_threshold_for_bundle(rows, bundle, args, trade_score_name):
     thresholds, fixed_threshold, ignored = selected_thresholds_for_bundle(bundle, rows, args)
     del fixed_threshold, ignored
-    return tune_threshold(
+    selection = tune_threshold(
         rows,
         bundle,
         thresholds,
@@ -9752,6 +11495,7 @@ def tune_threshold_for_bundle(rows, bundle, args, trade_score_name):
         args.target_validation_trades,
         args,
     )
+    return apply_hybrid_gate_diagnostics(selection, bundle)
 
 
 def maybe_retry_hybrid_no_trade_selection(rows, bundle, selection, args, trade_score_name):
@@ -9799,7 +11543,7 @@ def maybe_retry_hybrid_no_trade_selection(rows, bundle, selection, args, trade_s
         "probability_times_return",
     )
     retry_metrics["hybrid_return_selection_fallback_reason"] = fallback_reason
-    return retry_selection
+    return apply_hybrid_gate_diagnostics(retry_selection, bundle)
 
 
 def select_threshold_for_bundle(rows, bundle, args, trade_score_name):
@@ -9865,6 +11609,25 @@ def fit_select_model(train_rows, validation_rows, feature_names, args, kind):
             "regression_calibration_mae_after": 0.0,
             "hybrid_return_combination": hybrid_context.get("hybrid_return_combination", getattr(args, "hybrid_return_combination", "probability_times_return")),
             "hybrid_min_probability": hybrid_context.get("hybrid_min_probability", getattr(args, "hybrid_min_probability", 0.0)),
+            "configured_hybrid_min_score": selection["validation_metrics"].get("configured_hybrid_min_score", getattr(args, "hybrid_min_score", 0.0)),
+            "effective_hybrid_min_score": selection["validation_metrics"].get("effective_hybrid_min_score", getattr(args, "hybrid_min_score", 0.0)),
+            "hybrid_min_score_floor_scale": selection["validation_metrics"].get("hybrid_min_score_floor_scale", 1.0),
+            "hybrid_min_score_floor_source": selection["validation_metrics"].get("hybrid_min_score_floor_source", "configured"),
+            "hybrid_min_score_floor_reference_scale": selection["validation_metrics"].get("hybrid_min_score_floor_reference_scale", getattr(args, "hybrid_min_score_calibration_reference_scale", 0.20)),
+            "hybrid_min_score_floor_min_ratio": selection["validation_metrics"].get("hybrid_min_score_floor_min_ratio", getattr(args, "hybrid_min_score_calibration_min_ratio", 0.25)),
+            "hybrid_min_score_floor_min": selection["validation_metrics"].get("hybrid_min_score_floor_min", getattr(args, "hybrid_min_score_calibration_floor_min", 0.0)),
+            "hybrid_min_score_floor_max": selection["validation_metrics"].get("hybrid_min_score_floor_max", getattr(args, "hybrid_min_score_calibration_floor_max", 0.0)),
+            "hybrid_min_score_calibration_aware": selection["validation_metrics"].get("hybrid_min_score_calibration_aware", int(bool(getattr(args, "hybrid_min_score_calibration_aware", False)))),
+            "hybrid_min_score_regression_scale": selection["validation_metrics"].get("hybrid_min_score_regression_scale", 0.0),
+            "hybrid_min_score_regression_source": selection["validation_metrics"].get("hybrid_min_score_regression_source", "none"),
+            "hybrid_gate_score_count": selection["validation_metrics"].get("hybrid_gate_score_count", 0),
+            "hybrid_gate_score_min": selection["validation_metrics"].get("hybrid_gate_score_min", 0.0),
+            "hybrid_gate_score_p50": selection["validation_metrics"].get("hybrid_gate_score_p50", 0.0),
+            "hybrid_gate_score_p90": selection["validation_metrics"].get("hybrid_gate_score_p90", 0.0),
+            "hybrid_gate_score_max": selection["validation_metrics"].get("hybrid_gate_score_max", 0.0),
+            "hybrid_gate_rows_above_configured_floor": selection["validation_metrics"].get("hybrid_gate_rows_above_configured_floor", 0),
+            "hybrid_gate_rows_above_effective_floor": selection["validation_metrics"].get("hybrid_gate_rows_above_effective_floor", 0),
+            "hybrid_gate_rows_between_effective_and_configured_floor": selection["validation_metrics"].get("hybrid_gate_rows_between_effective_and_configured_floor", 0),
             "hybrid_score_mode": args.hybrid_score_mode,
             "hybrid_uncertainty_method": args.hybrid_uncertainty_method,
             "hybrid_uncertainty_penalty": args.hybrid_uncertainty_penalty,
@@ -10048,6 +11811,7 @@ def fit_select_model(train_rows, validation_rows, feature_names, args, kind):
             predicted_return_uncertainty=apply_uncertainty_model(predicted_trade_return, uncertainty_model) if predicted_trade_return is not None else None,
             uncertainty_context=uncertainty_model,
         )
+        bundle["regression_calibration"] = regression_calibration or {}
         bundle["ev_context"] = fit_ev_payoff_context(fit_validation_rows, bundle, args)
         bundle["hybrid_return_context"] = fit_hybrid_return_context(fit_validation_rows, bundle, args)
         selection = select_threshold_for_bundle(fit_validation_rows, bundle, args, score_name)
@@ -10093,6 +11857,7 @@ def fit_select_model(train_rows, validation_rows, feature_names, args, kind):
                 "score": score,
                 "base_score": selection.get("base_objective_score", metrics.get("selected_base_objective_score", score)),
                 "rank": rank,
+                "effective_hybrid_min_score": selection.get("effective_hybrid_min_score", metrics.get("effective_hybrid_min_score", args.hybrid_min_score)),
                 "calibration": calibration,
                 "regression_calibration": regression_calibration,
                 "uncertainty_model": uncertainty_model,
@@ -10127,7 +11892,9 @@ def fit_select_model(train_rows, validation_rows, feature_names, args, kind):
     gc.collect()
     if best is not None and len(fit_validation_rows) != len(validation_rows) and not args.skip_full_validation_retune:
         retune_token = start_profile_stage("full_validation_retune", "rows={}".format(len(validation_rows)))
-        bundle = prediction_bundle_for_models(best, validation_rows, kind, args, "full validation retune")
+        retune_args = runtime_args_for_selected_hybrid_floor(args, best)
+        bundle = prediction_bundle_for_models(best, validation_rows, kind, retune_args, "full validation retune")
+        bundle["regression_calibration"] = best.get("regression_calibration") or {}
         bundle["ev_context"] = fit_ev_payoff_context(validation_rows, bundle, args)
         bundle["hybrid_return_context"] = fit_hybrid_return_context(validation_rows, bundle, args)
         selection = select_threshold_for_bundle(validation_rows, bundle, args, score_name)
@@ -10152,6 +11919,7 @@ def fit_select_model(train_rows, validation_rows, feature_names, args, kind):
         best["base_score"] = selection.get("base_objective_score", metrics.get("selected_base_objective_score", best["score"]))
         best["ev_payoff_info"] = dict(bundle.get("ev_context") or {})
         best["hybrid_return_info"] = dict(bundle.get("hybrid_return_context") or {})
+        best["effective_hybrid_min_score"] = selection.get("effective_hybrid_min_score", metrics.get("effective_hybrid_min_score", best.get("effective_hybrid_min_score", args.hybrid_min_score)))
         best["rank"] = threshold_rank(
             metrics,
             args.threshold_objective,
@@ -10168,12 +11936,13 @@ def fit_select_model(train_rows, validation_rows, feature_names, args, kind):
         memory_checkpoint("Full validation threshold retune complete", args)
     if best is not None:
         meta_validation_rows = validation_rows if len(fit_validation_rows) != len(validation_rows) and not args.skip_full_validation_retune else fit_validation_rows
-        meta_bundle = prediction_bundle_for_models(best, meta_validation_rows, kind, args, "meta filter validation")
+        runtime_args = runtime_args_for_selected_hybrid_floor(args, best)
+        meta_bundle = prediction_bundle_for_models(best, meta_validation_rows, kind, runtime_args, "meta filter validation")
         best["symbol_filter_info"] = fit_symbol_validation_filter(
             meta_validation_rows,
             meta_bundle,
             best["threshold"],
-            args,
+            runtime_args,
             best.get("trade_score_name", score_name),
         )
         if best["symbol_filter_info"].get("enabled"):
@@ -10188,7 +11957,7 @@ def fit_select_model(train_rows, validation_rows, feature_names, args, kind):
                 meta_validation_rows,
                 meta_bundle,
                 best["threshold"],
-                args,
+                runtime_args,
                 best["selection"],
                 best["symbol_filter_info"],
                 best.get("selected_score_name", selected_score_name),
@@ -10211,14 +11980,14 @@ def fit_select_model(train_rows, validation_rows, feature_names, args, kind):
             meta_validation_rows,
             meta_bundle,
             best["threshold"],
-            args,
+            runtime_args,
             best["symbol_filter_info"],
         )
         best["meta_filter_info"], recalibrated_selection = recalibrate_meta_filter_validation(
             meta_validation_rows,
             meta_bundle,
             best["threshold"],
-            args,
+            runtime_args,
             best["selection"],
             best["meta_filter_info"],
             best["symbol_filter_info"],
@@ -10264,6 +12033,25 @@ def fit_select_model(train_rows, validation_rows, feature_names, args, kind):
             "regression_calibration_mae_after": regression_calibration.get("regression_calibration_mae_after", 0.0),
             "hybrid_return_combination": hybrid_return_info.get("hybrid_return_combination", getattr(args, "hybrid_return_combination", "probability_times_return")),
             "hybrid_min_probability": hybrid_return_info.get("hybrid_min_probability", getattr(args, "hybrid_min_probability", 0.0)),
+            "configured_hybrid_min_score": best["validation_metrics"].get("configured_hybrid_min_score", getattr(args, "hybrid_min_score", 0.0)),
+            "effective_hybrid_min_score": best["validation_metrics"].get("effective_hybrid_min_score", best.get("effective_hybrid_min_score", getattr(args, "hybrid_min_score", 0.0))),
+            "hybrid_min_score_floor_scale": best["validation_metrics"].get("hybrid_min_score_floor_scale", 1.0),
+            "hybrid_min_score_floor_source": best["validation_metrics"].get("hybrid_min_score_floor_source", "configured"),
+            "hybrid_min_score_floor_reference_scale": best["validation_metrics"].get("hybrid_min_score_floor_reference_scale", getattr(args, "hybrid_min_score_calibration_reference_scale", 0.20)),
+            "hybrid_min_score_floor_min_ratio": best["validation_metrics"].get("hybrid_min_score_floor_min_ratio", getattr(args, "hybrid_min_score_calibration_min_ratio", 0.25)),
+            "hybrid_min_score_floor_min": best["validation_metrics"].get("hybrid_min_score_floor_min", getattr(args, "hybrid_min_score_calibration_floor_min", 0.0)),
+            "hybrid_min_score_floor_max": best["validation_metrics"].get("hybrid_min_score_floor_max", getattr(args, "hybrid_min_score_calibration_floor_max", 0.0)),
+            "hybrid_min_score_calibration_aware": best["validation_metrics"].get("hybrid_min_score_calibration_aware", int(bool(getattr(args, "hybrid_min_score_calibration_aware", False)))),
+            "hybrid_min_score_regression_scale": best["validation_metrics"].get("hybrid_min_score_regression_scale", 0.0),
+            "hybrid_min_score_regression_source": best["validation_metrics"].get("hybrid_min_score_regression_source", "none"),
+            "hybrid_gate_score_count": best["validation_metrics"].get("hybrid_gate_score_count", 0),
+            "hybrid_gate_score_min": best["validation_metrics"].get("hybrid_gate_score_min", 0.0),
+            "hybrid_gate_score_p50": best["validation_metrics"].get("hybrid_gate_score_p50", 0.0),
+            "hybrid_gate_score_p90": best["validation_metrics"].get("hybrid_gate_score_p90", 0.0),
+            "hybrid_gate_score_max": best["validation_metrics"].get("hybrid_gate_score_max", 0.0),
+            "hybrid_gate_rows_above_configured_floor": best["validation_metrics"].get("hybrid_gate_rows_above_configured_floor", 0),
+            "hybrid_gate_rows_above_effective_floor": best["validation_metrics"].get("hybrid_gate_rows_above_effective_floor", 0),
+            "hybrid_gate_rows_between_effective_and_configured_floor": best["validation_metrics"].get("hybrid_gate_rows_between_effective_and_configured_floor", 0),
             "hybrid_score_mode": args.hybrid_score_mode,
             "hybrid_uncertainty_method": uncertainty_model.get("mode", "none"),
             "hybrid_uncertainty_penalty": args.hybrid_uncertainty_penalty,
@@ -10298,6 +12086,9 @@ def fit_select_model(train_rows, validation_rows, feature_names, args, kind):
             "symbol_filter_shrinkage": symbol_filter_info.get("symbol_filter_shrinkage", getattr(args, "symbol_filter_shrinkage", 50.0)),
             "symbol_filter_min_active_days": symbol_filter_info.get("symbol_filter_min_active_days", getattr(args, "symbol_filter_min_active_days", 0)),
             "symbol_filter_max_executed_trade_share": symbol_filter_info.get("symbol_filter_max_executed_trade_share", getattr(args, "symbol_filter_max_executed_trade_share", 0.0)),
+            "symbol_dominance_penalty_validation_weight": getattr(args, "symbol_dominance_penalty_validation_weight", 0.0),
+            "symbol_dominance_penalty_recent_weight": getattr(args, "symbol_dominance_penalty_recent_weight", 0.0),
+            "symbol_dominance_penalty_grace": getattr(args, "symbol_dominance_penalty_grace", 0.0),
             "symbol_filter_enabled": 1 if symbol_filter_info.get("enabled") else 0,
             "symbol_filter_allowed_symbols": len(symbol_filter_info.get("allowed_symbols", [])),
             "symbol_filter_total_symbols": symbol_filter_info.get("total_symbols", 0),
@@ -10314,6 +12105,40 @@ def fit_select_model(train_rows, validation_rows, feature_names, args, kind):
         }
         best["validation_metrics"]["calibration_info"] = dict(best["calibration_info"])
     return best
+
+
+def prediction_exit_fields(execution, index, fixed_trade_return, fixed_mfe, fixed_mae, holding_period_minutes):
+    exit_policy = execution.get("exit_policy", "fixed_horizon")
+    if exit_policy == "fixed_horizon":
+        details = fixed_horizon_exit_details(
+            fixed_trade_return,
+            fixed_mfe,
+            fixed_mae,
+            holding_period_minutes,
+        )
+        details["available"] = 1
+        return details
+    if int(index) not in execution.get("executed", {}):
+        return {
+            "available": 0,
+            "exit_policy": exit_policy,
+            "exit_minutes": "",
+            "exit_reason": "",
+            "dynamic_trade_return": "",
+            "fixed_horizon_trade_return": float(fixed_trade_return),
+            "max_favorable_excursion_before_exit": "",
+            "max_adverse_excursion_before_exit": "",
+        }
+    return {
+        "available": 1,
+        "exit_policy": exit_policy,
+        "exit_minutes": execution.get("executed_exit_minutes", {}).get(index, ""),
+        "exit_reason": execution.get("executed_exit_reasons", {}).get(index, ""),
+        "dynamic_trade_return": execution.get("executed_dynamic_trade_returns", {}).get(index, float(fixed_trade_return)),
+        "fixed_horizon_trade_return": execution.get("executed_fixed_horizon_trade_returns", {}).get(index, float(fixed_trade_return)),
+        "max_favorable_excursion_before_exit": execution.get("executed_max_favorable_excursion_before_exit", {}).get(index, float(fixed_mfe)),
+        "max_adverse_excursion_before_exit": execution.get("executed_max_adverse_excursion_before_exit", {}).get(index, float(fixed_mae)),
+    }
 
 
 def write_predictions(path, rows, predictions, threshold, model_name,
@@ -10383,6 +12208,17 @@ def write_predictions(path, rows, predictions, threshold, model_name,
                 "raw_signal",
                 "predicted",
                 "position_size",
+                "exit_policy",
+                "exit_minutes",
+                "exit_reason",
+                "dynamic_trade_return",
+                "fixed_horizon_trade_return",
+                "max_favorable_excursion_before_exit",
+                "max_adverse_excursion_before_exit",
+                "trailing_activation_return",
+                "trailing_drawdown",
+                "stop_loss",
+                "max_holding_period_minutes",
                 "forward_return",
                 "trade_return",
                 "max_future_high_return",
@@ -10487,6 +12323,17 @@ def write_predictions(path, rows, predictions, threshold, model_name,
                     max(float(row_threshold), float(hybrid_min_score)) if objective_mode == "hybrid" else float(row_threshold)
                 )
                 regime_bucket = regime_buckets[index] if regime_buckets is not None else ""
+                fixed_trade_return = float(table.trade_returns[position])
+                fixed_mfe = float(table.max_future_high_returns[position])
+                fixed_mae = float(table.max_future_low_returns[position])
+                exit_fields = prediction_exit_fields(
+                    execution,
+                    index,
+                    fixed_trade_return,
+                    fixed_mfe,
+                    fixed_mae,
+                    holding_period_minutes,
+                )
                 writer.writerow([
                     table.symbols[symbol_code],
                     table.months[int(table.month_codes[position])],
@@ -10526,10 +12373,21 @@ def write_predictions(path, rows, predictions, threshold, model_name,
                     1 if raw_signal else 0,
                     1 if predicted else 0,
                     "{:.12g}".format(executed.get(index, 0.0)),
+                    exit_fields["exit_policy"],
+                    exit_fields["exit_minutes"],
+                    exit_fields["exit_reason"],
+                    "{:.12g}".format(exit_fields["dynamic_trade_return"]) if exit_fields["dynamic_trade_return"] != "" else "",
+                    "{:.12g}".format(exit_fields["fixed_horizon_trade_return"]),
+                    "{:.12g}".format(exit_fields["max_favorable_excursion_before_exit"]) if exit_fields["max_favorable_excursion_before_exit"] != "" else "",
+                    "{:.12g}".format(exit_fields["max_adverse_excursion_before_exit"]) if exit_fields["max_adverse_excursion_before_exit"] != "" else "",
+                    "{:.12g}".format(execution.get("trailing_activation_return", float(getattr(hybrid_runtime_args, "trailing_activation_return", 0.01)) if hybrid_runtime_args is not None else 0.01)),
+                    "{:.12g}".format(execution.get("trailing_drawdown", float(getattr(hybrid_runtime_args, "trailing_drawdown", 0.003)) if hybrid_runtime_args is not None else 0.003)),
+                    "{:.12g}".format(execution.get("stop_loss", resolved_stop_loss(hybrid_runtime_args, downside_stop))),
+                    int(execution.get("max_holding_period_minutes", resolved_max_holding_period_minutes(hybrid_runtime_args))),
                     "{:.12g}".format(float(table.forward_returns[position])),
-                    "{:.12g}".format(float(table.trade_returns[position])),
-                    "{:.12g}".format(float(table.max_future_high_returns[position])),
-                    "{:.12g}".format(float(table.max_future_low_returns[position])),
+                    "{:.12g}".format(fixed_trade_return),
+                    "{:.12g}".format(fixed_mfe),
+                    "{:.12g}".format(fixed_mae),
                     ev_details["ev_payoff_mode"],
                     "{:.12g}".format(ev_details["ev_expected_win_return"]),
                     "{:.12g}".format(ev_details["ev_expected_loss_return"]),
@@ -10596,6 +12454,14 @@ def write_predictions(path, rows, predictions, threshold, model_name,
                 max(float(row_threshold), float(hybrid_min_score)) if objective_mode == "hybrid" else float(row_threshold)
             )
             regime_bucket = regime_buckets[index] if regime_buckets is not None else ""
+            exit_fields = prediction_exit_fields(
+                execution,
+                index,
+                float(row.trade_return),
+                float(row.max_future_high_return),
+                float(row.max_future_low_return),
+                holding_period_minutes,
+            )
             writer.writerow([
                 row.symbol,
                 row.month,
@@ -10635,6 +12501,17 @@ def write_predictions(path, rows, predictions, threshold, model_name,
                 1 if raw_signal else 0,
                 1 if predicted else 0,
                 "{:.12g}".format(executed.get(index, 0.0)),
+                exit_fields["exit_policy"],
+                exit_fields["exit_minutes"],
+                exit_fields["exit_reason"],
+                "{:.12g}".format(exit_fields["dynamic_trade_return"]) if exit_fields["dynamic_trade_return"] != "" else "",
+                "{:.12g}".format(exit_fields["fixed_horizon_trade_return"]),
+                "{:.12g}".format(exit_fields["max_favorable_excursion_before_exit"]) if exit_fields["max_favorable_excursion_before_exit"] != "" else "",
+                "{:.12g}".format(exit_fields["max_adverse_excursion_before_exit"]) if exit_fields["max_adverse_excursion_before_exit"] != "" else "",
+                "{:.12g}".format(execution.get("trailing_activation_return", float(getattr(hybrid_runtime_args, "trailing_activation_return", 0.01)) if hybrid_runtime_args is not None else 0.01)),
+                "{:.12g}".format(execution.get("trailing_drawdown", float(getattr(hybrid_runtime_args, "trailing_drawdown", 0.003)) if hybrid_runtime_args is not None else 0.003)),
+                "{:.12g}".format(execution.get("stop_loss", resolved_stop_loss(hybrid_runtime_args, downside_stop))),
+                int(execution.get("max_holding_period_minutes", resolved_max_holding_period_minutes(hybrid_runtime_args))),
                 "{:.12g}".format(row.forward_return),
                 "{:.12g}".format(row.trade_return),
                 "{:.12g}".format(row.max_future_high_return),
@@ -10691,11 +12568,17 @@ METRIC_COLUMNS = [
     "selected_validation_portfolio_return",
     "selected_validation_precision",
     "selected_validation_recall",
+    "selected_validation_symbol_profit_concentration_top1",
+    "selected_validation_symbol_profit_concentration_top3",
+    "selected_validation_symbol_trade_concentration_top1",
+    "selected_validation_symbol_count",
     "selected_validation_active_days",
     "selected_validation_profit_per_active_day",
     "selected_validation_average_profit_after_fee_and_slippage",
     "selected_validation_total_profit_after_fee_and_slippage",
     "selected_threshold_tie_rank_reason",
+    "selected_concentration_penalty_total",
+    "selected_diversity_penalty_total",
     "candidate_threshold_count",
     "rejected_under_min_trades_count",
     "rejected_over_max_trades_count",
@@ -10715,10 +12598,13 @@ METRIC_COLUMNS = [
     "closest_under_min_precision_trades",
     "rejected_over_top1_concentration_count",
     "rejected_over_top3_concentration_count",
+    "rejected_over_trade_top1_concentration_count",
     "closest_top1_concentration",
     "closest_top1_concentration_threshold",
     "closest_top3_concentration",
     "closest_top3_concentration_threshold",
+    "closest_trade_top1_concentration",
+    "closest_trade_top1_concentration_threshold",
     "train_rows",
     "validation_rows",
     "test_rows",
@@ -10786,18 +12672,55 @@ METRIC_COLUMNS = [
     "fold_trade_limit_blocked",
     "daily_loss_limit_blocked",
     "daily_drawdown_limit_blocked",
+    "period_trade_limit_blocked",
     "symbol_trade_limit_blocked",
+    "symbol_reentry_cooldown_blocked",
     "symbol_minute_cap_blocked",
     "blocked_trades_total",
     "blocked_by_trade_frequency",
     "blocked_by_drawdown",
     "max_trades_in_any_day",
     "max_trades_in_any_fold",
+    "ranking_candidate_count",
+    "ranking_selected_candidate_count",
+    "ranking_rejected_candidate_count",
+    "execution_rejected_candidate_count",
+    "raw_candidate_score_count",
+    "raw_candidate_score_min",
+    "raw_candidate_score_p50",
+    "raw_candidate_score_p90",
+    "raw_candidate_score_max",
+    "ranked_candidate_score_count",
+    "ranked_candidate_score_min",
+    "ranked_candidate_score_p50",
+    "ranked_candidate_score_p90",
+    "ranked_candidate_score_max",
+    "executed_trade_score_count",
+    "executed_trade_score_min",
+    "executed_trade_score_p50",
+    "executed_trade_score_p90",
+    "executed_trade_score_max",
+    "rejected_trade_score_count",
+    "rejected_trade_score_min",
+    "rejected_trade_score_p50",
+    "rejected_trade_score_p90",
+    "rejected_trade_score_max",
+    "ranking_rejected_trade_score_count",
+    "ranking_rejected_trade_score_min",
+    "ranking_rejected_trade_score_p50",
+    "ranking_rejected_trade_score_p90",
+    "ranking_rejected_trade_score_max",
+    "execution_rejected_trade_score_count",
+    "execution_rejected_trade_score_min",
+    "execution_rejected_trade_score_p50",
+    "execution_rejected_trade_score_p90",
+    "execution_rejected_trade_score_max",
     "normalized_microsecond_open_times",
     "max_position_fraction",
     "max_volume_fraction",
     "max_trades_per_period",
     "max_trades_per_symbol_period",
+    "symbol_reentry_cooldown_minutes",
     "max_trades_per_day",
     "max_trades_per_fold",
     "max_losing_trades_per_day",
@@ -10805,20 +12728,51 @@ METRIC_COLUMNS = [
     "pause_after_drawdown_minutes",
     "trade_period_minutes",
     "holding_period_minutes",
+    "exit_policy",
+    "trailing_activation_return",
+    "trailing_drawdown",
+    "stop_loss",
+    "max_holding_period_minutes",
     "min_validation_trades",
     "max_validation_trades",
     "min_validation_precision",
     "min_selected_threshold",
     "min_predicted_net_return",
     "hybrid_min_score",
+    "configured_hybrid_min_score",
+    "effective_hybrid_min_score",
+    "hybrid_min_score_floor_scale",
+    "hybrid_min_score_floor_source",
+    "hybrid_min_score_floor_reference_scale",
+    "hybrid_min_score_floor_min_ratio",
+    "hybrid_min_score_floor_min",
+    "hybrid_min_score_floor_max",
+    "hybrid_min_score_calibration_aware",
+    "hybrid_min_score_regression_scale",
+    "hybrid_min_score_regression_source",
+    "hybrid_gate_score_count",
+    "hybrid_gate_score_min",
+    "hybrid_gate_score_p50",
+    "hybrid_gate_score_p90",
+    "hybrid_gate_score_max",
+    "hybrid_gate_rows_above_configured_floor",
+    "hybrid_gate_rows_above_effective_floor",
+    "hybrid_gate_rows_between_effective_and_configured_floor",
     "threshold_drawdown_penalty",
     "threshold_trade_count_penalty",
+    "threshold_diversity_penalty_weight",
     "threshold_top1_concentration_penalty",
     "threshold_top3_concentration_penalty",
+    "threshold_trade_top1_concentration_penalty",
     "threshold_max_top1_concentration",
     "threshold_max_top3_concentration",
+    "threshold_max_trade_top1_concentration",
+    "threshold_concentration_cap_mode",
     "target_validation_trades",
     "threshold_tiebreaker",
+    "threshold_diversity_profit_tolerance_ratio",
+    "threshold_diversity_min_profit_top1_improvement",
+    "threshold_diversity_min_trade_top1_improvement",
     "threshold_tie_epsilon",
     "threshold_target_trades",
     "threshold_target_active_days",
@@ -10828,6 +12782,7 @@ METRIC_COLUMNS = [
     "trade_selection",
     "top_k_per_minute",
     "top_k_per_symbol_minute",
+    "prefer_unique_symbols",
     "calibration",
     "calibration_a",
     "calibration_b",
@@ -10883,6 +12838,9 @@ METRIC_COLUMNS = [
     "symbol_filter_shrinkage",
     "symbol_filter_min_active_days",
     "symbol_filter_max_executed_trade_share",
+    "symbol_dominance_penalty_validation_weight",
+    "symbol_dominance_penalty_recent_weight",
+    "symbol_dominance_penalty_grace",
     "symbol_filter_enabled",
     "symbol_filter_allowed_symbols",
     "symbol_filter_total_symbols",
@@ -10997,6 +12955,9 @@ def metrics_record(model_name, split, objective, threshold, train_rows, validati
     validation_metrics = validation_metrics if isinstance(validation_metrics, dict) else {}
     selected_score_name = validation_metrics.get("selected_score_name", selected_score_name_for_mode(args))
     resolved_selected_objective_score = validation_metrics.get("selected_objective_score", selected_objective_score)
+    calibration_info = validation_metrics.get("calibration_info", {}) or {}
+    if not calibration_info and hasattr(args, "_selected_calibration_info"):
+        calibration_info = getattr(args, "_selected_calibration_info") or {}
     record = {
         "model": model_name,
         "split": split,
@@ -11021,6 +12982,10 @@ def metrics_record(model_name, split, objective, threshold, train_rows, validati
         "selected_validation_portfolio_return": validation_metrics.get("selected_validation_portfolio_return", 0.0),
         "selected_validation_precision": validation_metrics.get("selected_validation_precision", 0.0),
         "selected_validation_recall": validation_metrics.get("selected_validation_recall", 0.0),
+        "selected_validation_symbol_profit_concentration_top1": validation_metrics.get("symbol_profit_concentration_top1", 0.0),
+        "selected_validation_symbol_profit_concentration_top3": validation_metrics.get("symbol_profit_concentration_top3", 0.0),
+        "selected_validation_symbol_trade_concentration_top1": validation_metrics.get("symbol_trade_concentration_top1", 0.0),
+        "selected_validation_symbol_count": validation_metrics.get("selected_validation_symbol_count", 0),
         "selected_validation_active_days": validation_metrics.get("selected_validation_active_days", 0),
         "selected_validation_profit_per_active_day": validation_metrics.get("selected_validation_profit_per_active_day", 0.0),
         "selected_validation_average_profit_after_fee_and_slippage": validation_metrics.get(
@@ -11032,6 +12997,8 @@ def metrics_record(model_name, split, objective, threshold, train_rows, validati
             0.0,
         ),
         "selected_threshold_tie_rank_reason": validation_metrics.get("selected_threshold_tie_rank_reason", ""),
+        "selected_concentration_penalty_total": validation_metrics.get("selected_concentration_penalty_total", 0.0),
+        "selected_diversity_penalty_total": validation_metrics.get("selected_diversity_penalty_total", 0.0),
         "candidate_threshold_count": validation_metrics.get("candidate_threshold_count", 0),
         "rejected_under_min_trades_count": validation_metrics.get("rejected_under_min_trades_count", 0),
         "rejected_over_max_trades_count": validation_metrics.get("rejected_over_max_trades_count", 0),
@@ -11049,6 +13016,15 @@ def metrics_record(model_name, split, objective, threshold, train_rows, validati
         "closest_under_min_precision": validation_metrics.get("closest_under_min_precision", 0.0),
         "closest_under_min_precision_threshold": validation_metrics.get("closest_under_min_precision_threshold", 0.0),
         "closest_under_min_precision_trades": validation_metrics.get("closest_under_min_precision_trades", 0),
+        "rejected_over_top1_concentration_count": validation_metrics.get("rejected_over_top1_concentration_count", 0),
+        "rejected_over_top3_concentration_count": validation_metrics.get("rejected_over_top3_concentration_count", 0),
+        "rejected_over_trade_top1_concentration_count": validation_metrics.get("rejected_over_trade_top1_concentration_count", 0),
+        "closest_top1_concentration": validation_metrics.get("closest_top1_concentration", 0.0),
+        "closest_top1_concentration_threshold": validation_metrics.get("closest_top1_concentration_threshold", 0.0),
+        "closest_top3_concentration": validation_metrics.get("closest_top3_concentration", 0.0),
+        "closest_top3_concentration_threshold": validation_metrics.get("closest_top3_concentration_threshold", 0.0),
+        "closest_trade_top1_concentration": validation_metrics.get("closest_trade_top1_concentration", 0.0),
+        "closest_trade_top1_concentration_threshold": validation_metrics.get("closest_trade_top1_concentration_threshold", 0.0),
         "selected_objective_finite_folds": 1 if math.isfinite(float(resolved_selected_objective_score)) else 0,
         "selected_objective_nonfinite_folds": 0 if math.isfinite(float(resolved_selected_objective_score)) else 1,
         "selected_no_trade_folds": 1 if int(validation_metrics.get("selected_validation_trade_count", 0)) <= 0 else 0,
@@ -11066,6 +13042,7 @@ def metrics_record(model_name, split, objective, threshold, train_rows, validati
         "max_volume_fraction": args.max_volume_fraction,
         "max_trades_per_period": args.max_trades_per_period,
         "max_trades_per_symbol_period": getattr(args, "max_trades_per_symbol_period", 0),
+        "symbol_reentry_cooldown_minutes": getattr(args, "symbol_reentry_cooldown_minutes", 0),
         "max_trades_per_day": args.max_trades_per_day,
         "max_trades_per_fold": args.max_trades_per_fold,
         "max_losing_trades_per_day": args.max_losing_trades_per_day,
@@ -11073,12 +13050,36 @@ def metrics_record(model_name, split, objective, threshold, train_rows, validati
         "pause_after_drawdown_minutes": args.pause_after_drawdown_minutes,
         "trade_period_minutes": args.trade_period_minutes,
         "holding_period_minutes": args.holding_period_minutes,
+        "exit_policy": getattr(args, "exit_policy", "fixed_horizon"),
+        "trailing_activation_return": getattr(args, "trailing_activation_return", 0.01),
+        "trailing_drawdown": getattr(args, "trailing_drawdown", 0.003),
+        "stop_loss": getattr(args, "stop_loss", getattr(args, "downside_stop", 0.02)),
+        "max_holding_period_minutes": getattr(args, "max_holding_period_minutes", args.holding_period_minutes),
         "min_validation_trades": args.min_validation_trades,
         "max_validation_trades": args.max_validation_trades,
         "min_validation_precision": args.min_validation_precision,
         "min_selected_threshold": args.min_selected_threshold,
         "min_predicted_net_return": args.min_predicted_net_return,
         "hybrid_min_score": args.hybrid_min_score,
+        "configured_hybrid_min_score": calibration_info.get("configured_hybrid_min_score", validation_metrics.get("configured_hybrid_min_score", args.hybrid_min_score)),
+        "effective_hybrid_min_score": calibration_info.get("effective_hybrid_min_score", validation_metrics.get("effective_hybrid_min_score", args.hybrid_min_score)),
+        "hybrid_min_score_floor_scale": calibration_info.get("hybrid_min_score_floor_scale", validation_metrics.get("hybrid_min_score_floor_scale", 1.0)),
+        "hybrid_min_score_floor_source": calibration_info.get("hybrid_min_score_floor_source", validation_metrics.get("hybrid_min_score_floor_source", "configured")),
+        "hybrid_min_score_floor_reference_scale": calibration_info.get("hybrid_min_score_floor_reference_scale", validation_metrics.get("hybrid_min_score_floor_reference_scale", getattr(args, "hybrid_min_score_calibration_reference_scale", 0.20))),
+        "hybrid_min_score_floor_min_ratio": calibration_info.get("hybrid_min_score_floor_min_ratio", validation_metrics.get("hybrid_min_score_floor_min_ratio", getattr(args, "hybrid_min_score_calibration_min_ratio", 0.25))),
+        "hybrid_min_score_floor_min": calibration_info.get("hybrid_min_score_floor_min", validation_metrics.get("hybrid_min_score_floor_min", getattr(args, "hybrid_min_score_calibration_floor_min", 0.0))),
+        "hybrid_min_score_floor_max": calibration_info.get("hybrid_min_score_floor_max", validation_metrics.get("hybrid_min_score_floor_max", getattr(args, "hybrid_min_score_calibration_floor_max", 0.0))),
+        "hybrid_min_score_calibration_aware": calibration_info.get("hybrid_min_score_calibration_aware", validation_metrics.get("hybrid_min_score_calibration_aware", int(bool(getattr(args, "hybrid_min_score_calibration_aware", False))))),
+        "hybrid_min_score_regression_scale": calibration_info.get("hybrid_min_score_regression_scale", validation_metrics.get("hybrid_min_score_regression_scale", 0.0)),
+        "hybrid_min_score_regression_source": calibration_info.get("hybrid_min_score_regression_source", validation_metrics.get("hybrid_min_score_regression_source", "none")),
+        "hybrid_gate_score_count": calibration_info.get("hybrid_gate_score_count", validation_metrics.get("hybrid_gate_score_count", 0)),
+        "hybrid_gate_score_min": calibration_info.get("hybrid_gate_score_min", validation_metrics.get("hybrid_gate_score_min", 0.0)),
+        "hybrid_gate_score_p50": calibration_info.get("hybrid_gate_score_p50", validation_metrics.get("hybrid_gate_score_p50", 0.0)),
+        "hybrid_gate_score_p90": calibration_info.get("hybrid_gate_score_p90", validation_metrics.get("hybrid_gate_score_p90", 0.0)),
+        "hybrid_gate_score_max": calibration_info.get("hybrid_gate_score_max", validation_metrics.get("hybrid_gate_score_max", 0.0)),
+        "hybrid_gate_rows_above_configured_floor": calibration_info.get("hybrid_gate_rows_above_configured_floor", validation_metrics.get("hybrid_gate_rows_above_configured_floor", 0)),
+        "hybrid_gate_rows_above_effective_floor": calibration_info.get("hybrid_gate_rows_above_effective_floor", validation_metrics.get("hybrid_gate_rows_above_effective_floor", 0)),
+        "hybrid_gate_rows_between_effective_and_configured_floor": calibration_info.get("hybrid_gate_rows_between_effective_and_configured_floor", validation_metrics.get("hybrid_gate_rows_between_effective_and_configured_floor", 0)),
         "hybrid_return_combination": getattr(args, "hybrid_return_combination", "probability_times_return"),
         "hybrid_min_probability": getattr(args, "hybrid_min_probability", 0.0),
         "regression_target": getattr(args, "regression_target", "trade_return"),
@@ -11087,12 +13088,19 @@ def metrics_record(model_name, split, objective, threshold, train_rows, validati
         "ev_payoff_mode": getattr(args, "ev_payoff_mode", "fixed_targets"),
         "threshold_drawdown_penalty": args.threshold_drawdown_penalty,
         "threshold_trade_count_penalty": args.threshold_trade_count_penalty,
+        "threshold_diversity_penalty_weight": getattr(args, "threshold_diversity_penalty_weight", 0.0),
         "threshold_top1_concentration_penalty": getattr(args, "threshold_top1_concentration_penalty", 0.0),
         "threshold_top3_concentration_penalty": getattr(args, "threshold_top3_concentration_penalty", 0.0),
+        "threshold_trade_top1_concentration_penalty": getattr(args, "threshold_trade_top1_concentration_penalty", 0.0),
         "threshold_max_top1_concentration": getattr(args, "threshold_max_top1_concentration", 0.0),
         "threshold_max_top3_concentration": getattr(args, "threshold_max_top3_concentration", 0.0),
+        "threshold_max_trade_top1_concentration": getattr(args, "threshold_max_trade_top1_concentration", 0.0),
+        "threshold_concentration_cap_mode": getattr(args, "threshold_concentration_cap_mode", "soft"),
         "target_validation_trades": args.target_validation_trades,
         "threshold_tiebreaker": getattr(args, "threshold_tiebreaker", "fewer_trades"),
+        "threshold_diversity_profit_tolerance_ratio": getattr(args, "threshold_diversity_profit_tolerance_ratio", 0.0),
+        "threshold_diversity_min_profit_top1_improvement": getattr(args, "threshold_diversity_min_profit_top1_improvement", 0.0),
+        "threshold_diversity_min_trade_top1_improvement": getattr(args, "threshold_diversity_min_trade_top1_improvement", 0.0),
         "threshold_tie_epsilon": getattr(args, "threshold_tie_epsilon", 1e-9),
         "threshold_target_trades": getattr(args, "threshold_target_trades", 0),
         "threshold_target_active_days": getattr(args, "threshold_target_active_days", 0),
@@ -11102,6 +13110,7 @@ def metrics_record(model_name, split, objective, threshold, train_rows, validati
         "trade_selection": args.trade_selection,
         "top_k_per_minute": args.top_k_per_minute,
         "top_k_per_symbol_minute": getattr(args, "top_k_per_symbol_minute", 0),
+        "prefer_unique_symbols": int(bool(getattr(args, "prefer_unique_symbols", False))),
         "selected_ev_safety_margin": args.ev_safety_margin,
         "acceptance_tier": getattr(args, "acceptance_tier", "none"),
         "normalized_microsecond_open_times": NORMALIZED_MICROSECOND_OPEN_TIMES,
@@ -11109,9 +13118,13 @@ def metrics_record(model_name, split, objective, threshold, train_rows, validati
         "meta_filter": getattr(args, "meta_filter", "none"),
         "symbol_filter_min_active_days": getattr(args, "symbol_filter_min_active_days", 0),
         "symbol_filter_max_executed_trade_share": getattr(args, "symbol_filter_max_executed_trade_share", 0.0),
+        "symbol_dominance_penalty_validation_weight": getattr(args, "symbol_dominance_penalty_validation_weight", 0.0),
+        "symbol_dominance_penalty_recent_weight": getattr(args, "symbol_dominance_penalty_recent_weight", 0.0),
+        "symbol_dominance_penalty_grace": getattr(args, "symbol_dominance_penalty_grace", 0.0),
         "ensemble_windows": ",".join(str(value) for value in getattr(args, "ensemble_window_list", [])),
         "ensemble_model_count": len(getattr(args, "ensemble_window_list", [])),
         "ensemble_enabled": 1 if getattr(args, "ensemble_window_list", []) else 0,
+        "threshold_rejection_diagnostics": validation_metrics.get("threshold_rejection_diagnostics", []),
     }
     if validation_metrics:
         record.update({
@@ -11196,6 +13209,43 @@ def metrics_record(model_name, split, objective, threshold, train_rows, validati
         "strategy_strength": "not_checked",
         "max_rss_gb_observed": MAX_RSS_GIB_OBSERVED,
     })
+    for key in (
+        "ranking_candidate_count",
+        "ranking_selected_candidate_count",
+        "ranking_rejected_candidate_count",
+        "execution_rejected_candidate_count",
+        "raw_candidate_score_count",
+        "raw_candidate_score_min",
+        "raw_candidate_score_p50",
+        "raw_candidate_score_p90",
+        "raw_candidate_score_max",
+        "ranked_candidate_score_count",
+        "ranked_candidate_score_min",
+        "ranked_candidate_score_p50",
+        "ranked_candidate_score_p90",
+        "ranked_candidate_score_max",
+        "executed_trade_score_count",
+        "executed_trade_score_min",
+        "executed_trade_score_p50",
+        "executed_trade_score_p90",
+        "executed_trade_score_max",
+        "rejected_trade_score_count",
+        "rejected_trade_score_min",
+        "rejected_trade_score_p50",
+        "rejected_trade_score_p90",
+        "rejected_trade_score_max",
+        "ranking_rejected_trade_score_count",
+        "ranking_rejected_trade_score_min",
+        "ranking_rejected_trade_score_p50",
+        "ranking_rejected_trade_score_p90",
+        "ranking_rejected_trade_score_max",
+        "execution_rejected_trade_score_count",
+        "execution_rejected_trade_score_min",
+        "execution_rejected_trade_score_p50",
+        "execution_rejected_trade_score_p90",
+        "execution_rejected_trade_score_max",
+    ):
+        record[key] = metrics.get(key, 0.0)
     return record
 
 
@@ -11323,8 +13373,9 @@ def run_fixed_split(rows, feature_names, args, kind, model_name):
             args,
         )
     args._selected_calibration_info = selected.get("calibration_info") or {}
+    runtime_args = runtime_args_for_selected_hybrid_floor(args, selected)
     predict_token = start_profile_stage("fixed_test_prediction", model_name)
-    bundle = prediction_bundle_for_models(selected, test_rows, kind, args, "fixed test")
+    bundle = prediction_bundle_for_models(selected, test_rows, kind, runtime_args, "fixed test")
     finish_profile_stage(predict_token, rows_processed=len(test_rows))
     test_metrics = evaluate(
         test_rows,
@@ -11348,13 +13399,13 @@ def run_fixed_split(rows, feature_names, args, kind, model_name):
         objective_mode=args.objective_mode,
         trade_score_name=selected.get("trade_score_name", score_name_for_args(args)),
         min_predicted_net_return=args.min_predicted_net_return,
-        hybrid_min_score=args.hybrid_min_score,
+        hybrid_min_score=runtime_args.hybrid_min_score,
         max_trades_per_day=args.max_trades_per_day,
         max_trades_per_fold=args.max_trades_per_fold,
         max_losing_trades_per_day=args.max_losing_trades_per_day,
         max_daily_drawdown=args.max_daily_drawdown,
         pause_after_drawdown_minutes=args.pause_after_drawdown_minutes,
-        hybrid_runtime_args=args,
+        hybrid_runtime_args=runtime_args,
         symbol_filter_info=selected.get("symbol_filter_info"),
     )
     test_metrics["calibration_info"] = selected.get("calibration_info") or {}
@@ -11384,13 +13435,13 @@ def run_fixed_split(rows, feature_names, args, kind, model_name):
         objective_mode=args.objective_mode,
         trade_score_name=selected.get("trade_score_name", score_name_for_args(args)),
         min_predicted_net_return=args.min_predicted_net_return,
-        hybrid_min_score=args.hybrid_min_score,
+        hybrid_min_score=runtime_args.hybrid_min_score,
         max_trades_per_day=args.max_trades_per_day,
         max_trades_per_fold=args.max_trades_per_fold,
         max_losing_trades_per_day=args.max_losing_trades_per_day,
         max_daily_drawdown=args.max_daily_drawdown,
         pause_after_drawdown_minutes=args.pause_after_drawdown_minutes,
-        hybrid_runtime_args=args,
+        hybrid_runtime_args=runtime_args,
         symbol_filter_info=selected.get("symbol_filter_info"),
     )
     finish_profile_stage(prediction_write_token, rows_processed=len(test_rows), extra_info=args.predictions_out)
@@ -11517,7 +13568,9 @@ def aggregate_fold_records(records, model_name, objective):
         "trade_selection": records[0].get("trade_selection", "threshold"),
         "top_k_per_minute": records[0].get("top_k_per_minute", 0),
         "top_k_per_symbol_minute": records[0].get("top_k_per_symbol_minute", 0),
+        "prefer_unique_symbols": records[0].get("prefer_unique_symbols", 0),
         "max_trades_per_symbol_period": records[0].get("max_trades_per_symbol_period", 0),
+        "symbol_reentry_cooldown_minutes": records[0].get("symbol_reentry_cooldown_minutes", 0),
         "threshold_tie_epsilon": records[0].get("threshold_tie_epsilon", 1e-9),
         "threshold_target_trades": records[0].get("threshold_target_trades", 0),
         "threshold_target_active_days": records[0].get("threshold_target_active_days", 0),
@@ -11602,6 +13655,8 @@ def run_walk_forward(rows, feature_names, args, kind, model_name):
     fold_records = []
     diagnostic_records = []
     symbol_filter_records = []
+    max_completed_folds = int(getattr(args, "walk_forward_max_folds", 0) or 0)
+    start_fold_index = int(getattr(args, "walk_forward_start_fold", 0) or 0)
     init_prediction_token = start_profile_stage("prediction_output_write", args.walk_predictions_out)
     write_predictions(
         args.walk_predictions_out,
@@ -11627,7 +13682,9 @@ def run_walk_forward(rows, feature_names, args, kind, model_name):
     )
     finish_profile_stage(init_prediction_token, rows_processed=0, extra_info=args.walk_predictions_out)
     max_fold_start = max_month - args.walk_train_months - args.walk_validation_months - args.walk_test_months + 2
-    for fold_start in range(0, max(0, max_fold_start)):
+    for fold_start in range(start_fold_index, max(0, max_fold_start)):
+        if max_completed_folds and len(fold_records) >= max_completed_folds:
+            break
         train_start, train_end, validation_start, validation_end, test_start, test_end = walk_forward_split_bounds(
             fold_start,
             args.walk_train_months,
@@ -11665,6 +13722,7 @@ def run_walk_forward(rows, feature_names, args, kind, model_name):
         selected = fit_select_model(train_rows, validation_rows, feature_names, args, kind)
         finish_profile_stage(fold_fit_token, rows_processed=len(train_rows) + len(validation_rows))
         args._selected_calibration_info = selected.get("calibration_info") or {}
+        selected_runtime_args = runtime_args_for_selected_hybrid_floor(args, selected)
         if args.walk_forward_final_model == "selected":
             fit_final_train_rows = None
             final_selected = selected
@@ -11699,6 +13757,7 @@ def run_walk_forward(rows, feature_names, args, kind, model_name):
                 "score": selected.get("score", 0.0),
                 "trade_score_name": selected.get("trade_score_name", score_name_for_args(args)),
                 "selected_score_name": selected.get("selected_score_name", selected_score_name_for_mode(args)),
+                "effective_hybrid_min_score": selected.get("effective_hybrid_min_score", selected_runtime_args.hybrid_min_score),
                 "calibration": selected.get("calibration"),
                 "regression_calibration": selected.get("regression_calibration"),
                 "uncertainty_model": selected.get("uncertainty_model"),
@@ -11737,7 +13796,7 @@ def run_walk_forward(rows, feature_names, args, kind, model_name):
             final_selected,
             test_rows,
             kind,
-            args,
+            selected_runtime_args,
             "walk-forward fold {}".format(fold_index),
         )
         finish_profile_stage(fold_predict_token, rows_processed=len(test_rows))
@@ -11763,13 +13822,13 @@ def run_walk_forward(rows, feature_names, args, kind, model_name):
             objective_mode=args.objective_mode,
             trade_score_name=final_selected.get("trade_score_name", score_name_for_args(args)),
             min_predicted_net_return=args.min_predicted_net_return,
-            hybrid_min_score=args.hybrid_min_score,
+            hybrid_min_score=selected_runtime_args.hybrid_min_score,
             max_trades_per_day=args.max_trades_per_day,
             max_trades_per_fold=args.max_trades_per_fold,
             max_losing_trades_per_day=args.max_losing_trades_per_day,
             max_daily_drawdown=args.max_daily_drawdown,
             pause_after_drawdown_minutes=args.pause_after_drawdown_minutes,
-            hybrid_runtime_args=args,
+            hybrid_runtime_args=selected_runtime_args,
             symbol_filter_info=final_selected.get("symbol_filter_info"),
         )
         metrics.update(
@@ -11779,7 +13838,7 @@ def run_walk_forward(rows, feature_names, args, kind, model_name):
                 final_selected["threshold"],
                 metrics,
                 selected.get("validation_metrics", {}),
-                args,
+                selected_runtime_args,
                 final_selected.get("trade_score_name", score_name_for_args(args)),
             )
         )
@@ -11811,13 +13870,13 @@ def run_walk_forward(rows, feature_names, args, kind, model_name):
             objective_mode=args.objective_mode,
             trade_score_name=final_selected.get("trade_score_name", score_name_for_args(args)),
             min_predicted_net_return=args.min_predicted_net_return,
-            hybrid_min_score=args.hybrid_min_score,
+            hybrid_min_score=selected_runtime_args.hybrid_min_score,
             max_trades_per_day=args.max_trades_per_day,
             max_trades_per_fold=args.max_trades_per_fold,
             max_losing_trades_per_day=args.max_losing_trades_per_day,
             max_daily_drawdown=args.max_daily_drawdown,
             pause_after_drawdown_minutes=args.pause_after_drawdown_minutes,
-            hybrid_runtime_args=args,
+            hybrid_runtime_args=selected_runtime_args,
             symbol_filter_info=final_selected.get("symbol_filter_info"),
         )
         finish_profile_stage(fold_output_token, rows_processed=len(test_rows), extra_info=args.walk_predictions_out)
@@ -11974,6 +14033,263 @@ def derived_regime_pairs(row, args):
     return pairs
 
 
+def prediction_row_realized_trade_return(row):
+    if row.get("dynamic_trade_return", "") not in ("", None):
+        return safe_float(row.get("dynamic_trade_return", 0.0), 0.0)
+    return safe_float(row.get("trade_return", 0.0), 0.0)
+
+
+RANKING_SCORE_SOURCES = [
+    ("trade_score", "trade_score"),
+    ("hybrid_score", "hybrid_score"),
+    ("expected_value", "expected_value"),
+    ("predicted_net_return", "predicted_net_return"),
+    ("calibrated_probability", "calibrated_probability"),
+    ("probability", "probability"),
+]
+
+
+RANKING_REPORT_COLUMNS = [
+    "available",
+    "score_source",
+    "bucket_type",
+    "bucket",
+    "rows",
+    "predicted_trades",
+    "label_positive_rate",
+    "avg_score",
+    "min_score",
+    "max_score",
+    "avg_forward_return",
+    "avg_trade_return",
+    "avg_net_return_after_costs",
+    "total_net_return_after_costs",
+    "portfolio_profit_if_selected",
+    "profit_factor",
+    "symbol_count",
+    "month_count",
+    "active_day_count",
+    "top_symbol",
+    "top_symbol_share",
+    "top_month",
+    "top_month_share",
+    "skipped_reason",
+]
+
+
+def prediction_row_selected(row):
+    return int(safe_float(row.get("predicted", 0), 0.0)) > 0
+
+
+def prediction_row_month(row):
+    month = str(row.get("month", "") or "").strip()
+    if month:
+        return month
+    month_index = str(row.get("month_index", "") or "").strip()
+    return month_index
+
+
+def prediction_row_day(row):
+    trade_day = str(row.get("trade_day", "") or "").strip()
+    if trade_day:
+        return trade_day
+    open_time = row.get("open_time", "")
+    if open_time in ("", None):
+        return ""
+    try:
+        return minute_day_string(open_time_minute(int(float(open_time))))
+    except (TypeError, ValueError, OverflowError):
+        return ""
+
+
+def prediction_row_score_values(row):
+    values = {}
+    for source_name, key in RANKING_SCORE_SOURCES:
+        value_text = row.get(key, "")
+        if value_text in ("", None):
+            continue
+        values[source_name] = safe_float(value_text, 0.0)
+    return values
+
+
+def ranking_prediction_records(path, args):
+    applied_fee = resolve_execution_fee(getattr(args, "fee", 0.0), args)
+    effective_slippage = getattr(args, "slippage", 0.0) * getattr(args, "test_slippage_multiplier", 1.0)
+    latency_penalty = max(0.0, float(getattr(args, "latency_penalty_bps", 0.0))) / 10000.0
+    total_cost = applied_fee + effective_slippage + latency_penalty
+    initial_capital = float(getattr(args, "initial_capital", 10000.0))
+    fallback_position_size = initial_capital * float(getattr(args, "max_position_fraction", 0.10))
+    records = []
+    for row in iter_prediction_report_rows(path):
+        scores = prediction_row_score_values(row)
+        if not scores:
+            continue
+        trade_return = prediction_row_realized_trade_return(row)
+        position_size = safe_float(row.get("position_size", 0.0), 0.0)
+        records.append({
+            "scores": scores,
+            "symbol": str(row.get("symbol", "") or ""),
+            "month": prediction_row_month(row),
+            "day": prediction_row_day(row),
+            "label": safe_float(row.get("label", 0.0), 0.0),
+            "forward_return": safe_float(row.get("forward_return", 0.0), 0.0),
+            "trade_return": trade_return,
+            "net_return": trade_return - total_cost,
+            "predicted": prediction_row_selected(row),
+            "analysis_position_size": position_size if position_size > 0.0 else fallback_position_size,
+        })
+    return records
+
+
+def ranking_bucket_stats(records, score_source, bucket_type, bucket):
+    row_count = len(records)
+    if not row_count:
+        return {
+            "available": 1,
+            "score_source": score_source,
+            "bucket_type": bucket_type,
+            "bucket": bucket,
+            "rows": 0,
+            "predicted_trades": 0,
+            "label_positive_rate": 0.0,
+            "avg_score": 0.0,
+            "min_score": 0.0,
+            "max_score": 0.0,
+            "avg_forward_return": 0.0,
+            "avg_trade_return": 0.0,
+            "avg_net_return_after_costs": 0.0,
+            "total_net_return_after_costs": 0.0,
+            "portfolio_profit_if_selected": 0.0,
+            "profit_factor": 0.0,
+            "symbol_count": 0,
+            "month_count": 0,
+            "active_day_count": 0,
+            "top_symbol": "",
+            "top_symbol_share": 0.0,
+            "top_month": "",
+            "top_month_share": 0.0,
+            "skipped_reason": "",
+        }
+    scores = [record["score"] for record in records]
+    forward_returns = [record["forward_return"] for record in records]
+    trade_returns = [record["trade_return"] for record in records]
+    net_returns = [record["net_return"] for record in records]
+    gross_profit = sum(value for value in net_returns if value > 0.0)
+    gross_loss = -sum(value for value in net_returns if value < 0.0)
+    symbol_counts = Counter(record["symbol"] for record in records if record["symbol"])
+    month_counts = Counter(record["month"] for record in records if record["month"])
+    day_count = len(set(record["day"] for record in records if record["day"]))
+    top_symbol, top_symbol_count = symbol_counts.most_common(1)[0] if symbol_counts else ("", 0)
+    top_month, top_month_count = month_counts.most_common(1)[0] if month_counts else ("", 0)
+    return {
+        "available": 1,
+        "score_source": score_source,
+        "bucket_type": bucket_type,
+        "bucket": bucket,
+        "rows": row_count,
+        "predicted_trades": sum(1 for record in records if record["predicted"]),
+        "label_positive_rate": sum(record["label"] for record in records) / float(row_count),
+        "avg_score": sum(scores) / float(row_count),
+        "min_score": min(scores),
+        "max_score": max(scores),
+        "avg_forward_return": sum(forward_returns) / float(row_count),
+        "avg_trade_return": sum(trade_returns) / float(row_count),
+        "avg_net_return_after_costs": sum(net_returns) / float(row_count),
+        "total_net_return_after_costs": sum(net_returns),
+        "portfolio_profit_if_selected": sum(record["analysis_position_size"] * record["net_return"] for record in records),
+        "profit_factor": gross_profit / gross_loss if gross_loss else (float("inf") if gross_profit else 0.0),
+        "symbol_count": len(symbol_counts),
+        "month_count": len(month_counts),
+        "active_day_count": day_count,
+        "top_symbol": top_symbol,
+        "top_symbol_share": top_symbol_count / float(row_count) if row_count else 0.0,
+        "top_month": top_month,
+        "top_month_share": top_month_count / float(row_count) if row_count else 0.0,
+        "skipped_reason": "",
+    }
+
+
+def ranking_monotonicity(decile_rows):
+    ordered = sorted(
+        [row for row in decile_rows if int(row.get("rows", 0)) > 0],
+        key=lambda row: row["bucket"],
+    )
+    if len(ordered) <= 1:
+        return 0.0
+    adjacent_pairs = len(ordered) - 1
+    good_pairs = sum(
+        1
+        for index in range(adjacent_pairs)
+        if float(ordered[index]["avg_net_return_after_costs"]) >= float(ordered[index + 1]["avg_net_return_after_costs"])
+    )
+    return good_pairs / float(adjacent_pairs)
+
+
+def ranking_report_from_predictions(path, args):
+    if not path:
+        return [skipped_report_row("prediction_output_missing", score_source="", bucket_type="", bucket="")], {
+            "ranking_report_rows_available": 0,
+            "ranking_report_score_sources": "",
+        }
+    records = ranking_prediction_records(path, args)
+    if not records:
+        return [skipped_report_row("prediction_output_empty", score_source="", bucket_type="", bucket="")], {
+            "ranking_report_rows_available": 0,
+            "ranking_report_score_sources": "",
+        }
+
+    rows = []
+    summary = {
+        "ranking_report_rows_available": len(records),
+        "ranking_report_score_sources": "",
+    }
+    score_sources = sorted(set(source for record in records for source in record["scores"]))
+    summary["ranking_report_score_sources"] = ",".join(score_sources)
+    top_fractions = [
+        ("top_1pct", 0.01),
+        ("top_5pct", 0.05),
+        ("top_10pct", 0.10),
+        ("top_25pct", 0.25),
+        ("top_100pct", 1.00),
+    ]
+    for source_name in score_sources:
+        scored = [
+            dict(record, score=record["scores"][source_name])
+            for record in records
+            if source_name in record["scores"]
+        ]
+        scored.sort(key=lambda record: record["score"], reverse=True)
+        total = len(scored)
+        if not total:
+            continue
+        for bucket_name, fraction in top_fractions:
+            take = max(1, int(math.ceil(total * fraction)))
+            rows.append(ranking_bucket_stats(scored[:take], source_name, "top_fraction", bucket_name))
+        source_decile_rows = []
+        for decile_index in range(10):
+            start = int(decile_index * total / 10.0)
+            end = int((decile_index + 1) * total / 10.0)
+            bucket_name = "score_decile_{:02d}".format(decile_index + 1)
+            bucket_row = ranking_bucket_stats(scored[start:end], source_name, "score_decile", bucket_name)
+            rows.append(bucket_row)
+            source_decile_rows.append(bucket_row)
+        predicted = [record for record in scored if record["predicted"]]
+        rows.append(ranking_bucket_stats(predicted, source_name, "selection", "executed_trades"))
+
+        top_decile = source_decile_rows[0] if source_decile_rows else {}
+        top_one = next((row for row in rows if row["score_source"] == source_name and row["bucket"] == "top_1pct"), {})
+        prefix = "ranking_{}".format(source_name)
+        summary["{}_top_decile_avg_net_return".format(prefix)] = top_decile.get("avg_net_return_after_costs", 0.0)
+        summary["{}_top_decile_label_rate".format(prefix)] = top_decile.get("label_positive_rate", 0.0)
+        summary["{}_top_decile_rows".format(prefix)] = top_decile.get("rows", 0)
+        summary["{}_top_decile_top_symbol_share".format(prefix)] = top_decile.get("top_symbol_share", 0.0)
+        summary["{}_top_decile_top_month_share".format(prefix)] = top_decile.get("top_month_share", 0.0)
+        summary["{}_top_1pct_avg_net_return".format(prefix)] = top_one.get("avg_net_return_after_costs", 0.0)
+        summary["{}_top_1pct_rows".format(prefix)] = top_one.get("rows", 0)
+        summary["{}_net_return_monotonicity".format(prefix)] = ranking_monotonicity(source_decile_rows)
+    return rows, summary
+
+
 def calibration_report_from_predictions(path):
     fieldnames = [
         "probability_source",
@@ -11995,7 +14311,7 @@ def calibration_report_from_predictions(path):
         threshold = safe_float(row.get("selected_threshold", 0.0), 0.0)
         label = safe_float(row.get("label", 0.0), 0.0)
         forward_return = safe_float(row.get("forward_return", 0.0), 0.0)
-        trade_return = safe_float(row.get("trade_return", 0.0), 0.0)
+        trade_return = prediction_row_realized_trade_return(row)
         for source_name, key in (("raw_probability", "probability"), ("calibrated_probability", "calibrated_probability")):
             value_text = row.get(key, "")
             if value_text in (None, ""):
@@ -12117,7 +14433,7 @@ def symbol_report_from_predictions(path, args):
         stats["sum_forward_return"] += safe_float(row.get("forward_return", 0.0), 0.0)
         if int(safe_float(row.get("predicted", 0.0), 0.0)) <= 0:
             continue
-        trade_return = safe_float(row.get("trade_return", 0.0), 0.0)
+        trade_return = prediction_row_realized_trade_return(row)
         position_size = safe_float(row.get("position_size", 0.0), 0.0)
         net_after_fee = trade_return - applied_fee
         net_after_costs = trade_return - applied_fee - effective_slippage - latency_penalty
@@ -12194,7 +14510,7 @@ def regime_report_from_predictions(path, args):
         if not pairs:
             continue
         predicted = int(safe_float(row.get("predicted", 0.0), 0.0)) > 0
-        trade_return = safe_float(row.get("trade_return", 0.0), 0.0)
+        trade_return = prediction_row_realized_trade_return(row)
         position_size = safe_float(row.get("position_size", 0.0), 0.0)
         net_pnl = position_size * (trade_return - applied_fee - effective_slippage - latency_penalty)
         for regime_type, regime_value in pairs:
@@ -12270,6 +14586,41 @@ def feature_importance_snapshot(model, feature_names):
     return rows
 
 
+def feature_usage_summary(model, feature_names):
+    rows = feature_importance_snapshot(model, feature_names)
+    if not rows:
+        return {
+            "nonzero_feature_count": 0,
+            "zero_importance_feature_count": len(feature_names),
+            "nonzero_feature_fraction": 0.0,
+            "top_nonzero_features": "",
+            "top_feature_importance_share": 0.0,
+        }
+    aggregated = {}
+    for feature, importance, fraction in rows:
+        stats = aggregated.setdefault(feature, {"importance": 0.0, "fraction": 0.0})
+        stats["importance"] += float(importance)
+        stats["fraction"] += float(fraction)
+    ordered = sorted(
+        (
+            (feature, stats["importance"], stats["fraction"])
+            for feature, stats in aggregated.items()
+        ),
+        key=lambda item: (item[1], item[2], item[0]),
+        reverse=True,
+    )
+    nonzero = [item for item in ordered if abs(float(item[1])) > 1e-12 or abs(float(item[2])) > 1e-12]
+    total_features = max(1, len(feature_names))
+    top_fraction_total = sum(max(0.0, float(item[2])) for item in nonzero)
+    return {
+        "nonzero_feature_count": len(nonzero),
+        "zero_importance_feature_count": max(0, len(feature_names) - len(nonzero)),
+        "nonzero_feature_fraction": float(len(nonzero)) / float(total_features),
+        "top_nonzero_features": ", ".join(item[0] for item in nonzero[:10]),
+        "top_feature_importance_share": max(0.0, float(nonzero[0][2])) / float(top_fraction_total) if nonzero and top_fraction_total > 0.0 else 0.0,
+    }
+
+
 def collect_feature_stability(args, model, feature_names, fold_index):
     rows = feature_importance_snapshot(model, feature_names)
     if not rows:
@@ -12331,7 +14682,10 @@ def feature_stability_report(args):
             "skipped_reason": "",
         })
     report_rows.sort(key=lambda row: (-row["stability_score"], row["mean_rank"]))
-    summary = {"top_stable_features": ", ".join(row["feature"] for row in report_rows[:5])}
+    summary = {
+        "top_stable_features": ", ".join(row["feature"] for row in report_rows[:5]),
+        "stable_nonzero_feature_count": sum(1 for row in report_rows if abs(float(row["mean_importance"])) > 1e-12),
+    }
     return report_rows, summary
 
 
@@ -12558,6 +14912,7 @@ def write_experiment_report(path, summary):
     if walk_forward_enabled:
         conclusion_lines.extend([
             "- Walk-forward acceptance passed: `{}`".format(summary.get("walkforward_acceptance_passed", 0)),
+            "- Walk-forward gate status: `{}`".format(summary.get("walkforward_gate_status", "")),
             "- Acceptance reasons: `{}`".format(summary.get("walkforward_acceptance_reasons", "")),
         ])
     else:
@@ -12601,6 +14956,16 @@ def write_experiment_report(path, summary):
         "- Brier score: `{:.6f}`".format(summary.get("brier_score", 0.0)),
         "- Expected calibration error: `{:.6f}`".format(summary.get("expected_calibration_error", 0.0)),
         "- Max calibration error: `{:.6f}`".format(summary.get("max_calibration_error", 0.0)),
+        "",
+        "## Ranking / Tail Diagnostics",
+        "- Ranking rows available: `{}`".format(summary.get("ranking_report_rows_available", 0)),
+        "- Score sources: `{}`".format(summary.get("ranking_report_score_sources", "")),
+        "- Trade-score top decile net return after costs: `{:.6f}`".format(summary.get("ranking_trade_score_top_decile_avg_net_return", 0.0)),
+        "- Trade-score top 1% net return after costs: `{:.6f}`".format(summary.get("ranking_trade_score_top_1pct_avg_net_return", 0.0)),
+        "- Trade-score top decile label rate: `{:.4f}`".format(summary.get("ranking_trade_score_top_decile_label_rate", 0.0)),
+        "- Trade-score net-return monotonicity: `{:.4f}`".format(summary.get("ranking_trade_score_net_return_monotonicity", 0.0)),
+        "- Trade-score top decile symbol concentration: `{:.4f}`".format(summary.get("ranking_trade_score_top_decile_top_symbol_share", 0.0)),
+        "- Trade-score top decile month concentration: `{:.4f}`".format(summary.get("ranking_trade_score_top_decile_top_month_share", 0.0)),
         "",
         "## Regime Summary",
         "- Best regime by avg trade return: `{}`".format(summary.get("best_regime_by_avg_trade_return", "")),
@@ -12674,14 +15039,20 @@ def inspect_cache(args, training_manifest=None, manifest_path=None):
     if args.feature_storage not in ("memmap32", "memmap64"):
         raise ValueError("--inspect-cache requires --feature-storage memmap32 or memmap64")
     if os.path.isdir(args.input):
-        shards = discover_sharded_dataset_shards(args.input, training_manifest)
+        shards = None
+        shard_discovery_error = None
+        try:
+            shards = discover_sharded_dataset_shards(args.input, training_manifest)
+        except ValueError as error:
+            shard_discovery_error = error
         cache_hit = inspect_sharded_binary_cache(
             args.input,
             args.feature_storage,
             args.cache_dir or None,
             training_manifest,
-            shards,
+            shards or [],
             require_cache_hit=False,
+            allow_missing_inventory=shard_discovery_error is not None,
         )
         resolved_cache_dir = resolve_cache_dir(args.input, args.cache_dir or None)
         paths = sharded_dataset_cache_paths(
@@ -12689,7 +15060,7 @@ def inspect_cache(args, training_manifest=None, manifest_path=None):
             resolved_cache_dir,
             np.float32 if args.feature_storage == "memmap32" else np.float64,
         )
-        inventory_signature = sharded_inventory_signature(shards)
+        inventory_signature = sharded_inventory_signature(shards) if shards is not None else ""
         source_present = os.path.isdir(args.input)
     else:
         cache_hit = inspect_binary_cache(
@@ -12747,17 +15118,34 @@ def cache_report(args, training_manifest=None, manifest_path=None):
     print("Cache report", flush=True)
     print("cache_dir={}".format(resolved_cache_dir), flush=True)
     if os.path.isdir(args.input):
-        shards = discover_sharded_dataset_shards(args.input, training_manifest)
+        shards = None
+        shard_discovery_error = None
+        try:
+            shards = discover_sharded_dataset_shards(args.input, training_manifest)
+        except ValueError as error:
+            shard_discovery_error = error
         aggregate_paths = sharded_dataset_cache_paths(args.input, resolved_cache_dir, dtype)
         aggregate_manifest, _ = load_cache_manifest_file(aggregate_paths["manifest"])
-        aggregate_valid = bool(
-            aggregate_manifest and sharded_aggregate_manifest_matches(
-                aggregate_manifest, args.input, dtype, aggregate_paths, training_manifest, shards
-            )
-        )
+        aggregate_valid = bool(aggregate_manifest)
+        if aggregate_valid:
+            if shards is not None:
+                aggregate_valid = sharded_aggregate_manifest_matches(
+                    aggregate_manifest, args.input, dtype, aggregate_paths, training_manifest, shards
+                )
+            else:
+                aggregate_valid = sharded_aggregate_manifest_matches_without_inventory(
+                    aggregate_manifest, args.input, dtype, aggregate_paths, training_manifest
+                )
         print("dataset_type=sharded", flush=True)
         print("aggregate_cache_valid={}".format(int(aggregate_valid)), flush=True)
-        print("shard_count={}".format(len(shards)), flush=True)
+        print("shard_count={}".format(len(shards) if shards is not None else int(aggregate_manifest.get("shard_count", 0) if aggregate_manifest else 0)), flush=True)
+        if shard_discovery_error is not None:
+            print("shard_inventory_available=0", flush=True)
+            print("shard_inventory_error={}".format(str(shard_discovery_error)), flush=True)
+        else:
+            print("shard_inventory_available=1", flush=True)
+        if shards is None:
+            return 0
         shard_hits = 0
         shard_rebuild_needed = 0
         shard_rows = 0
@@ -12872,14 +15260,20 @@ def cache_cleanup(args):
 
 def smoke_test_cache(path, feature_storage, cache_dir, training_manifest=None, manifest_path=None):
     if os.path.isdir(path):
-        shards = discover_sharded_dataset_shards(path, training_manifest)
+        shards = None
+        shard_discovery_error = None
+        try:
+            shards = discover_sharded_dataset_shards(path, training_manifest)
+        except ValueError as error:
+            shard_discovery_error = error
         cache_hit = inspect_sharded_binary_cache(
             path,
             feature_storage,
             cache_dir,
             training_manifest,
-            shards,
+            shards or [],
             require_cache_hit=True,
+            allow_missing_inventory=shard_discovery_error is not None,
         )
     else:
         cache_hit = inspect_binary_cache(
@@ -12944,6 +15338,8 @@ def json_safe(value):
 def print_comparison(gbdt_record, walk_records, args):
     logistic = read_logistic_metric(args.logistic_metrics_in)
     walkforward_summary = walkforward_acceptance_summary(walk_records, args) if walk_records else None
+    explicit_flags = set(getattr(args, "_explicit_flags", []) or [])
+    logistic_metrics_requested = "logistic_metrics_in" in explicit_flags
     print("\nComparison report")
     if logistic:
         print(
@@ -12955,7 +15351,10 @@ def print_comparison(gbdt_record, walk_records, args):
             )
         )
     else:
-        print("Logistic: metrics file not found at {}".format(args.logistic_metrics_in))
+        if logistic_metrics_requested:
+            print("Logistic: metrics file not found at {}".format(args.logistic_metrics_in))
+        else:
+            print("Logistic: baseline unavailable for this run")
     print(
         "GBDT: model={} threshold={:.4g} precision={:.4f} recall={:.4f} portfolio_profit={:.2f} portfolio_return={:.4%} safety={}".format(
             gbdt_record["model"],
@@ -13039,10 +15438,15 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
         regime_rows, regime_summary = [skipped_report_row("fast_diagnostics_mode")], {}
         feature_stability_rows, feature_stability_summary = [skipped_report_row("fast_diagnostics_mode")], {}
         baseline_rows, baseline_summary = [skipped_report_row("fast_diagnostics_mode")], {}
+        ranking_rows, ranking_summary = [skipped_report_row("fast_diagnostics_mode", score_source="", bucket_type="", bucket="")], {
+            "ranking_report_rows_available": 0,
+            "ranking_report_score_sources": "",
+        }
     else:
         regime_rows, regime_summary = regime_report_from_predictions(prediction_report_path, args)
         feature_stability_rows, feature_stability_summary = feature_stability_report(args)
         baseline_rows, baseline_summary = baseline_report(args)
+        ranking_rows, ranking_summary = ranking_report_from_predictions(prediction_report_path, args)
         write_optional_csv_report(
             args.calibration_report_out,
             ["probability_source", "probability_bucket", "rows", "trades_if_thresholded", "mean_predicted_probability", "actual_positive_rate", "avg_forward_return", "avg_trade_return", "total_trade_return", "skipped_reason"],
@@ -13068,6 +15472,12 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
             ["baseline_name", "available", "skipped_reason", "trades", "win_rate", "avg_trade_return", "total_profit_after_fee_and_slippage", "portfolio_return", "max_drawdown", "profit_factor"],
             baseline_rows,
         )
+        write_optional_csv_report(
+            args.ranking_report_out,
+            RANKING_REPORT_COLUMNS,
+            ranking_rows,
+        )
+    feature_usage = feature_usage_summary(fixed_selected, feature_names)
     model_reference = aggregate if aggregate else fixed_record
     model_vs_best_baseline_return_delta = float(model_reference.get("portfolio_return", 0.0)) - float(baseline_summary.get("best_baseline_portfolio_return", 0.0))
     model_vs_best_baseline_profit_delta = float(model_reference.get("total_profit_after_fee_and_slippage", model_reference.get("portfolio_profit", 0.0))) - float(baseline_summary.get("best_baseline_total_profit", 0.0))
@@ -13132,13 +15542,16 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
             "symbol_report_out": args.symbol_report_out,
             "feature_stability_out": args.feature_stability_out,
             "baseline_report_out": args.baseline_report_out,
+            "ranking_report_out": args.ranking_report_out,
             "experiment_report_out": args.experiment_report_out,
         },
         "calibration_summary": calibration_summary,
         "regime_summary": regime_summary,
         "symbol_summary": symbol_summary,
         "feature_stability_summary": feature_stability_summary,
+        "feature_usage_summary": feature_usage,
         "baseline_summary": baseline_summary,
+        "ranking_summary": ranking_summary,
         "model_vs_best_baseline_return_delta": model_vs_best_baseline_return_delta,
         "model_vs_best_baseline_profit_delta": model_vs_best_baseline_profit_delta,
         "max_rss_gb_observed": MAX_RSS_GIB_OBSERVED,
@@ -13149,28 +15562,12 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
     summary.update(regime_summary)
     summary.update(symbol_summary)
     summary.update(feature_stability_summary)
+    summary.update(feature_usage)
     summary.update(baseline_summary)
-    for key in (
-        "candidate_threshold_count",
-        "rejected_under_min_trades_count",
-        "rejected_over_max_trades_count",
-        "rejected_under_min_precision_count",
-        "rejected_mixed_constraints_count",
-        "admissible_candidate_count",
-        "fallback_candidate_count",
-        "lowest_trade_count_seen",
-        "highest_trade_count_seen",
-        "best_precision_seen",
-        "best_precision_threshold",
-        "closest_over_max_trades_count",
-        "closest_over_max_threshold",
-        "closest_over_max_precision",
-        "closest_under_min_precision",
-        "closest_under_min_precision_threshold",
-        "closest_under_min_precision_trades",
-    ):
-        if fixed_record and key in fixed_record:
-            summary[key] = fixed_record.get(key)
+    summary.update(ranking_summary)
+    if fixed_record:
+        for key, value in fixed_record.items():
+            summary[key] = json_safe(value)
     summary.update(walkforward_summary)
     summary.update(overall_acceptance)
     def write_one(output_path):
@@ -13190,6 +15587,15 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
         "selected_score_name",
         "selected_score_threshold",
         "selected_threshold",
+        "exit_policy",
+        "trailing_activation_return",
+        "trailing_drawdown",
+        "stop_loss",
+        "max_holding_period_minutes",
+        "selected_validation_symbol_profit_concentration_top1",
+        "selected_validation_symbol_profit_concentration_top3",
+        "selected_validation_symbol_trade_concentration_top1",
+        "selected_validation_symbol_count",
         "hybrid_return_combination",
         "hybrid_min_probability",
         "conditional_expected_win_return",
@@ -13210,13 +15616,24 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
         "threshold_tiebreaker",
         "ensemble_windows",
         "top_k_per_symbol_minute",
+        "prefer_unique_symbols",
         "max_trades_per_symbol_period",
+        "symbol_reentry_cooldown_minutes",
         "portfolio_profit",
         "portfolio_return",
         "precision",
         "recall",
         "raw_precision",
         "raw_recall",
+        "average_exit_minutes",
+        "median_exit_minutes",
+        "trailing_stop_exit_count",
+        "stop_loss_exit_count",
+        "max_holding_exit_count",
+        "average_dynamic_trade_return",
+        "median_dynamic_trade_return",
+        "average_fixed_horizon_trade_return",
+        "dynamic_minus_fixed_avg_return",
         "walk_forward_folds",
         "walk_forward_portfolio_profit",
         "walk_forward_portfolio_return",
@@ -13243,10 +15660,20 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
         "rejection_reason",
         "strategy_strength",
         "walkforward_acceptance_passed",
+        "walkforward_gate_status",
+        "walkforward_gate_failed",
         "walkforward_acceptance_reasons",
         "brier_score",
         "expected_calibration_error",
         "max_calibration_error",
+        "ranking_report_rows_available",
+        "ranking_report_score_sources",
+        "ranking_trade_score_top_decile_avg_net_return",
+        "ranking_trade_score_top_1pct_avg_net_return",
+        "ranking_trade_score_top_decile_label_rate",
+        "ranking_trade_score_net_return_monotonicity",
+        "ranking_trade_score_top_decile_top_symbol_share",
+        "ranking_trade_score_top_decile_top_month_share",
         "best_regime_by_avg_trade_return",
         "worst_regime_by_avg_trade_return",
         "best_regime_by_profit",
@@ -13258,6 +15685,11 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
         "best_symbol",
         "worst_symbol",
         "top_stable_features",
+        "nonzero_feature_count",
+        "zero_importance_feature_count",
+        "nonzero_feature_fraction",
+        "top_nonzero_features",
+        "top_feature_importance_share",
         "model_vs_best_baseline_return_delta",
         "model_vs_best_baseline_profit_delta",
         "embargo_minutes",
@@ -13292,6 +15724,15 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
         "selected_score_name": fixed_record.get("selected_score_name", selected_score_name_for_mode(args)),
         "selected_score_threshold": fixed_record.get("selected_score_threshold", fixed_record.get("selected_threshold", 0.0)),
         "selected_threshold": fixed_record.get("selected_threshold", 0.0),
+        "exit_policy": fixed_record.get("exit_policy", getattr(args, "exit_policy", "fixed_horizon")),
+        "trailing_activation_return": fixed_record.get("trailing_activation_return", getattr(args, "trailing_activation_return", 0.01)),
+        "trailing_drawdown": fixed_record.get("trailing_drawdown", getattr(args, "trailing_drawdown", 0.003)),
+        "stop_loss": fixed_record.get("stop_loss", getattr(args, "stop_loss", getattr(args, "downside_stop", 0.02))),
+        "max_holding_period_minutes": fixed_record.get("max_holding_period_minutes", getattr(args, "max_holding_period_minutes", getattr(args, "holding_period_minutes", 0))),
+        "selected_validation_symbol_profit_concentration_top1": fixed_record.get("selected_validation_symbol_profit_concentration_top1", 0.0),
+        "selected_validation_symbol_profit_concentration_top3": fixed_record.get("selected_validation_symbol_profit_concentration_top3", 0.0),
+        "selected_validation_symbol_trade_concentration_top1": fixed_record.get("selected_validation_symbol_trade_concentration_top1", 0.0),
+        "selected_validation_symbol_count": fixed_record.get("selected_validation_symbol_count", 0),
         "hybrid_return_combination": fixed_record.get("hybrid_return_combination", getattr(args, "hybrid_return_combination", "probability_times_return")),
         "hybrid_min_probability": fixed_record.get("hybrid_min_probability", getattr(args, "hybrid_min_probability", 0.0)),
         "conditional_expected_win_return": fixed_record.get("conditional_expected_win_return", 0.0),
@@ -13312,13 +15753,24 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
         "threshold_tiebreaker": fixed_record.get("threshold_tiebreaker", getattr(args, "threshold_tiebreaker", "fewer_trades")),
         "ensemble_windows": fixed_record.get("ensemble_windows", ",".join(str(value) for value in getattr(args, "ensemble_window_list", []))),
         "top_k_per_symbol_minute": fixed_record.get("top_k_per_symbol_minute", getattr(args, "top_k_per_symbol_minute", 0)),
+        "prefer_unique_symbols": fixed_record.get("prefer_unique_symbols", int(bool(getattr(args, "prefer_unique_symbols", False)))),
         "max_trades_per_symbol_period": fixed_record.get("max_trades_per_symbol_period", getattr(args, "max_trades_per_symbol_period", 0)),
+        "symbol_reentry_cooldown_minutes": fixed_record.get("symbol_reentry_cooldown_minutes", getattr(args, "symbol_reentry_cooldown_minutes", 0)),
         "portfolio_profit": fixed_record.get("portfolio_profit", 0.0),
         "portfolio_return": fixed_record.get("portfolio_return", 0.0),
         "precision": fixed_record.get("precision", 0.0),
         "recall": fixed_record.get("recall", 0.0),
         "raw_precision": fixed_record.get("raw_precision", 0.0),
         "raw_recall": fixed_record.get("raw_recall", 0.0),
+        "average_exit_minutes": fixed_record.get("average_exit_minutes", 0.0),
+        "median_exit_minutes": fixed_record.get("median_exit_minutes", 0.0),
+        "trailing_stop_exit_count": fixed_record.get("trailing_stop_exit_count", 0),
+        "stop_loss_exit_count": fixed_record.get("stop_loss_exit_count", 0),
+        "max_holding_exit_count": fixed_record.get("max_holding_exit_count", 0),
+        "average_dynamic_trade_return": fixed_record.get("average_dynamic_trade_return", 0.0),
+        "median_dynamic_trade_return": fixed_record.get("median_dynamic_trade_return", 0.0),
+        "average_fixed_horizon_trade_return": fixed_record.get("average_fixed_horizon_trade_return", 0.0),
+        "dynamic_minus_fixed_avg_return": fixed_record.get("dynamic_minus_fixed_avg_return", 0.0),
         "walk_forward_folds": len(walk_records) - 1 if aggregate else 0,
         "walk_forward_portfolio_profit": aggregate.get("portfolio_profit", 0.0) if aggregate else 0.0,
         "walk_forward_portfolio_return": aggregate.get("portfolio_return", 0.0) if aggregate else 0.0,
@@ -13345,10 +15797,20 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
         "rejection_reason": overall_acceptance.get("rejection_reason", ""),
         "strategy_strength": overall_acceptance.get("strategy_strength", "not_checked"),
         "walkforward_acceptance_passed": walkforward_summary.get("walkforward_acceptance_passed", 0),
+        "walkforward_gate_status": walkforward_summary.get("walkforward_gate_status", ""),
+        "walkforward_gate_failed": walkforward_summary.get("walkforward_gate_failed", 0),
         "walkforward_acceptance_reasons": walkforward_summary.get("walkforward_acceptance_reasons", ""),
         "brier_score": calibration_summary.get("brier_score", 0.0),
         "expected_calibration_error": calibration_summary.get("expected_calibration_error", 0.0),
         "max_calibration_error": calibration_summary.get("max_calibration_error", 0.0),
+        "ranking_report_rows_available": ranking_summary.get("ranking_report_rows_available", 0),
+        "ranking_report_score_sources": ranking_summary.get("ranking_report_score_sources", ""),
+        "ranking_trade_score_top_decile_avg_net_return": ranking_summary.get("ranking_trade_score_top_decile_avg_net_return", 0.0),
+        "ranking_trade_score_top_1pct_avg_net_return": ranking_summary.get("ranking_trade_score_top_1pct_avg_net_return", 0.0),
+        "ranking_trade_score_top_decile_label_rate": ranking_summary.get("ranking_trade_score_top_decile_label_rate", 0.0),
+        "ranking_trade_score_net_return_monotonicity": ranking_summary.get("ranking_trade_score_net_return_monotonicity", 0.0),
+        "ranking_trade_score_top_decile_top_symbol_share": ranking_summary.get("ranking_trade_score_top_decile_top_symbol_share", 0.0),
+        "ranking_trade_score_top_decile_top_month_share": ranking_summary.get("ranking_trade_score_top_decile_top_month_share", 0.0),
         "best_regime_by_avg_trade_return": regime_summary.get("best_regime_by_avg_trade_return", ""),
         "worst_regime_by_avg_trade_return": regime_summary.get("worst_regime_by_avg_trade_return", ""),
         "best_regime_by_profit": regime_summary.get("best_regime_by_profit", ""),
@@ -13360,6 +15822,11 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
         "best_symbol": symbol_summary.get("best_symbol", ""),
         "worst_symbol": symbol_summary.get("worst_symbol", ""),
         "top_stable_features": feature_stability_summary.get("top_stable_features", ""),
+        "nonzero_feature_count": feature_usage.get("nonzero_feature_count", 0),
+        "zero_importance_feature_count": feature_usage.get("zero_importance_feature_count", 0),
+        "nonzero_feature_fraction": feature_usage.get("nonzero_feature_fraction", 0.0),
+        "top_nonzero_features": feature_usage.get("top_nonzero_features", ""),
+        "top_feature_importance_share": feature_usage.get("top_feature_importance_share", 0.0),
         "model_vs_best_baseline_return_delta": model_vs_best_baseline_return_delta,
         "model_vs_best_baseline_profit_delta": model_vs_best_baseline_profit_delta,
         "embargo_minutes": embargo_summary["embargo_minutes"],
@@ -13456,11 +15923,20 @@ def build_parser():
     parser.add_argument("--cooldown-after-loss-minutes", type=int, default=0)
     parser.add_argument("--trade-period-minutes", type=int, default=60)
     parser.add_argument("--holding-period-minutes", type=int, default=5)
+    parser.add_argument("--exit-policy", choices=["fixed_horizon", "trailing_stop"], default="fixed_horizon")
+    parser.add_argument("--max-holding-period-minutes", type=int, default=0)
+    parser.add_argument("--trailing-activation-return", type=float, default=0.01)
+    parser.add_argument("--trailing-drawdown", type=float, default=0.003)
+    parser.add_argument("--stop-loss", type=float, default=None)
+    parser.add_argument("--dynamic-exit-price-source", choices=["auto", "existing_rows", "raw_klines", "disabled"], default="auto")
+    parser.add_argument("--raw-kline-dir", default="")
     parser.add_argument("--position-sizing-mode", choices=["fixed_fraction", "confidence_weighted", "volatility_adjusted", "ev_weighted"], default="fixed_fraction")
     parser.add_argument("--trade-selection", choices=["threshold", "topk_ev", "topk_score"], default="threshold")
     parser.add_argument("--trade-score", choices=["auto", "probability", "ev", "predicted_return", "hybrid"], default="auto")
     parser.add_argument("--top-k-per-minute", type=int, default=3)
     parser.add_argument("--top-k-per-symbol-minute", type=int, default=0)
+    parser.add_argument("--prefer-unique-symbols", action="store_true")
+    parser.add_argument("--symbol-reentry-cooldown-minutes", type=int, default=0)
     parser.add_argument("--profit-safety", choices=["strict", "explore"], default="explore")
     parser.add_argument("--upside-target", type=float, default=0.05)
     parser.add_argument("--downside-stop", type=float, default=0.02)
@@ -13471,6 +15947,11 @@ def build_parser():
     parser.add_argument("--ev-payoff-min-negative-rows", type=int, default=25)
     parser.add_argument("--min-predicted-net-return", type=float, default=0.0)
     parser.add_argument("--hybrid-min-score", type=float, default=0.0)
+    parser.add_argument("--hybrid-min-score-calibration-aware", action="store_true")
+    parser.add_argument("--hybrid-min-score-calibration-reference-scale", type=float, default=0.20)
+    parser.add_argument("--hybrid-min-score-calibration-min-ratio", type=float, default=0.25)
+    parser.add_argument("--hybrid-min-score-calibration-floor-min", type=float, default=0.0)
+    parser.add_argument("--hybrid-min-score-calibration-floor-max", type=float, default=0.0)
     parser.add_argument("--hybrid-return-combination", choices=["probability_times_return", "expected_return", "conditional_payoff"], default="probability_times_return")
     parser.add_argument("--hybrid-min-probability", type=float, default=0.0)
     parser.add_argument("--conditional-payoff-min-positive-rows", type=int, default=25)
@@ -13502,6 +15983,9 @@ def build_parser():
     parser.add_argument("--symbol-filter-shrinkage", type=float, default=50.0)
     parser.add_argument("--symbol-filter-min-active-days", type=int, default=0)
     parser.add_argument("--symbol-filter-max-executed-trade-share", type=float, default=0.0)
+    parser.add_argument("--symbol-dominance-penalty-validation-weight", type=float, default=0.0)
+    parser.add_argument("--symbol-dominance-penalty-recent-weight", type=float, default=0.0)
+    parser.add_argument("--symbol-dominance-penalty-grace", type=float, default=0.0)
     parser.add_argument("--min-symbol-validation-trades", type=int, default=3)
     parser.add_argument("--min-symbol-validation-average-profit", type=float, default=0.0)
     parser.add_argument("--min-symbol-validation-total-profit", type=float, default=0.0)
@@ -13515,12 +15999,28 @@ def build_parser():
     parser.add_argument("--ensemble-windows", default="")
     parser.add_argument("--threshold-drawdown-penalty", type=float, default=0.0)
     parser.add_argument("--threshold-trade-count-penalty", type=float, default=0.0)
+    parser.add_argument("--threshold-diversity-penalty-weight", type=float, default=0.0)
+    parser.add_argument("--threshold-burst-trades-per-day-penalty", type=float, default=0.0)
+    parser.add_argument("--threshold-burst-max-trades-in-day-penalty", type=float, default=0.0)
+    parser.add_argument("--threshold-target-trades-per-day", type=float, default=0.0)
+    parser.add_argument("--threshold-target-max-trades-in-day", type=int, default=0)
+    parser.add_argument("--threshold-short-history-days", type=float, default=0.0)
+    parser.add_argument("--threshold-short-history-penalty", type=float, default=0.0)
+    parser.add_argument("--threshold-floor-snap-penalty-weight", type=float, default=0.0)
+    parser.add_argument("--threshold-floor-snap-tolerance", type=float, default=0.0)
+    parser.add_argument("--threshold-floor-snap-score-tolerance-ratio", type=float, default=0.0)
     parser.add_argument("--threshold-top1-concentration-penalty", type=float, default=0.0)
     parser.add_argument("--threshold-top3-concentration-penalty", type=float, default=0.0)
+    parser.add_argument("--threshold-trade-top1-concentration-penalty", type=float, default=0.0)
     parser.add_argument("--threshold-max-top1-concentration", type=float, default=0.0)
     parser.add_argument("--threshold-max-top3-concentration", type=float, default=0.0)
+    parser.add_argument("--threshold-max-trade-top1-concentration", type=float, default=0.0)
+    parser.add_argument("--threshold-concentration-cap-mode", choices=["soft", "hard"], default="soft")
     parser.add_argument("--target-validation-trades", type=int, default=0)
-    parser.add_argument("--threshold-tiebreaker", choices=["fewer_trades", "target_trades", "active_days", "balanced"], default="fewer_trades")
+    parser.add_argument("--threshold-tiebreaker", choices=["fewer_trades", "target_trades", "active_days", "balanced", "diversified"], default="fewer_trades")
+    parser.add_argument("--threshold-diversity-profit-tolerance-ratio", type=float, default=0.0)
+    parser.add_argument("--threshold-diversity-min-profit-top1-improvement", type=float, default=0.0)
+    parser.add_argument("--threshold-diversity-min-trade-top1-improvement", type=float, default=0.0)
     parser.add_argument("--threshold-tie-epsilon", type=float, default=1e-9)
     parser.add_argument("--threshold-target-trades", type=int, default=0)
     parser.add_argument("--threshold-target-active-days", type=int, default=0)
@@ -13574,12 +16074,17 @@ def build_parser():
     parser.add_argument("--auc-sample-rows", type=int, default=1000000)
     parser.add_argument("--calibration", choices=["none", "platt"], default="none")
     parser.add_argument("--calibration-max-rows", type=int, default=0)
+    parser.add_argument("--calibration-window-mode", choices=["all", "recent"], default="all")
+    parser.add_argument("--calibration-recent-ratio", type=float, default=0.0)
+    parser.add_argument("--calibration-recent-rows", type=int, default=0)
     parser.add_argument("--skip-full-validation-retune", action="store_true")
     parser.add_argument("--fixed-validation-backfill-months", type=int, default=2)
     parser.add_argument("--walk-forward", action="store_true")
     parser.add_argument("--walk-train-months", type=int, default=6)
     parser.add_argument("--walk-validation-months", type=int, default=1)
     parser.add_argument("--walk-test-months", type=int, default=1)
+    parser.add_argument("--walk-forward-start-fold", type=int, default=0)
+    parser.add_argument("--walk-forward-max-folds", type=int, default=0)
     parser.add_argument("--walk-forward-final-model", choices=["selected", "refit"], default="selected")
     parser.add_argument("--require-positive-walkforward", action="store_true")
     parser.add_argument("--min-profitable-fold-rate", type=float, default=0.0)
@@ -13600,6 +16105,7 @@ def build_parser():
     parser.add_argument("--symbol-report-out", default="")
     parser.add_argument("--feature-stability-out", default="")
     parser.add_argument("--baseline-report-out", default="")
+    parser.add_argument("--ranking-report-out", default="")
     parser.add_argument("--experiment-report-out", default="")
     parser.add_argument("--logistic-metrics-in", default="kline_growth_metrics_logistic.csv")
     parser.add_argument("--run-summary-out", default="kline_growth_run_summary.json")
@@ -13624,6 +16130,16 @@ def main(argv):
     args._explicit_flags = explicit_flags
     configure_output_paths(args)
     budget_applied = apply_memory_budget_defaults(args, explicit_flags)
+    diversity_defaults_applied = apply_diversity_selection_defaults(args, explicit_flags)
+    if diversity_defaults_applied:
+        print(
+            "Diversity selection defaults enabled: tie-breaker={} symbol_filter={} stage={}".format(
+                args.threshold_tiebreaker,
+                args.symbol_validation_filter,
+                args.symbol_filter_stage,
+            ),
+            flush=True,
+        )
     if args.min_validation_trades < 0:
         raise ValueError("--min-validation-trades cannot be negative")
     if args.max_validation_trades < 0:
@@ -13684,18 +16200,32 @@ def main(argv):
         raise ValueError("--trade-period-minutes must be positive when --max-trades-per-period is enabled")
     if args.holding_period_minutes <= 0:
         raise ValueError("--holding-period-minutes must be positive")
+    if args.max_holding_period_minutes < 0:
+        raise ValueError("--max-holding-period-minutes cannot be negative")
+    if args.trailing_activation_return < 0.0:
+        raise ValueError("--trailing-activation-return cannot be negative")
+    if args.trailing_drawdown < 0.0:
+        raise ValueError("--trailing-drawdown cannot be negative")
+    if args.stop_loss is not None and args.stop_loss <= 0.0:
+        raise ValueError("--stop-loss must be positive")
     if args.top_k_per_minute < 0:
         raise ValueError("--top-k-per-minute cannot be negative")
     if args.top_k_per_symbol_minute < 0:
         raise ValueError("--top-k-per-symbol-minute cannot be negative")
+    if args.symbol_reentry_cooldown_minutes < 0:
+        raise ValueError("--symbol-reentry-cooldown-minutes cannot be negative")
     if args.threshold_top1_concentration_penalty < 0.0:
         raise ValueError("--threshold-top1-concentration-penalty cannot be negative")
     if args.threshold_top3_concentration_penalty < 0.0:
         raise ValueError("--threshold-top3-concentration-penalty cannot be negative")
+    if args.threshold_trade_top1_concentration_penalty < 0.0:
+        raise ValueError("--threshold-trade-top1-concentration-penalty cannot be negative")
     if not 0.0 <= args.threshold_max_top1_concentration <= 1.0:
         raise ValueError("--threshold-max-top1-concentration must be between 0 and 1")
     if not 0.0 <= args.threshold_max_top3_concentration <= 1.0:
         raise ValueError("--threshold-max-top3-concentration must be between 0 and 1")
+    if not 0.0 <= args.threshold_max_trade_top1_concentration <= 1.0:
+        raise ValueError("--threshold-max-trade-top1-concentration must be between 0 and 1")
     if not 0.0 <= args.min_profitable_fold_rate <= 1.0:
         raise ValueError("--min-profitable-fold-rate must be between 0 and 1")
     if args.max_worst_fold_drawdown < 0.0:
@@ -13722,8 +16252,34 @@ def main(argv):
         raise ValueError("--threshold-drawdown-penalty cannot be negative")
     if args.threshold_trade_count_penalty < 0.0:
         raise ValueError("--threshold-trade-count-penalty cannot be negative")
+    if args.threshold_diversity_penalty_weight < 0.0:
+        raise ValueError("--threshold-diversity-penalty-weight cannot be negative")
+    if args.threshold_burst_trades_per_day_penalty < 0.0:
+        raise ValueError("--threshold-burst-trades-per-day-penalty cannot be negative")
+    if args.threshold_burst_max_trades_in_day_penalty < 0.0:
+        raise ValueError("--threshold-burst-max-trades-in-day-penalty cannot be negative")
+    if args.threshold_target_trades_per_day < 0.0:
+        raise ValueError("--threshold-target-trades-per-day cannot be negative")
+    if args.threshold_target_max_trades_in_day < 0:
+        raise ValueError("--threshold-target-max-trades-in-day cannot be negative")
+    if args.threshold_short_history_days < 0.0:
+        raise ValueError("--threshold-short-history-days cannot be negative")
+    if args.threshold_short_history_penalty < 0.0:
+        raise ValueError("--threshold-short-history-penalty cannot be negative")
+    if args.threshold_floor_snap_penalty_weight < 0.0:
+        raise ValueError("--threshold-floor-snap-penalty-weight cannot be negative")
+    if args.threshold_floor_snap_tolerance < 0.0:
+        raise ValueError("--threshold-floor-snap-tolerance cannot be negative")
+    if args.threshold_floor_snap_score_tolerance_ratio < 0.0:
+        raise ValueError("--threshold-floor-snap-score-tolerance-ratio cannot be negative")
     if args.target_validation_trades < 0:
         raise ValueError("--target-validation-trades cannot be negative")
+    if args.threshold_diversity_profit_tolerance_ratio < 0.0:
+        raise ValueError("--threshold-diversity-profit-tolerance-ratio cannot be negative")
+    if args.threshold_diversity_min_profit_top1_improvement < 0.0:
+        raise ValueError("--threshold-diversity-min-profit-top1-improvement cannot be negative")
+    if args.threshold_diversity_min_trade_top1_improvement < 0.0:
+        raise ValueError("--threshold-diversity-min-trade-top1-improvement cannot be negative")
     if args.threshold_tie_epsilon < 0.0:
         raise ValueError("--threshold-tie-epsilon cannot be negative")
     if args.threshold_target_trades < 0:
@@ -13732,6 +16288,20 @@ def main(argv):
         raise ValueError("--threshold-target-active-days cannot be negative")
     if args.overactive_trade_threshold < 0:
         raise ValueError("--overactive-trade-threshold cannot be negative")
+    if args.hybrid_min_score_calibration_reference_scale <= 0.0:
+        raise ValueError("--hybrid-min-score-calibration-reference-scale must be greater than 0")
+    if not 0.0 <= args.hybrid_min_score_calibration_min_ratio <= 1.0:
+        raise ValueError("--hybrid-min-score-calibration-min-ratio must be between 0 and 1")
+    if not math.isfinite(args.hybrid_min_score_calibration_floor_min):
+        raise ValueError("--hybrid-min-score-calibration-floor-min must be finite")
+    if not math.isfinite(args.hybrid_min_score_calibration_floor_max):
+        raise ValueError("--hybrid-min-score-calibration-floor-max must be finite")
+    if (
+        abs(args.hybrid_min_score_calibration_floor_max) > 1e-12
+        and abs(args.hybrid_min_score_calibration_floor_min) > 1e-12
+        and args.hybrid_min_score_calibration_floor_max < args.hybrid_min_score_calibration_floor_min
+    ):
+        raise ValueError("--hybrid-min-score-calibration-floor-max cannot be smaller than --hybrid-min-score-calibration-floor-min")
     if args.trade_score == "probability" and args.objective_mode == "return_regression":
         raise ValueError("--trade-score probability is incompatible with --objective-mode return_regression")
     if args.trade_score == "predicted_return" and args.objective_mode == "classification":
@@ -13760,6 +16330,10 @@ def main(argv):
         raise ValueError("--auc-sample-rows cannot be negative")
     if args.calibration_max_rows < 0:
         raise ValueError("--calibration-max-rows cannot be negative")
+    if not 0.0 <= args.calibration_recent_ratio <= 1.0:
+        raise ValueError("--calibration-recent-ratio must be between 0 and 1")
+    if args.calibration_recent_rows < 0:
+        raise ValueError("--calibration-recent-rows cannot be negative")
     if args.regression_calibration_max_rows < 0:
         raise ValueError("--regression-calibration-max-rows cannot be negative")
     if args.regression_calibration_buckets < 2:
@@ -13774,6 +16348,10 @@ def main(argv):
         raise ValueError("--walk-validation-months must be at least 1")
     if args.walk_test_months < 1:
         raise ValueError("--walk-test-months must be at least 1")
+    if args.walk_forward_start_fold < 0:
+        raise ValueError("--walk-forward-start-fold cannot be negative")
+    if args.walk_forward_max_folds < 0:
+        raise ValueError("--walk-forward-max-folds cannot be negative")
     if args.meta_filter_max_rows < 0:
         raise ValueError("--meta-filter-max-rows cannot be negative")
     if args.min_symbol_validation_trades < 0:
@@ -13792,6 +16370,12 @@ def main(argv):
         raise ValueError("--symbol-filter-min-active-days cannot be negative")
     if not 0.0 <= args.symbol_filter_max_executed_trade_share <= 1.0:
         raise ValueError("--symbol-filter-max-executed-trade-share must be between 0 and 1")
+    if args.symbol_dominance_penalty_validation_weight < 0.0:
+        raise ValueError("--symbol-dominance-penalty-validation-weight cannot be negative")
+    if args.symbol_dominance_penalty_recent_weight < 0.0:
+        raise ValueError("--symbol-dominance-penalty-recent-weight cannot be negative")
+    if not 0.0 <= args.symbol_dominance_penalty_grace <= 1.0:
+        raise ValueError("--symbol-dominance-penalty-grace must be between 0 and 1")
     if args.regression_clip_min > args.regression_clip_max:
         raise ValueError("--regression-clip-min must be <= --regression-clip-max")
     if args.early_stopping_rounds < 0:
@@ -13876,6 +16460,10 @@ def main(argv):
                 )
     training_manifest_for_args, _ = load_training_manifest(args.input)
     apply_manifest_ev_targets(args, training_manifest_for_args, explicit_flags)
+    if args.max_holding_period_minutes <= 0:
+        args.max_holding_period_minutes = args.holding_period_minutes
+    if args.stop_loss is None:
+        args.stop_loss = getattr(args, "effective_downside_stop", getattr(args, "downside_stop", 0.02))
     args.thresholds = parse_threshold_grid(args.threshold_grid)
     AUC_SAMPLE_ROWS = args.auc_sample_rows
     kind = choose_model_kind(args.model)

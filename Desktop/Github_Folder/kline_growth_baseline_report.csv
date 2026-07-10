@@ -1,0 +1,8 @@
+baseline_name,available,skipped_reason,trades,win_rate,avg_trade_return,total_profit_after_fee_and_slippage,portfolio_return,max_drawdown,profit_factor
+buy_and_hold_btc,0,continuous_price_path_unavailable,0,0.0,0.0,0.0,0.0,0.0,0.0
+equal_weight_buy_and_hold,0,continuous_price_path_unavailable,0,0.0,0.0,0.0,0.0,0.0,0.0
+logistic_baseline,0,logistic_metrics_unavailable,0,0.0,0.0,0.0,0.0,0.0,0.0
+no_trade,1,,0,0.0,0.0,0.0,0.0,0.0,0.0
+random_trade,0,baseline_context_missing,0,0.0,0.0,0.0,0.0,0.0,0.0
+simple_momentum,0,baseline_context_missing,0,0.0,0.0,0.0,0.0,0.0,0.0
+volume_spike,0,baseline_context_missing,0,0.0,0.0,0.0,0.0,0.0,0.0

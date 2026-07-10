@@ -1,0 +1,2 @@
+regime_type,regime_value,rows,predicted_trades,win_rate,avg_trade_return,total_profit_after_fee_and_slippage,portfolio_return_if_isolated,max_drawdown_if_isolated,profit_factor,skipped_reason
+,,,,,,,,,,prediction_output_missing

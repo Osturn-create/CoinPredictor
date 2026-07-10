@@ -147,8 +147,8 @@ bool isNormalCryptoUsdtSymbol(const std::string &symbol) {
     }
 
     const char *const blockedExactBases[] = {
-        "AUSDT", "CUSDT", "DUSDT", "FUSDT", "GUSDT", "SUSDT", "TUSDT",
-        "UUSDT", "WUSDT", "WBETH", "WBTC", "BETH", "XAUT"
+        "A", "C", "D", "F", "G", "S", "T",
+        "U", "W", "WBETH", "WBTC", "BETH", "XAUT"
     };
     const size_t blockedExactBaseCount = sizeof(blockedExactBases) / sizeof(blockedExactBases[0]);
     for (size_t i = 0; i < blockedExactBaseCount; ++i) {
