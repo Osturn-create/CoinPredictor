@@ -51,13 +51,18 @@ RESULT_COLUMNS = [
     "experiment_name",
     "profile",
     "objective_mode",
+    "threshold_objective",
     "trade_score",
     "trade_selection",
     "top_percent_per_period",
     "ranker_objective",
     "ranker_min_score",
+    "ranker_score_upper_quantile",
+    "ranker_score_upper_cap",
+    "ranker_score_upper_cap_blocked",
     "ranker_group_minutes",
     "ranker_min_group_size",
+    "ranker_threshold_search",
     "ranker_relevance_q1",
     "ranker_relevance_q2",
     "ranker_relevance_q3",
@@ -80,11 +85,25 @@ RESULT_COLUMNS = [
     "ensemble_windows",
     "ev_safety_margin",
     "min_selected_threshold",
+    "min_validation_trades",
     "min_validation_precision",
     "top_k_per_minute",
     "top_k_per_symbol_minute",
     "max_trades_per_period",
+    "max_trades_per_symbol_period",
+    "symbol_reentry_cooldown_minutes",
+    "max_same_symbol_streak",
+    "max_symbol_fold_trade_share",
+    "max_symbol_fold_trade_share_min_trades",
     "max_validation_trades",
+    "threshold_require_positive_top_1pct",
+    "threshold_max_raw_signal_share",
+    "threshold_min_avg_net_return",
+    "threshold_min_top_decile_net_return",
+    "threshold_min_score_win_loss_gap",
+    "threshold_max_top1_concentration",
+    "threshold_max_top3_concentration",
+    "threshold_max_trade_top1_concentration",
     "threshold_drawdown_penalty",
     "threshold_trade_count_penalty",
     "threshold_burst_trades_per_day_penalty",
@@ -102,6 +121,9 @@ RESULT_COLUMNS = [
     "calibration_recent_rows",
     "walk_forward_start_fold",
     "walk_forward_max_folds",
+    "min_profitable_fold_rate",
+    "min_median_fold_return",
+    "robustness_gate_action",
     "min_predicted_net_return",
     "hybrid_min_score",
     "total_profit",
@@ -124,12 +146,36 @@ RESULT_COLUMNS = [
     "robustness_gate_status",
     "profitable_but_fragile",
     "robustness_failed_checks",
+    "ranking_trade_score_top_1pct_avg_net_return",
+    "ranking_trade_score_top_5pct_avg_net_return",
+    "ranking_trade_score_top_decile_avg_net_return",
+    "ranking_ranker_score_top_1pct_avg_net_return",
+    "ranking_ranker_score_top_5pct_avg_net_return",
+    "ranking_ranker_score_top_decile_avg_net_return",
     "ranking_trade_score_net_return_monotonicity",
     "ranking_ranker_score_net_return_monotonicity",
     "ranking_trade_score_executed_top_symbol_share",
     "ranking_trade_score_executed_top_month_share",
     "ranking_ranker_score_executed_top_symbol_share",
     "ranking_ranker_score_executed_top_month_share",
+    "threshold_diagnostics_primary_rejection",
+    "threshold_diagnostics_primary_rejection_count",
+    "threshold_diagnostics_best_avg_net_return",
+    "threshold_diagnostics_best_avg_net_return_trades",
+    "threshold_diagnostics_best_top_decile_net_return",
+    "threshold_diagnostics_near_miss_count",
+    "threshold_diagnostics_near_miss_ignored_flags",
+    "threshold_diagnostics_best_near_miss_source_split",
+    "threshold_diagnostics_best_near_miss_fold_index",
+    "threshold_diagnostics_best_near_miss_threshold",
+    "threshold_diagnostics_best_near_miss_trades",
+    "threshold_diagnostics_best_near_miss_avg_net_return",
+    "threshold_diagnostics_best_near_miss_top_1pct_net_return",
+    "threshold_diagnostics_best_near_miss_top_decile_net_return",
+    "threshold_diagnostics_best_near_miss_top1_concentration",
+    "threshold_diagnostics_best_near_miss_top3_concentration",
+    "threshold_diagnostics_best_near_miss_trade_top1_concentration",
+    "threshold_diagnostics_best_near_miss_rejection_flags",
     "max_rss_gb_observed",
     "run_exit_code",
 ]
@@ -535,27 +581,39 @@ def hybrid_late_recent_tuned_experiments():
 
 
 def economic_ranker_experiments():
-    for trade_selection, top_k, top_percent, adverse_penalty in (
-        ("topk_score", 2, 0.0, 0.0),
-        ("topk_score", 1, 0.0, 0.10),
-        ("top_percent_score", 0, 0.05, 0.0),
+    for trade_selection, top_k, top_percent, adverse_penalty, max_trades_per_period, max_validation_trades, target_validation_trades in (
+        ("topk_score", 1, 0.0, 0.10, 6, 120, 40),
+        ("topk_score", 1, 0.0, 0.20, 6, 120, 40),
+        ("top_percent_score", 0, 0.03, 0.10, 6, 120, 40),
     ):
         yield {
             "profile": "economic-ranker",
             "input": "shard_dataset_30_volatile_from_existing",
             "cache_dir": ".gbdt_cache_full30_volatile",
+            "max_train_rows": 750000,
+            "max_validation_rows": 250000,
+            "max_final_train_rows": 750000,
+            "prediction_batch_rows": 500000,
+            "auc_sample_rows": 250000,
+            "adaptive_threshold_sample_rows": 250000,
+            "n_estimators": 120,
+            "model_candidate_count": 2,
+            "skip_full_validation_retune": True,
             "objective_mode": "economic_ranking",
+            "threshold_objective": "avg_profit",
             "trade_score": "ranker_score",
             "trade_selection": trade_selection,
             "walk_train_months": 8,
-            "walk_validation_months": 1,
+            "walk_validation_months": 2,
             "walk_test_months": 1,
             "walk_forward": True,
             "walk_forward_start_fold": 88,
             "walk_forward_max_folds": 10,
             "ranker_objective": "rank_xendcg",
             "ranker_min_score": -1000000000.0,
-            "ranker_group_minutes": 1,
+            "ranker_score_upper_quantile": 0.90,
+            "ranker_threshold_search": True,
+            "ranker_group_minutes": 5,
             "ranker_min_group_size": 2,
             "ranker_relevance_q1": 0.50,
             "ranker_relevance_q2": 0.75,
@@ -563,12 +621,27 @@ def economic_ranker_experiments():
             "ranker_adverse_penalty": adverse_penalty,
             "ev_safety_margin": 0.0,
             "min_selected_threshold": 0.0,
+            "min_validation_trades": 20,
             "min_validation_precision": 0.0,
             "top_k_per_minute": top_k,
             "top_percent_per_period": top_percent,
             "top_k_per_symbol_minute": 1,
-            "max_trades_per_period": 0,
-            "max_validation_trades": 400,
+            "max_trades_per_period": max_trades_per_period,
+            "max_trades_per_symbol_period": 1,
+            "symbol_reentry_cooldown_minutes": 240,
+            "max_same_symbol_streak": 4,
+            "max_symbol_fold_trade_share": 0.30,
+            "max_symbol_fold_trade_share_min_trades": 20,
+            "max_validation_trades": max_validation_trades,
+            "threshold_require_positive_top_1pct": True,
+            "threshold_max_raw_signal_share": 0.010,
+            "threshold_min_avg_net_return": 0.0004,
+            "threshold_min_top_decile_net_return": 0.0,
+            "threshold_min_score_win_loss_gap": 0.0,
+            "threshold_max_top1_concentration": 0.70,
+            "threshold_max_top3_concentration": 0.90,
+            "threshold_max_trade_top1_concentration": 0.35,
+            "threshold_concentration_cap_mode": "hard",
             "threshold_drawdown_penalty": 0.02,
             "threshold_trade_count_penalty": 0.00025,
             "threshold_burst_trades_per_day_penalty": 0.01,
@@ -577,7 +650,14 @@ def economic_ranker_experiments():
             "threshold_target_max_trades_in_day": 10,
             "threshold_short_history_days": 45.0,
             "threshold_short_history_penalty": 0.06,
-            "target_validation_trades": 220,
+            "target_validation_trades": target_validation_trades,
+            "min_profitable_fold_rate": 0.50,
+            "min_median_fold_return": 0.0,
+            "robustness_gate_action": "reject",
+            "robust_require_positive_top_1pct": True,
+            "robust_require_positive_top_5pct": True,
+            "robust_require_positive_top_decile": True,
+            "robust_min_executed_score_gap": 0.0,
             "min_predicted_net_return": 0.0,
             "hybrid_min_score": 0.0,
         }
@@ -673,6 +753,19 @@ def experiment_name(experiment):
     )
 
 
+def set_command_option(command, flag, value):
+    for index, item in enumerate(command[:-1]):
+        if item == flag:
+            command[index + 1] = str(value)
+            return
+    command.extend([flag, str(value)])
+
+
+def ensure_command_flag(command, flag):
+    if flag not in command:
+        command.append(flag)
+
+
 def build_command(args, experiment):
     pipeline_path = args.pipeline_script
     if not os.path.isabs(pipeline_path):
@@ -685,14 +778,21 @@ def build_command(args, experiment):
         command.extend(["--input", input_path])
     cache_dir = experiment.get("cache_dir", "")
     if cache_dir:
-        replaced = False
-        for index, value in enumerate(command[:-1]):
-            if value == "--cache-dir":
-                command[index + 1] = cache_dir
-                replaced = True
-                break
-        if not replaced:
-            command.extend(["--cache-dir", cache_dir])
+        set_command_option(command, "--cache-dir", cache_dir)
+    for flag, key in (
+        ("--max-train-rows", "max_train_rows"),
+        ("--max-validation-rows", "max_validation_rows"),
+        ("--max-final-train-rows", "max_final_train_rows"),
+        ("--prediction-batch-rows", "prediction_batch_rows"),
+        ("--auc-sample-rows", "auc_sample_rows"),
+        ("--adaptive-threshold-sample-rows", "adaptive_threshold_sample_rows"),
+        ("--n-estimators", "n_estimators"),
+        ("--model-candidate-count", "model_candidate_count"),
+    ):
+        if key in experiment:
+            set_command_option(command, flag, experiment[key])
+    if experiment.get("skip_full_validation_retune", False):
+        ensure_command_flag(command, "--skip-full-validation-retune")
     command.append("--cache-only")
     if not experiment.get("walk_forward", True):
         command = [value for value in command if value != "--walk-forward"]
@@ -707,11 +807,29 @@ def build_command(args, experiment):
         "--top-percent-per-period", str(experiment.get("top_percent_per_period", 0.0)),
         "--top-k-per-symbol-minute", str(experiment.get("top_k_per_symbol_minute", 0)),
         "--max-trades-per-period", str(experiment.get("max_trades_per_period", 10)),
+        "--max-trades-per-symbol-period", str(experiment.get("max_trades_per_symbol_period", 0)),
+        "--symbol-reentry-cooldown-minutes", str(experiment.get("symbol_reentry_cooldown_minutes", 0)),
+        "--max-same-symbol-streak", str(experiment.get("max_same_symbol_streak", 0)),
+        "--max-symbol-fold-trade-share", str(experiment.get("max_symbol_fold_trade_share", 0.0)),
+        "--max-symbol-fold-trade-share-min-trades", str(experiment.get("max_symbol_fold_trade_share_min_trades", 0)),
+        "--min-validation-trades", str(experiment.get("min_validation_trades", 5)),
         "--max-validation-trades", str(experiment.get("max_validation_trades", 250)),
+        "--threshold-max-raw-signal-share", str(experiment.get("threshold_max_raw_signal_share", 0.0)),
+        "--threshold-min-avg-net-return", str(experiment.get("threshold_min_avg_net_return", -999.0)),
+        "--threshold-min-top-decile-net-return", str(experiment.get("threshold_min_top_decile_net_return", -999.0)),
+        "--threshold-min-score-win-loss-gap", str(experiment.get("threshold_min_score_win_loss_gap", -999.0)),
+        "--threshold-max-top1-concentration", str(experiment.get("threshold_max_top1_concentration", 0.0)),
+        "--threshold-max-top3-concentration", str(experiment.get("threshold_max_top3_concentration", 0.0)),
+        "--threshold-max-trade-top1-concentration", str(experiment.get("threshold_max_trade_top1_concentration", 0.0)),
+        "--threshold-concentration-cap-mode", experiment.get("threshold_concentration_cap_mode", "soft"),
         "--threshold-drawdown-penalty", str(experiment.get("threshold_drawdown_penalty", 0.0)),
         "--threshold-trade-count-penalty", str(experiment.get("threshold_trade_count_penalty", 0.0)),
         "--target-validation-trades", str(experiment.get("target_validation_trades", 0)),
         "--acceptance-tier", args.acceptance_tier,
+        "--min-profitable-fold-rate", str(experiment.get("min_profitable_fold_rate", 0.0)),
+        "--min-median-fold-return", str(experiment.get("min_median_fold_return", -999.0)),
+        "--robustness-gate-action", experiment.get("robustness_gate_action", "warn"),
+        "--robust-min-executed-score-gap", str(experiment.get("robust_min_executed_score_gap", -999.0)),
         "--run-summary-out", args.summary_path,
         "--walk-forward-start-fold", str(experiment.get("walk_forward_start_fold", 0)),
         "--walk-forward-max-folds", str(experiment.get("walk_forward_max_folds", 0)),
@@ -735,6 +853,14 @@ def build_command(args, experiment):
         "--symbol-filter-stage", experiment.get("symbol_filter_stage", "executed"),
         "--threshold-tiebreaker", experiment.get("threshold_tiebreaker", "fewer_trades"),
     ])
+    if experiment.get("threshold_require_positive_top_1pct", False):
+        command.append("--threshold-require-positive-top-1pct")
+    if experiment.get("robust_require_positive_top_1pct", False):
+        command.append("--robust-require-positive-top-1pct")
+    if experiment.get("robust_require_positive_top_5pct", False):
+        command.append("--robust-require-positive-top-5pct")
+    if experiment.get("robust_require_positive_top_decile", False):
+        command.append("--robust-require-positive-top-decile")
     if experiment.get("ensemble_windows", ""):
         command.extend(["--ensemble-windows", experiment["ensemble_windows"]])
     if experiment["objective_mode"] == "classification":
@@ -755,8 +881,10 @@ def build_command(args, experiment):
         ])
     elif experiment["objective_mode"] == "economic_ranking":
         command.extend([
+            "--threshold-objective", experiment.get("threshold_objective", "avg_profit"),
             "--ranker-objective", experiment.get("ranker_objective", "rank_xendcg"),
             "--ranker-min-score", str(experiment.get("ranker_min_score", -1000000000.0)),
+            "--ranker-score-upper-quantile", str(experiment.get("ranker_score_upper_quantile", 1.0)),
             "--ranker-group-minutes", str(experiment.get("ranker_group_minutes", 1)),
             "--ranker-min-group-size", str(experiment.get("ranker_min_group_size", 2)),
             "--ranker-relevance-q1", str(experiment.get("ranker_relevance_q1", 0.50)),
@@ -766,6 +894,8 @@ def build_command(args, experiment):
             "--min-selected-threshold", str(experiment.get("min_selected_threshold", 0.0)),
             "--min-validation-precision", str(experiment.get("min_validation_precision", 0.0)),
         ])
+        if experiment.get("ranker_threshold_search", False):
+            command.append("--ranker-threshold-search")
     else:
         command.extend([
             "--calibration", "platt",
@@ -812,13 +942,18 @@ def summary_record(experiment, summary, run_exit_code):
         "experiment_name": experiment_name(experiment),
         "profile": experiment.get("profile", ""),
         "objective_mode": experiment["objective_mode"],
+        "threshold_objective": experiment.get("threshold_objective", ""),
         "trade_score": experiment["trade_score"],
         "trade_selection": experiment.get("trade_selection", "topk_score"),
         "top_percent_per_period": experiment.get("top_percent_per_period", 0.0),
         "ranker_objective": experiment.get("ranker_objective", "none"),
         "ranker_min_score": experiment.get("ranker_min_score", 0.0),
+        "ranker_score_upper_quantile": experiment.get("ranker_score_upper_quantile", 1.0),
+        "ranker_score_upper_cap": float_value(source.get("ranker_score_upper_cap", 0.0)),
+        "ranker_score_upper_cap_blocked": int(float_value(source.get("ranker_score_upper_cap_blocked", 0))),
         "ranker_group_minutes": experiment.get("ranker_group_minutes", 0),
         "ranker_min_group_size": experiment.get("ranker_min_group_size", 0),
+        "ranker_threshold_search": int(bool(experiment.get("ranker_threshold_search", False))),
         "ranker_relevance_q1": experiment.get("ranker_relevance_q1", 0.0),
         "ranker_relevance_q2": experiment.get("ranker_relevance_q2", 0.0),
         "ranker_relevance_q3": experiment.get("ranker_relevance_q3", 0.0),
@@ -841,11 +976,25 @@ def summary_record(experiment, summary, run_exit_code):
         "ensemble_windows": experiment.get("ensemble_windows", ""),
         "ev_safety_margin": experiment.get("ev_safety_margin", 0.0),
         "min_selected_threshold": experiment.get("min_selected_threshold", 0.0),
+        "min_validation_trades": experiment.get("min_validation_trades", 5),
         "min_validation_precision": experiment.get("min_validation_precision", 0.0),
         "top_k_per_minute": experiment.get("top_k_per_minute", 0),
         "top_k_per_symbol_minute": experiment.get("top_k_per_symbol_minute", 0),
         "max_trades_per_period": experiment.get("max_trades_per_period", 10),
+        "max_trades_per_symbol_period": experiment.get("max_trades_per_symbol_period", 0),
+        "symbol_reentry_cooldown_minutes": experiment.get("symbol_reentry_cooldown_minutes", 0),
+        "max_same_symbol_streak": experiment.get("max_same_symbol_streak", 0),
+        "max_symbol_fold_trade_share": experiment.get("max_symbol_fold_trade_share", 0.0),
+        "max_symbol_fold_trade_share_min_trades": experiment.get("max_symbol_fold_trade_share_min_trades", 0),
         "max_validation_trades": experiment.get("max_validation_trades", 250),
+        "threshold_require_positive_top_1pct": int(bool(experiment.get("threshold_require_positive_top_1pct", False))),
+        "threshold_max_raw_signal_share": experiment.get("threshold_max_raw_signal_share", 0.0),
+        "threshold_min_avg_net_return": experiment.get("threshold_min_avg_net_return", -999.0),
+        "threshold_min_top_decile_net_return": experiment.get("threshold_min_top_decile_net_return", -999.0),
+        "threshold_min_score_win_loss_gap": experiment.get("threshold_min_score_win_loss_gap", -999.0),
+        "threshold_max_top1_concentration": experiment.get("threshold_max_top1_concentration", 0.0),
+        "threshold_max_top3_concentration": experiment.get("threshold_max_top3_concentration", 0.0),
+        "threshold_max_trade_top1_concentration": experiment.get("threshold_max_trade_top1_concentration", 0.0),
         "threshold_drawdown_penalty": experiment.get("threshold_drawdown_penalty", 0.0),
         "threshold_trade_count_penalty": experiment.get("threshold_trade_count_penalty", 0.0),
         "threshold_burst_trades_per_day_penalty": experiment.get("threshold_burst_trades_per_day_penalty", 0.0),
@@ -863,6 +1012,9 @@ def summary_record(experiment, summary, run_exit_code):
         "calibration_recent_rows": experiment.get("calibration_recent_rows", 0),
         "walk_forward_start_fold": experiment.get("walk_forward_start_fold", 0),
         "walk_forward_max_folds": experiment.get("walk_forward_max_folds", 0),
+        "min_profitable_fold_rate": experiment.get("min_profitable_fold_rate", 0.0),
+        "min_median_fold_return": experiment.get("min_median_fold_return", -999.0),
+        "robustness_gate_action": experiment.get("robustness_gate_action", "warn"),
         "min_predicted_net_return": experiment.get("min_predicted_net_return", 0.0),
         "hybrid_min_score": experiment.get("hybrid_min_score", 0.0),
         "total_profit": float_value(source.get("portfolio_profit", 0.0)),
@@ -885,12 +1037,36 @@ def summary_record(experiment, summary, run_exit_code):
         "robustness_gate_status": summary.get("robustness_gate_status", ""),
         "profitable_but_fragile": int(float_value(summary.get("profitable_but_fragile", 0))),
         "robustness_failed_checks": summary.get("robustness_failed_checks", ""),
+        "ranking_trade_score_top_1pct_avg_net_return": float_value(summary.get("ranking_trade_score_top_1pct_avg_net_return", 0.0)),
+        "ranking_trade_score_top_5pct_avg_net_return": float_value(summary.get("ranking_trade_score_top_5pct_avg_net_return", 0.0)),
+        "ranking_trade_score_top_decile_avg_net_return": float_value(summary.get("ranking_trade_score_top_decile_avg_net_return", 0.0)),
+        "ranking_ranker_score_top_1pct_avg_net_return": float_value(summary.get("ranking_ranker_score_top_1pct_avg_net_return", 0.0)),
+        "ranking_ranker_score_top_5pct_avg_net_return": float_value(summary.get("ranking_ranker_score_top_5pct_avg_net_return", 0.0)),
+        "ranking_ranker_score_top_decile_avg_net_return": float_value(summary.get("ranking_ranker_score_top_decile_avg_net_return", 0.0)),
         "ranking_trade_score_net_return_monotonicity": float_value(summary.get("ranking_trade_score_net_return_monotonicity", 0.0)),
         "ranking_ranker_score_net_return_monotonicity": float_value(summary.get("ranking_ranker_score_net_return_monotonicity", 0.0)),
         "ranking_trade_score_executed_top_symbol_share": float_value(summary.get("ranking_trade_score_executed_top_symbol_share", 0.0)),
         "ranking_trade_score_executed_top_month_share": float_value(summary.get("ranking_trade_score_executed_top_month_share", 0.0)),
         "ranking_ranker_score_executed_top_symbol_share": float_value(summary.get("ranking_ranker_score_executed_top_symbol_share", 0.0)),
         "ranking_ranker_score_executed_top_month_share": float_value(summary.get("ranking_ranker_score_executed_top_month_share", 0.0)),
+        "threshold_diagnostics_primary_rejection": summary.get("threshold_diagnostics_primary_rejection", ""),
+        "threshold_diagnostics_primary_rejection_count": int(float_value(summary.get("threshold_diagnostics_primary_rejection_count", 0))),
+        "threshold_diagnostics_best_avg_net_return": float_value(summary.get("threshold_diagnostics_best_avg_net_return", 0.0)),
+        "threshold_diagnostics_best_avg_net_return_trades": int(float_value(summary.get("threshold_diagnostics_best_avg_net_return_trades", 0))),
+        "threshold_diagnostics_best_top_decile_net_return": float_value(summary.get("threshold_diagnostics_best_top_decile_net_return", 0.0)),
+        "threshold_diagnostics_near_miss_count": int(float_value(summary.get("threshold_diagnostics_near_miss_count", 0))),
+        "threshold_diagnostics_near_miss_ignored_flags": summary.get("threshold_diagnostics_near_miss_ignored_flags", ""),
+        "threshold_diagnostics_best_near_miss_source_split": summary.get("threshold_diagnostics_best_near_miss_source_split", ""),
+        "threshold_diagnostics_best_near_miss_fold_index": int(float_value(summary.get("threshold_diagnostics_best_near_miss_fold_index", 0))),
+        "threshold_diagnostics_best_near_miss_threshold": float_value(summary.get("threshold_diagnostics_best_near_miss_threshold", 0.0)),
+        "threshold_diagnostics_best_near_miss_trades": int(float_value(summary.get("threshold_diagnostics_best_near_miss_trades", 0))),
+        "threshold_diagnostics_best_near_miss_avg_net_return": float_value(summary.get("threshold_diagnostics_best_near_miss_avg_net_return", 0.0)),
+        "threshold_diagnostics_best_near_miss_top_1pct_net_return": float_value(summary.get("threshold_diagnostics_best_near_miss_top_1pct_net_return", 0.0)),
+        "threshold_diagnostics_best_near_miss_top_decile_net_return": float_value(summary.get("threshold_diagnostics_best_near_miss_top_decile_net_return", 0.0)),
+        "threshold_diagnostics_best_near_miss_top1_concentration": float_value(summary.get("threshold_diagnostics_best_near_miss_top1_concentration", 0.0)),
+        "threshold_diagnostics_best_near_miss_top3_concentration": float_value(summary.get("threshold_diagnostics_best_near_miss_top3_concentration", 0.0)),
+        "threshold_diagnostics_best_near_miss_trade_top1_concentration": float_value(summary.get("threshold_diagnostics_best_near_miss_trade_top1_concentration", 0.0)),
+        "threshold_diagnostics_best_near_miss_rejection_flags": summary.get("threshold_diagnostics_best_near_miss_rejection_flags", ""),
         "max_rss_gb_observed": float_value(summary.get("memory_settings", {}).get("max_rss_gb_observed", 0.0)),
         "run_exit_code": run_exit_code,
     }
