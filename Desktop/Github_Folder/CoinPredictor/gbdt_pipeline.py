@@ -29,6 +29,11 @@ import warnings
 import gzip
 import zipfile
 
+import artifact_contracts
+import candidate_artifacts
+import created_file_inventory
+import portfolio_ledger
+
 try:
     import numpy as np
 except ImportError:
@@ -67,6 +72,23 @@ CACHE_LOAD_INFO = {}
 TEMP_PREDICTION_PATHS = set()
 PREDICTION_BUNDLE_MEMORY_CACHE = {}
 AUC_SAMPLE_ROWS = 1000000
+DEFAULT_CANDIDATE_UTILITY_DIAGNOSTIC_MAX_ROWS = 500000
+THRESHOLD_STATUS_VALID = "valid_threshold"
+THRESHOLD_STATUS_NO_VALID = "no_valid_threshold"
+THRESHOLD_STATUS_INSUFFICIENT_VALIDATION = "insufficient_validation_trades"
+CANDIDATE_SERIALIZATION_POST_SELECTION = "post_selection"
+CANDIDATE_SERIALIZATION_PRE_FILTER = "pre_score_edge_pre_symbol_filter"
+PREDICTION_BUNDLE_VALUE_KEYS = (
+    "probability",
+    "calibrated_probability",
+    "predicted_trade_return",
+    "raw_predicted_trade_return",
+    "predicted_return_uncertainty",
+    "ranker_score",
+    "ranker_utility_score",
+    "ranker_selection_score",
+    "meta_probability",
+)
 CANONICAL_TRAINING_CSV = "kline_growth_training.csv"
 TRAINING_MANIFEST_VERSION = 1
 SHARDED_DATASET_MANIFEST = "kline_growth_dataset.meta.json"
@@ -199,6 +221,22 @@ def safe_float(value, default=0.0):
         return default
 
 
+def required_float(value, field_name):
+    if value is None or value == "":
+        raise ValueError("{} is missing or empty".format(field_name))
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        raise ValueError("{} must be numeric; got {!r}".format(field_name, value))
+    if math.isnan(parsed) or math.isinf(parsed):
+        raise ValueError("{} must be finite; got {!r}".format(field_name, value))
+    return parsed
+
+
+def required_int(value, field_name):
+    return int(required_float(value, field_name))
+
+
 def open_csv_text(path):
     if str(path).endswith(".gz"):
         return gzip.open(path, "rt", newline="")
@@ -320,18 +358,20 @@ def apply_diversity_selection_defaults(args, explicit_flags):
     if "threshold_diversity_min_trade_top1_improvement" not in explicit_flags and float(getattr(args, "threshold_diversity_min_trade_top1_improvement", 0.0)) <= 0.0:
         args.threshold_diversity_min_trade_top1_improvement = 0.05
         changed = True
-    if "symbol_validation_filter" not in explicit_flags and getattr(args, "symbol_validation_filter", "none") == "none":
-        args.symbol_validation_filter = "positive_avg_profit"
-        changed = True
-    if "symbol_filter_stage" not in explicit_flags and getattr(args, "symbol_filter_stage", "executed") == "executed":
-        args.symbol_filter_stage = "candidate_blend"
-        changed = True
-    if "symbol_filter_min_active_days" not in explicit_flags and int(getattr(args, "symbol_filter_min_active_days", 0)) <= 0:
-        args.symbol_filter_min_active_days = 3
-        changed = True
-    if "symbol_filter_max_executed_trade_share" not in explicit_flags and float(getattr(args, "symbol_filter_max_executed_trade_share", 0.0)) <= 0.0:
-        args.symbol_filter_max_executed_trade_share = 0.55
-        changed = True
+    enable_symbol_filter_defaults = bool(getattr(args, "enable_symbol_filter_activation_defaults", False))
+    if enable_symbol_filter_defaults:
+        if "symbol_validation_filter" not in explicit_flags and getattr(args, "symbol_validation_filter", "none") == "none":
+            args.symbol_validation_filter = "positive_avg_profit"
+            changed = True
+        if "symbol_filter_stage" not in explicit_flags and getattr(args, "symbol_filter_stage", "executed") == "executed":
+            args.symbol_filter_stage = "candidate_blend"
+            changed = True
+        if "symbol_filter_min_active_days" not in explicit_flags and int(getattr(args, "symbol_filter_min_active_days", 0)) <= 0:
+            args.symbol_filter_min_active_days = 3
+            changed = True
+        if "symbol_filter_max_executed_trade_share" not in explicit_flags and float(getattr(args, "symbol_filter_max_executed_trade_share", 0.0)) <= 0.0:
+            args.symbol_filter_max_executed_trade_share = 0.55
+            changed = True
     if "symbol_dominance_penalty_validation_weight" not in explicit_flags and float(getattr(args, "symbol_dominance_penalty_validation_weight", 0.0)) <= 0.0:
         args.symbol_dominance_penalty_validation_weight = 0.35
         changed = True
@@ -347,6 +387,56 @@ def apply_diversity_selection_defaults(args, explicit_flags):
     if "symbol_reentry_cooldown_minutes" not in explicit_flags and int(getattr(args, "symbol_reentry_cooldown_minutes", 0)) <= 0:
         args.symbol_reentry_cooldown_minutes = 15
         changed = True
+    return changed
+
+
+SYMBOL_FILTER_ACTIVATION_FLAGS = {
+    "symbol_filter_stage",
+    "symbol_filter_min_candidates",
+    "symbol_filter_min_executed",
+    "symbol_filter_candidate_weight",
+    "symbol_filter_executed_weight",
+    "symbol_filter_shrinkage",
+    "symbol_filter_min_active_days",
+    "symbol_filter_max_executed_trade_share",
+    "min_symbol_validation_trades",
+    "min_symbol_validation_average_profit",
+    "min_symbol_validation_total_profit",
+}
+
+
+def apply_symbol_filter_activation_defaults(args, explicit_flags):
+    if "symbol_validation_filter" in explicit_flags:
+        return False
+    if getattr(args, "symbol_validation_filter", "none") != "none":
+        return False
+    if not bool(getattr(args, "enable_symbol_filter_activation_defaults", False)):
+        return False
+    if not any(flag in explicit_flags for flag in SYMBOL_FILTER_ACTIVATION_FLAGS):
+        return False
+    if "symbol_filter_stage" in explicit_flags and getattr(args, "symbol_filter_stage", "executed") == "executed":
+        requested = any(flag in explicit_flags for flag in SYMBOL_FILTER_ACTIVATION_FLAGS - {"symbol_filter_stage"})
+        if not requested:
+            return False
+    args.symbol_validation_filter = "positive_avg_profit"
+    return True
+
+
+def apply_threshold_score_edge_gate(args, explicit_flags):
+    if not bool(getattr(args, "threshold_score_edge_gate", False)):
+        return False
+
+    changed = False
+    if "threshold_min_top_decile_net_return" not in explicit_flags:
+        current = float(getattr(args, "threshold_min_top_decile_net_return", -999.0))
+        if current < 0.0:
+            args.threshold_min_top_decile_net_return = 0.0
+            changed = True
+    if "threshold_min_score_win_loss_gap" not in explicit_flags:
+        current = float(getattr(args, "threshold_min_score_win_loss_gap", -999.0))
+        if current < 0.0:
+            args.threshold_min_score_win_loss_gap = 0.0
+            changed = True
     return changed
 
 
@@ -519,6 +609,10 @@ def output_path_args():
         "baseline_report_out",
         "ranking_report_out",
         "threshold_diagnostics_out",
+        "candidate_artifact_out",
+        "walk_candidate_artifact_out",
+        "portfolio_ledger_out",
+        "walk_portfolio_ledger_out",
         "experiment_report_out",
         "run_summary_out",
         "experiment_summary_out",
@@ -648,6 +742,36 @@ def postprocess_output_files(args):
         value = getattr(args, name, "")
         if value:
             setattr(args, name, maybe_compress_file(value, args.output_compression))
+
+
+def write_candidate_artifact_created_files_inventory(args):
+    entries = []
+    for label, value in (
+        ("fixed_candidate_artifact", getattr(args, "candidate_artifact_out", "")),
+        ("walk_candidate_artifact", getattr(args, "walk_candidate_artifact_out", "")),
+    ):
+        if not value:
+            continue
+        entries.append((label, value))
+        entries.append((label + "_manifest", artifact_contracts.manifest_path_for(value)))
+    if not entries:
+        return {}
+    output_dirs = [
+        os.path.dirname(os.path.abspath(value))
+        for _, value in entries
+        if value and os.path.exists(value)
+    ]
+    if getattr(args, "results_dir", ""):
+        output_dir = os.path.abspath(args.results_dir)
+    elif output_dirs:
+        output_dir = output_dirs[0]
+    else:
+        output_dir = os.getcwd()
+    inventory_path = os.path.join(output_dir, "candidate_artifact_created_files.csv")
+    summary = created_file_inventory.write_inventory(inventory_path, entries)
+    if summary.get("path"):
+        print("Candidate artifact created-files inventory: {}".format(summary["path"]), flush=True)
+    return summary
 
 
 def resolve_cache_dir(path, cache_dir):
@@ -1530,6 +1654,65 @@ def ranker_score_value(bundle, index):
     if values is None:
         return 0.0
     return float(values[index])
+
+
+def ranker_utility_score_value(bundle, index):
+    values = bundle.get("ranker_utility_score")
+    if values is None:
+        return 0.0
+    value = float(values[index])
+    return value if math.isfinite(value) else 0.0
+
+
+def ranker_selection_score_value(bundle, index, fallback_score=None):
+    values = bundle.get("ranker_selection_score")
+    if values is None:
+        return ranker_score_value(bundle, index) if fallback_score is None else float(fallback_score)
+    value = float(values[index])
+    if not math.isfinite(value):
+        return ranker_score_value(bundle, index) if fallback_score is None else float(fallback_score)
+    return value
+
+
+def ranker_threshold_score_mode(args):
+    return str(getattr(args, "ranker_threshold_score", "raw") or "raw")
+
+
+def ranker_threshold_scores_for_bundle(bundle, args):
+    raw_scores = bundle.get("ranker_score")
+    if ranker_threshold_score_mode(args) != "selection":
+        return raw_scores
+    selection_scores = bundle.get("ranker_selection_score")
+    if selection_scores is None:
+        return raw_scores
+    if raw_scores is None:
+        return selection_scores
+    if np is not None:
+        selected = np.asarray(selection_scores, dtype=np.float32).copy()
+        raw = np.asarray(raw_scores, dtype=np.float32)
+        if len(selected) == len(raw):
+            invalid = ~np.isfinite(selected)
+            if np.any(invalid):
+                selected[invalid] = raw[invalid]
+        return selected
+    return [
+        float(selection) if math.isfinite(float(selection)) else float(raw)
+        for selection, raw in zip(selection_scores, raw_scores)
+    ]
+
+
+def ranker_threshold_score_value(bundle, index, args, fallback_score=None):
+    if ranker_threshold_score_mode(args) == "selection":
+        return ranker_selection_score_value(bundle, index, fallback_score)
+    return ranker_score_value(bundle, index) if fallback_score is None else float(fallback_score)
+
+
+def selection_score_value(bundle, index, score_name, fallback_score=None):
+    if score_name in ("ranker_score", "economic_rank_score"):
+        return ranker_selection_score_value(bundle, index, fallback_score)
+    if fallback_score is not None:
+        return float(fallback_score)
+    return trade_score_value(bundle, index, score_name, 0.0, 0.0, 0.0, 0.0)
 
 
 def ranker_score_upper_quantile(args):
@@ -2528,6 +2711,8 @@ def recalibrate_meta_filter_validation(rows, bundle, threshold, args, selection,
         getattr(args, "threshold_max_trade_top1_concentration", 0.0),
         getattr(args, "threshold_concentration_cap_mode", "soft"),
         getattr(args, "threshold_diversity_penalty_weight", 0.0),
+        threshold_cost_stress_multiplier=getattr(args, "threshold_cost_stress_multiplier", 1.0),
+        threshold_cost_stress_weight=getattr(args, "threshold_cost_stress_weight", 0.0),
     )
     trade_count = int(meta_selection["validation_metrics"].get("predicted_trades", 0))
     raw_signal_count = int(meta_selection["validation_metrics"].get("raw_signal_trades", 0))
@@ -2580,6 +2765,7 @@ def compact_signal_indices_for_bundle(rows, bundle, threshold, objective_mode="c
         predicted_returns = maybe_float32_array(bundle.get("raw_predicted_trade_return"))
     predicted_uncertainty = maybe_float32_array(bundle.get("predicted_return_uncertainty"))
     ranker_scores = maybe_float32_array(bundle.get("ranker_score"))
+    ranker_threshold_scores = maybe_float32_array(ranker_threshold_scores_for_bundle(bundle, hybrid_runtime_args))
     ranker_upper_cap = (
         (
             float(ranker_score_upper_cap)
@@ -2628,13 +2814,13 @@ def compact_signal_indices_for_bundle(rows, bundle, threshold, objective_mode="c
                 continue
             mask = (predicted_returns[start:end] - fee - slippage) >= minimum_predicted
         elif objective_mode == "economic_ranking":
-            if ranker_scores is None:
+            if ranker_threshold_scores is None:
                 continue
             if threshold_array is not None:
-                mask = ranker_scores[start:end] >= threshold_array[start:end]
+                mask = ranker_threshold_scores[start:end] >= threshold_array[start:end]
             else:
-                mask = ranker_scores[start:end] >= scalar_threshold
-            if ranker_upper_cap is not None:
+                mask = ranker_threshold_scores[start:end] >= scalar_threshold
+            if ranker_upper_cap is not None and ranker_scores is not None:
                 mask &= ranker_scores[start:end] <= np.float32(ranker_upper_cap + 1e-12)
         else:
             if calibrated_values is None or (predicted_returns is None and hybrid_requires_predicted_return):
@@ -2680,7 +2866,9 @@ def threshold_for_mode(args):
 def build_prediction_bundle(probability=None, calibrated_probability=None, predicted_trade_return=None,
                             raw_predicted_trade_return=None, predicted_return_uncertainty=None,
                             meta_probability=None, ev_context=None, hybrid_return_context=None,
-                            uncertainty_context=None, ranker_score=None):
+                            uncertainty_context=None, ranker_score=None,
+                            ranker_utility_score=None,
+                            ranker_selection_score=None):
     return {
         "probability": probability,
         "calibrated_probability": calibrated_probability,
@@ -2688,6 +2876,8 @@ def build_prediction_bundle(probability=None, calibrated_probability=None, predi
         "raw_predicted_trade_return": raw_predicted_trade_return,
         "predicted_return_uncertainty": predicted_return_uncertainty,
         "ranker_score": ranker_score,
+        "ranker_utility_score": ranker_utility_score,
+        "ranker_selection_score": ranker_selection_score,
         "meta_probability": meta_probability,
         "ev_context": ev_context,
         "hybrid_return_context": hybrid_return_context,
@@ -2696,9 +2886,7 @@ def build_prediction_bundle(probability=None, calibrated_probability=None, predi
 
 
 def bundle_length(bundle):
-    for key in ("probability", "calibrated_probability", "predicted_trade_return",
-                "raw_predicted_trade_return", "predicted_return_uncertainty",
-                "ranker_score", "meta_probability"):
+    for key in PREDICTION_BUNDLE_VALUE_KEYS:
         values = bundle.get(key)
         if values is not None:
             return len(values)
@@ -3539,17 +3727,19 @@ def score_values_for_bundle(rows, bundle, args):
             return predicted.astype(np.float32, copy=False) - np.float32(fee_slippage)
         return [float(value) - fee_slippage for value in predicted]
     if args.objective_mode == "economic_ranking":
-        scores = bundle.get("ranker_score")
-        upper_cap = ranker_score_upper_cap_from_scores(scores, ranker_score_upper_quantile(args))
-        if upper_cap is None:
+        scores = ranker_threshold_scores_for_bundle(bundle, args)
+        raw_scores = bundle.get("ranker_score")
+        upper_cap = ranker_score_upper_cap_from_scores(raw_scores, ranker_score_upper_quantile(args))
+        if upper_cap is None or raw_scores is None:
             return scores
-        if np is not None and isinstance(scores, np.ndarray):
+        if np is not None and (isinstance(scores, np.ndarray) or isinstance(raw_scores, np.ndarray)):
             capped_scores = np.asarray(scores, dtype=np.float32).copy()
-            capped_scores[capped_scores > np.float32(float(upper_cap) + 1e-12)] = -np.inf
+            raw_array = np.asarray(raw_scores, dtype=np.float32)
+            capped_scores[raw_array > np.float32(float(upper_cap) + 1e-12)] = -np.inf
             return capped_scores
         return [
-            float(value) if not ranker_score_above_upper_cap(float(value), upper_cap) else -float("inf")
-            for value in scores
+            float(value) if not ranker_score_above_upper_cap(float(raw_value), upper_cap) else -float("inf")
+            for value, raw_value in zip(scores, raw_scores)
         ]
     probabilities = bundle["calibrated_probability"] if bundle.get("calibrated_probability") is not None else bundle.get("probability")
     predicted = bundle.get("predicted_trade_return")
@@ -3910,8 +4100,8 @@ def make_row(item, feature_columns, month_index_lookup, text_cache, feature_stor
     if month_index is None:
         month_index = month_index_lookup.get((symbol, month))
     if month_index is None:
-        month_index = int(safe_float(item.get("month_index"), 0.0))
-    raw_open_time = int(safe_float(item.get("open_time"), 0.0))
+        month_index = required_int(item.get("month_index"), "month_index")
+    raw_open_time = required_int(item.get("open_time"), "open_time")
     open_time = normalize_open_time_ms(raw_open_time)
     if open_time != raw_open_time:
         NORMALIZED_MICROSECOND_OPEN_TIMES += 1
@@ -4056,8 +4246,8 @@ def load_compact_rows(path, feature_storage="matrix32", memmap_dir=None, feature
 
             symbol_codes[row_index] = symbol_code
             month_codes[row_index] = month_code
-            month_indices[row_index] = int(safe_float(csv_value(fields, positions, "month_index"), 0.0))
-            raw_open_time = int(safe_float(csv_value(fields, positions, "open_time"), 0.0))
+            month_indices[row_index] = required_int(csv_value(fields, positions, "month_index"), "month_index")
+            raw_open_time = required_int(csv_value(fields, positions, "open_time"), "open_time")
             normalized_open_time = normalize_open_time_ms(raw_open_time)
             if normalized_open_time != raw_open_time:
                 NORMALIZED_MICROSECOND_OPEN_TIMES += 1
@@ -5298,6 +5488,107 @@ def feature_values_or_default(rows, name, default=0.0):
     return [default] * len(rows)
 
 
+TRADE_REGIME_FILTER_CHOICES = [
+    "none",
+    "btc_positive",
+    "market_positive",
+    "btc_or_market_positive",
+    "btc_and_market_positive",
+    "breadth_positive",
+    "market_positive_breadth_positive",
+]
+
+
+def trade_regime_filter_mode(args):
+    return str(getattr(args, "trade_regime_filter", "none") if args is not None else "none")
+
+
+def trade_regime_breadth_threshold(args):
+    return float(getattr(args, "trade_regime_breadth_threshold", 0.5) if args is not None else 0.5)
+
+
+def trade_regime_filter_allows_values(mode, btc_return, market_return, breadth, breadth_threshold=0.5):
+    if mode == "none":
+        return True
+    btc_positive = float(btc_return) > 0.0
+    market_positive = float(market_return) > 0.0
+    breadth_positive = float(breadth) >= float(breadth_threshold)
+    if mode == "btc_positive":
+        return btc_positive
+    if mode == "market_positive":
+        return market_positive
+    if mode == "btc_or_market_positive":
+        return btc_positive or market_positive
+    if mode == "btc_and_market_positive":
+        return btc_positive and market_positive
+    if mode == "breadth_positive":
+        return breadth_positive
+    if mode == "market_positive_breadth_positive":
+        return market_positive and breadth_positive
+    return True
+
+
+def trade_regime_filter_allows(rows, index, args):
+    mode = trade_regime_filter_mode(args)
+    if mode == "none":
+        return True
+    btc_return = feature_value(
+        rows,
+        index,
+        "btc_return_240m",
+        feature_value(rows, index, "btc_return_60m", 0.0),
+    )
+    market_return = feature_value(rows, index, "market_average_return_60m", 0.0)
+    breadth = feature_value(rows, index, "market_breadth_up_60m", 0.0)
+    return trade_regime_filter_allows_values(
+        mode,
+        btc_return,
+        market_return,
+        breadth,
+        trade_regime_breadth_threshold(args),
+    )
+
+
+def trade_regime_filter_signal_indices(rows, signal_indices, args):
+    mode = trade_regime_filter_mode(args)
+    if mode == "none" or np is None or len(signal_indices) == 0:
+        return signal_indices, 0
+    indices = np.asarray(signal_indices, dtype=np.int64)
+    row_count = len(indices)
+
+    def selected_feature(name):
+        values = row_feature_array(rows, name)
+        if values is None:
+            return None
+        return np.asarray(values)[indices]
+
+    btc_returns = selected_feature("btc_return_240m")
+    if btc_returns is None:
+        btc_returns = selected_feature("btc_return_60m")
+    market_returns = selected_feature("market_average_return_60m")
+    breadth_values = selected_feature("market_breadth_up_60m")
+    zeros = np.zeros(row_count, dtype=np.float32)
+    btc_positive = (btc_returns if btc_returns is not None else zeros) > 0.0
+    market_positive = (market_returns if market_returns is not None else zeros) > 0.0
+    breadth_positive = (breadth_values if breadth_values is not None else zeros) >= np.float32(trade_regime_breadth_threshold(args))
+    if mode == "btc_positive":
+        allowed = btc_positive
+    elif mode == "market_positive":
+        allowed = market_positive
+    elif mode == "btc_or_market_positive":
+        allowed = btc_positive | market_positive
+    elif mode == "btc_and_market_positive":
+        allowed = btc_positive & market_positive
+    elif mode == "breadth_positive":
+        allowed = breadth_positive
+    elif mode == "market_positive_breadth_positive":
+        allowed = market_positive & breadth_positive
+    else:
+        return signal_indices, 0
+    blocked = int(row_count - int(np.count_nonzero(allowed)))
+    return np.asarray(signal_indices)[allowed], blocked
+
+
 def regression_target_name(args):
     return getattr(args, "regression_target", "trade_return")
 
@@ -5368,9 +5659,23 @@ def ranker_total_cost(args, slippage_multiplier=1.0):
     )
 
 
+def ranker_utility_target_margin(args):
+    margin = safe_float(getattr(args, "ranker_utility_target_margin", 0.0), 0.0)
+    if not math.isfinite(margin):
+        return 0.0
+    return max(0.0, margin)
+
+
+def ranker_min_calibration_top_bin_utility(args):
+    minimum = safe_float(getattr(args, "ranker_min_calibration_top_bin_utility", 0.0), 0.0)
+    if not math.isfinite(minimum):
+        return 0.0
+    return float(minimum)
+
+
 def ranker_net_utility_values(rows, args, slippage_multiplier=1.0):
     trade_returns = actual_trade_returns(rows)
-    cost = ranker_total_cost(args, slippage_multiplier)
+    cost = ranker_total_cost(args, slippage_multiplier) + ranker_utility_target_margin(args)
     adverse_penalty = max(0.0, float(getattr(args, "ranker_adverse_penalty", 0.0)))
     if np is not None and isinstance(trade_returns, np.ndarray):
         utilities = trade_returns.astype(np.float32, copy=True) - np.float32(cost)
@@ -5386,6 +5691,314 @@ def ranker_net_utility_values(rows, args, slippage_multiplier=1.0):
             for index, value in enumerate(utilities)
         ]
     return utilities
+
+
+def disabled_ranker_selection_calibration(reason, args=None):
+    return {
+        "mode": getattr(args, "ranker_selection_calibration", "none") if args is not None else "none",
+        "enabled": False,
+        "disabled_reason": reason,
+        "rows": 0,
+        "bins": [],
+        "global_avg_utility": 0.0,
+        "positive_utility_rate": 0.0,
+        "shrinkage": float(getattr(args, "ranker_selection_calibration_shrinkage", 0.0)) if args is not None else 0.0,
+        "top_bin_rejected": False,
+        "top_bin_rejection_floor": ranker_min_calibration_top_bin_utility(args) if args is not None else 0.0,
+        "top_bin_rejection_reason": "",
+    }
+
+
+def ranker_calibration_top_bin_rejection_info(bins, args):
+    floor = ranker_min_calibration_top_bin_utility(args)
+    if not bool(getattr(args, "ranker_reject_negative_calibration_top_bin", False)):
+        return {
+            "top_bin_rejected": False,
+            "top_bin_rejection_floor": floor,
+            "top_bin_rejection_reason": "",
+        }
+    if not bins:
+        return {
+            "top_bin_rejected": False,
+            "top_bin_rejection_floor": floor,
+            "top_bin_rejection_reason": "empty_bins",
+        }
+    top_bin = bins[-1]
+    avg_utility = safe_float(top_bin.get("avg_utility", 0.0), 0.0)
+    calibrated_utility = safe_float(top_bin.get("calibrated_utility", avg_utility), avg_utility)
+    if avg_utility < floor and calibrated_utility < floor:
+        reason = "top_bin_avg_and_score_under_floor"
+    elif avg_utility < floor:
+        reason = "top_bin_avg_utility_under_floor"
+    elif calibrated_utility < floor:
+        reason = "top_bin_score_under_floor"
+    else:
+        reason = ""
+    return {
+        "top_bin_rejected": bool(reason),
+        "top_bin_rejection_floor": floor,
+        "top_bin_rejection_reason": reason,
+    }
+
+
+def fit_ranker_selection_calibration(rows, bundle, args):
+    mode = getattr(args, "ranker_selection_calibration", "none")
+    if mode == "none":
+        return disabled_ranker_selection_calibration("disabled", args)
+    if getattr(args, "objective_mode", "classification") != "economic_ranking":
+        return disabled_ranker_selection_calibration("objective_not_economic_ranking", args)
+    if mode != "score_bucket":
+        return disabled_ranker_selection_calibration("unknown_mode", args)
+    raw_scores = bundle.get("ranker_score")
+    if raw_scores is None:
+        return disabled_ranker_selection_calibration("missing_ranker_score", args)
+    min_rows = max(1, int(getattr(args, "ranker_selection_calibration_min_rows", 200)))
+    requested_bins = max(2, int(getattr(args, "ranker_selection_calibration_bins", 20)))
+    shrinkage = max(0.0, float(getattr(args, "ranker_selection_calibration_shrinkage", 50.0)))
+    utilities = ranker_net_utility_values(rows, args, getattr(args, "validation_slippage_multiplier", 1.0))
+    if np is not None:
+        score_array = np.asarray(raw_scores, dtype=np.float32)
+        utility_array = np.asarray(utilities, dtype=np.float32)
+        if len(score_array) != len(utility_array):
+            return disabled_ranker_selection_calibration("length_mismatch", args)
+        finite_mask = np.isfinite(score_array) & np.isfinite(utility_array)
+        finite_count = int(np.count_nonzero(finite_mask))
+        if finite_count < min_rows:
+            result = disabled_ranker_selection_calibration("not_enough_rows", args)
+            result["rows"] = finite_count
+            return result
+        scores = score_array[finite_mask]
+        utility_values = utility_array[finite_mask]
+        order = np.argsort(scores, kind="mergesort")
+        sorted_scores = scores[order]
+        sorted_utilities = utility_values[order]
+        row_count = int(len(sorted_scores))
+        bin_count = min(requested_bins, row_count)
+        global_avg = float(np.mean(sorted_utilities)) if row_count else 0.0
+        positive_rate = float(np.mean(sorted_utilities > 0.0)) if row_count else 0.0
+        bins = []
+        for bin_index in range(bin_count):
+            start = (bin_index * row_count) // bin_count
+            end = ((bin_index + 1) * row_count) // bin_count
+            if end <= start:
+                continue
+            segment_scores = sorted_scores[start:end]
+            segment_utilities = sorted_utilities[start:end]
+            segment_count = int(end - start)
+            segment_sum = float(np.sum(segment_utilities))
+            avg_utility = segment_sum / float(segment_count)
+            calibrated_utility = (
+                (segment_sum + shrinkage * global_avg) / float(segment_count + shrinkage)
+                if segment_count + shrinkage > 0.0 else avg_utility
+            )
+            bins.append({
+                "lower_score": float(segment_scores[0]),
+                "upper_score": float(segment_scores[-1]),
+                "rows": segment_count,
+                "avg_utility": avg_utility,
+                "calibrated_utility": float(calibrated_utility),
+                "positive_utility_rate": float(np.mean(segment_utilities > 0.0)) if segment_count else 0.0,
+            })
+    else:
+        paired = []
+        for index, raw_score in enumerate(raw_scores):
+            if index >= len(utilities):
+                break
+            score = safe_float(raw_score, float("nan"))
+            utility = safe_float(utilities[index], float("nan"))
+            if math.isfinite(score) and math.isfinite(utility):
+                paired.append((score, utility))
+        if len(paired) < min_rows:
+            result = disabled_ranker_selection_calibration("not_enough_rows", args)
+            result["rows"] = len(paired)
+            return result
+        paired.sort(key=lambda item: item[0])
+        row_count = len(paired)
+        bin_count = min(requested_bins, row_count)
+        global_avg = sum(item[1] for item in paired) / float(row_count)
+        positive_rate = sum(1 for _, utility in paired if utility > 0.0) / float(row_count)
+        bins = []
+        for bin_index in range(bin_count):
+            start = (bin_index * row_count) // bin_count
+            end = ((bin_index + 1) * row_count) // bin_count
+            if end <= start:
+                continue
+            segment = paired[start:end]
+            segment_count = len(segment)
+            segment_sum = sum(item[1] for item in segment)
+            avg_utility = segment_sum / float(segment_count)
+            calibrated_utility = (
+                (segment_sum + shrinkage * global_avg) / float(segment_count + shrinkage)
+                if segment_count + shrinkage > 0.0 else avg_utility
+            )
+            bins.append({
+                "lower_score": float(segment[0][0]),
+                "upper_score": float(segment[-1][0]),
+                "rows": segment_count,
+                "avg_utility": avg_utility,
+                "calibrated_utility": float(calibrated_utility),
+                "positive_utility_rate": sum(1 for _, utility in segment if utility > 0.0) / float(segment_count),
+            })
+    if not bins:
+        result = disabled_ranker_selection_calibration("empty_bins", args)
+        result["rows"] = int(len(rows))
+        return result
+    rejection_info = ranker_calibration_top_bin_rejection_info(bins, args)
+    return {
+        "mode": mode,
+        "enabled": True,
+        "disabled_reason": "",
+        "rows": int(sum(int(item.get("rows", 0)) for item in bins)),
+        "bins": bins,
+        "global_avg_utility": float(global_avg),
+        "positive_utility_rate": float(positive_rate),
+        "shrinkage": shrinkage,
+        **rejection_info,
+    }
+
+
+def apply_ranker_selection_calibration(scores, calibration):
+    if scores is None or not calibration or not calibration.get("enabled"):
+        return None
+    bins = calibration.get("bins") or []
+    if not bins:
+        return None
+    global_avg = float(calibration.get("global_avg_utility", 0.0))
+    upper_bounds = [float(item.get("upper_score", 0.0)) for item in bins]
+    bin_values = [float(item.get("calibrated_utility", global_avg)) for item in bins]
+    if np is not None:
+        score_array = np.asarray(scores, dtype=np.float32)
+        result = np.empty(score_array.shape, dtype=np.float32)
+        finite_mask = np.isfinite(score_array)
+        result[~finite_mask] = np.float32(global_avg)
+        if np.any(finite_mask):
+            bounds = np.asarray(upper_bounds, dtype=np.float32)
+            values = np.asarray(bin_values, dtype=np.float32)
+            positions = np.searchsorted(bounds, score_array[finite_mask], side="left")
+            positions = np.clip(positions, 0, len(values) - 1)
+            result[finite_mask] = values[positions]
+        return result
+    result = []
+    for raw_score in scores:
+        score = safe_float(raw_score, float("nan"))
+        if not math.isfinite(score):
+            result.append(global_avg)
+            continue
+        position = bisect.bisect_left(upper_bounds, score)
+        if position < 0:
+            position = 0
+        if position >= len(bin_values):
+            position = len(bin_values) - 1
+        result.append(bin_values[position])
+    return result
+
+
+def rank_selection_score_with_utility_blend(scores, calibration, utility_scores, args):
+    calibrated_scores = apply_ranker_selection_calibration(scores, calibration)
+    if calibrated_scores is None:
+        return None
+    blend = max(0.0, min(1.0, float(getattr(args, "ranker_utility_regression_blend", 0.0))))
+    if blend <= 0.0 or utility_scores is None:
+        return calibrated_scores
+    if np is not None:
+        calibrated_array = np.asarray(calibrated_scores, dtype=np.float32)
+        utility_array = np.asarray(utility_scores, dtype=np.float32)
+        if len(calibrated_array) != len(utility_array):
+            return calibrated_scores
+        finite_utility = np.isfinite(utility_array)
+        utility_array = np.where(finite_utility, utility_array, np.float32(0.0))
+        return (
+            calibrated_array.astype(np.float32, copy=False) * np.float32(1.0 - blend)
+            + utility_array.astype(np.float32, copy=False) * np.float32(blend)
+        ).astype(np.float32, copy=False)
+    if len(calibrated_scores) != len(utility_scores):
+        return calibrated_scores
+    blended = []
+    for calibrated, utility in zip(calibrated_scores, utility_scores):
+        calibrated_value = safe_float(calibrated, 0.0)
+        utility_value = safe_float(utility, 0.0)
+        if not math.isfinite(utility_value):
+            utility_value = 0.0
+        blended.append(calibrated_value * (1.0 - blend) + utility_value * blend)
+    return blended
+
+
+def ranker_selection_calibration_rejects_top_bin(calibration, args):
+    if not calibration or not calibration.get("enabled"):
+        return False
+    if bool(calibration.get("top_bin_rejected", False)):
+        return True
+    return bool(ranker_calibration_top_bin_rejection_info(calibration.get("bins") or [], args).get("top_bin_rejected", False))
+
+
+def rejected_ranker_selection_scores_like(scores):
+    if scores is None:
+        return None
+    if np is not None:
+        score_array = np.asarray(scores, dtype=np.float32)
+        return np.full(score_array.shape, -np.inf, dtype=np.float32)
+    return [-float("inf") for _ in scores]
+
+
+def rank_selection_score_with_calibration_gate(scores, calibration, utility_scores, args):
+    if ranker_selection_calibration_rejects_top_bin(calibration, args):
+        return rejected_ranker_selection_scores_like(scores)
+    return rank_selection_score_with_utility_blend(scores, calibration, utility_scores, args)
+
+
+def ranker_selection_calibration_metrics(calibration):
+    calibration = calibration or {}
+    bins = calibration.get("bins") or []
+    top_bin = bins[-1] if bins else {}
+    bottom_bin = bins[0] if bins else {}
+    return {
+        "ranker_selection_calibration": calibration.get("mode", "none"),
+        "ranker_selection_calibration_enabled": 1 if calibration.get("enabled") else 0,
+        "ranker_selection_calibration_rows": int(calibration.get("rows", 0) or 0),
+        "ranker_selection_calibration_bins": len(bins),
+        "ranker_selection_calibration_global_avg_utility": float(calibration.get("global_avg_utility", 0.0) or 0.0),
+        "ranker_selection_calibration_positive_utility_rate": float(calibration.get("positive_utility_rate", 0.0) or 0.0),
+        "ranker_selection_calibration_top_bin_avg_utility": float(top_bin.get("avg_utility", 0.0) or 0.0),
+        "ranker_selection_calibration_top_bin_score": float(top_bin.get("calibrated_utility", 0.0) or 0.0),
+        "ranker_selection_calibration_bottom_bin_avg_utility": float(bottom_bin.get("avg_utility", 0.0) or 0.0),
+        "ranker_selection_calibration_disabled_reason": calibration.get("disabled_reason", ""),
+        "ranker_selection_calibration_top_bin_rejected": 1 if calibration.get("top_bin_rejected") else 0,
+        "ranker_selection_calibration_top_bin_rejection_floor": float(calibration.get("top_bin_rejection_floor", 0.0) or 0.0),
+        "ranker_selection_calibration_top_bin_rejection_reason": calibration.get("top_bin_rejection_reason", ""),
+    }
+
+
+def clip_ranker_utility_values(values, args):
+    clip_min = float(getattr(args, "ranker_utility_regression_clip_min", -0.03))
+    clip_max = float(getattr(args, "ranker_utility_regression_clip_max", 0.05))
+    if clip_min > clip_max:
+        clip_min, clip_max = clip_max, clip_min
+    if np is not None and isinstance(values, np.ndarray):
+        return np.clip(values.astype(np.float32, copy=False), np.float32(clip_min), np.float32(clip_max)).astype(np.float32, copy=False)
+    return [max(clip_min, min(clip_max, float(value))) for value in values]
+
+
+def ranker_label_distribution_metrics(labels):
+    if np is not None and isinstance(labels, np.ndarray):
+        total = int(len(labels))
+        counts = {label: int(np.sum(labels == label)) for label in range(5)}
+    else:
+        total = len(labels)
+        counts = {label: 0 for label in range(5)}
+        for label in labels:
+            numeric = int(label)
+            if 0 <= numeric <= 4:
+                counts[numeric] += 1
+    relevant = total - counts.get(0, 0)
+    return {
+        "ranker_label_0_rows": counts.get(0, 0),
+        "ranker_label_1_rows": counts.get(1, 0),
+        "ranker_label_2_rows": counts.get(2, 0),
+        "ranker_label_3_rows": counts.get(3, 0),
+        "ranker_label_4_rows": counts.get(4, 0),
+        "ranker_relevant_rows": relevant,
+        "ranker_relevant_row_share": float(relevant) / float(total) if total else 0.0,
+    }
 
 
 def finite_sorted(values):
@@ -5435,8 +6048,8 @@ def fit_ranker_relevance_context(rows, args):
         strong = max(useful, quantile_from_sorted(ordered_positive, float(getattr(args, "ranker_relevance_q3", 0.90))))
     else:
         weak, useful, strong = 0.0, 0.0, 0.0
-    return {
-        "mode": "train_quantiles",
+    context = {
+        "mode": getattr(args, "ranker_relevance_mode", "train_quantiles"),
         "utility_rows": utility_count,
         "positive_utility_rows": positive_count,
         "zero_threshold": 0.0,
@@ -5446,36 +6059,50 @@ def fit_ranker_relevance_context(rows, args):
         "fee": resolve_execution_fee(getattr(args, "fee", 0.0), args),
         "slippage": float(getattr(args, "slippage", 0.0)) * float(getattr(args, "validation_slippage_multiplier", 1.0)),
         "latency_penalty": max(0.0, float(getattr(args, "latency_penalty_bps", 0.0))) / 10000.0,
+        "ranker_utility_target_margin": ranker_utility_target_margin(args),
         "adverse_penalty": max(0.0, float(getattr(args, "ranker_adverse_penalty", 0.0))),
     }
+    context.update(ranker_label_distribution_metrics(ranker_relevance_labels_from_utilities(utilities, context)))
+    return context
 
 
 def ranker_relevance_labels_from_utilities(utilities, context):
     weak = float(context.get("weak_positive_threshold", 0.0))
     useful = float(context.get("useful_positive_threshold", weak))
     strong = float(context.get("strong_positive_threshold", useful))
+    mode = context.get("mode", "train_quantiles")
+    if mode == "utility_tail" and int(context.get("positive_utility_rows", 1)) <= 0:
+        if np is not None and isinstance(utilities, np.ndarray):
+            return np.zeros(len(utilities), dtype=np.int32)
+        return [0 for _ in utilities]
     if np is not None and isinstance(utilities, np.ndarray):
         labels_array = np.zeros(len(utilities), dtype=np.int32)
-        positive_mask = utilities > 0.0
-        labels_array[positive_mask] = 1
-        weak_mask = positive_mask & (utilities >= weak)
-        useful_mask = positive_mask & (utilities >= useful)
-        strong_mask = positive_mask & (utilities >= strong)
+        if mode == "utility_tail":
+            weak_mask = utilities >= weak
+        else:
+            positive_mask = utilities > 0.0
+            labels_array[positive_mask] = 1
+            weak_mask = positive_mask & (utilities >= weak)
+        labels_array[weak_mask] = np.maximum(labels_array[weak_mask], 1)
+        useful_mask = weak_mask & (utilities >= useful)
+        strong_mask = weak_mask & (utilities >= strong)
         labels_array[weak_mask] = np.maximum(labels_array[weak_mask], 2)
         labels_array[useful_mask] = np.maximum(labels_array[useful_mask], 3)
         labels_array[strong_mask] = np.maximum(labels_array[strong_mask], 4)
+        if mode == "utility_tail":
+            labels_array[weak_mask & (utilities < useful)] = 1
         return labels_array
     labels_list = []
     for value in utilities:
         numeric = float(value)
         label = 0
-        if numeric > 0.0:
+        if mode != "utility_tail" and numeric > 0.0:
             label = 1
-        if numeric > 0.0 and numeric >= weak:
-            label = max(label, 2)
-        if numeric > 0.0 and numeric >= useful:
+        if numeric >= weak and (mode == "utility_tail" or numeric > 0.0):
+            label = max(label, 1 if mode == "utility_tail" else 2)
+        if numeric >= useful and (mode == "utility_tail" or numeric > 0.0):
             label = max(label, 3)
-        if numeric > 0.0 and numeric >= strong:
+        if numeric >= strong and (mode == "utility_tail" or numeric > 0.0):
             label = max(label, 4)
         labels_list.append(label)
     return labels_list
@@ -5805,11 +6432,18 @@ def recent_calibration_mask(rows, args):
     if keep_count >= row_count:
         return None
     if np is not None:
+        open_times = np.asarray(row_open_time_array(rows), dtype=np.int64)
         mask = np.zeros(row_count, dtype=bool)
-        mask[-keep_count:] = True
+        order = np.lexsort((np.arange(row_count, dtype=np.int64), open_times))
+        mask[order[-keep_count:]] = True
         return mask
     mask = [False] * row_count
-    for index in range(row_count - keep_count, row_count):
+    open_times = row_open_time_array(rows)
+    selected_indices = sorted(
+        range(row_count),
+        key=lambda index: (int(open_times[index]), index),
+    )[-keep_count:]
+    for index in selected_indices:
         mask[index] = True
     return mask
 
@@ -6031,6 +6665,29 @@ def evaluate_acceptance_tier(summary, tier):
     return failures
 
 
+def exploration_acceptance_failures(summary, args):
+    failures = []
+    active_rate_floor = float(getattr(args, "min_active_profitable_fold_rate", 0.50))
+    active_rate = float(summary.get("active_profitable_fold_rate", 0.0))
+    if active_rate < active_rate_floor:
+        failures.append("active_profitable_fold_rate {:.4f} < {:.4f}".format(active_rate, active_rate_floor))
+
+    median_floor = float(getattr(args, "min_median_fold_return", -999.0))
+    if median_floor < -998.0:
+        median_floor = 0.0
+    median_return = float(summary.get("walkforward_median_portfolio_return", 0.0))
+    if median_return < median_floor:
+        failures.append("median_portfolio_return {:.4f} < {:.4f}".format(median_return, median_floor))
+
+    min_trades = int(getattr(args, "min_walkforward_total_trades", 0) or 0)
+    if min_trades <= 0:
+        min_trades = int(getattr(args, "robust_min_trades", 0) or 0)
+    total_trades = int(summary.get("walkforward_total_predicted_trades", 0) or 0)
+    if min_trades > 0 and total_trades < min_trades:
+        failures.append("walkforward_total_predicted_trades {} < {}".format(total_trades, min_trades))
+    return failures
+
+
 def walkforward_acceptance_summary(records, args):
     fold_records = [row for row in records if str(row.get("split", "")).startswith("walkforward_fold_")]
     overactive_threshold = int(getattr(args, "overactive_trade_threshold", 150))
@@ -6185,6 +6842,8 @@ def walkforward_acceptance_summary(records, args):
 
     if acceptance_tier != "none":
         failures = evaluate_acceptance_tier(summary, args.acceptance_tier)
+        if args.acceptance_tier == "exploration":
+            failures.extend(exploration_acceptance_failures(summary, args))
         if failures:
             summary["accepted"] = 0
             summary["failed_acceptance_checks"] = "; ".join(failures)
@@ -6213,15 +6872,74 @@ def resolved_walkforward_summary(walk_records, args):
     return summary
 
 
+def fixed_model_acceptance_failures(fixed_record, args):
+    if not fixed_record:
+        return []
+    if getattr(args, "acceptance_tier", "none") == "none" and not getattr(args, "require_positive_walkforward", False):
+        return []
+    failures = []
+    status = str(fixed_record.get("threshold_selection_status", "") or "")
+    threshold_is_valid = int(float(fixed_record.get("threshold_is_valid", 1) or 0))
+    selected_threshold = safe_float(fixed_record.get("selected_threshold"), 0.0)
+    selected_validation_trades = int(float(
+        fixed_record.get(
+            "selected_validation_trade_count",
+            fixed_record.get("validation_predicted_trades", 0),
+        ) or 0
+    ))
+    tie_reason = str(fixed_record.get("selected_threshold_tie_rank_reason", "") or "")
+    inferred_no_valid = (
+        status == THRESHOLD_STATUS_NO_VALID
+        or threshold_is_valid <= 0
+        or (selected_validation_trades <= 0 and (
+            tie_reason == "no_trade_fallback"
+            or selected_threshold >= no_trade_threshold_for_mode(fixed_record.get("objective_mode", "")) - 1e-12
+        ))
+    )
+    if inferred_no_valid:
+        failures.append(THRESHOLD_STATUS_NO_VALID)
+
+    min_validation_trades = int(getattr(args, "min_validation_trades", 0) or 0)
+    if selected_validation_trades <= 0:
+        failures.append("zero_validation_trades")
+    elif min_validation_trades > 0 and selected_validation_trades < min_validation_trades:
+        failures.append("validation_trades {} < {}".format(selected_validation_trades, min_validation_trades))
+
+    fixed_test_trades = int(float(fixed_record.get("predicted_trades", 0) or 0))
+    min_fixed_trades = int(getattr(args, "min_fixed_test_trades", 1) or 0)
+    if fixed_test_trades <= 0:
+        failures.append("zero_fixed_test_trades")
+    elif min_fixed_trades > 0 and fixed_test_trades < min_fixed_trades:
+        failures.append("fixed_test_trades {} < {}".format(fixed_test_trades, min_fixed_trades))
+    return failures
+
+
+def combine_acceptance_failures(existing, extra):
+    parts = [part.strip() for part in str(existing or "").split(";") if part.strip()]
+    for item in extra:
+        text = str(item).strip()
+        if text and text not in parts:
+            parts.append(text)
+    return "; ".join(parts)
+
+
 def resolved_run_acceptance(fixed_record, walkforward_summary, args):
     source = walkforward_summary if getattr(args, "walk_forward", False) else (fixed_record or {})
-    return {
+    result = {
         "acceptance_tier": source.get("acceptance_tier", getattr(args, "acceptance_tier", "none")),
         "accepted": int(source.get("accepted", 1)),
         "failed_acceptance_checks": source.get("failed_acceptance_checks", ""),
         "rejection_reason": source.get("rejection_reason", ""),
         "strategy_strength": source.get("strategy_strength", "not_checked"),
     }
+    fixed_failures = fixed_model_acceptance_failures(fixed_record, args)
+    if fixed_failures:
+        combined = combine_acceptance_failures(result.get("failed_acceptance_checks", ""), fixed_failures)
+        result["accepted"] = 0
+        result["failed_acceptance_checks"] = combined
+        result["rejection_reason"] = combine_acceptance_failures(result.get("rejection_reason", ""), fixed_failures)
+        result["strategy_strength"] = "rejected"
+    return result
 
 
 def preferred_ranking_source_for_summary(summary, args):
@@ -6387,7 +7105,9 @@ def resolved_calibration_summary(calibration_rows, calibration_summary, fixed_re
     if len(calibration_rows) == 1:
         skipped_reason = str(calibration_rows[0].get("skipped_reason", "")).strip()
     if skipped_reason not in ("prediction_output_missing", "prediction_output_empty"):
-        return calibration_summary
+        result = dict(calibration_summary)
+        result.setdefault("calibration_report_skipped_reason", "")
+        return result
     source = aggregate or fixed_record or {}
     return {
         "brier_score": safe_float(source.get("brier_score"), calibration_summary.get("brier_score", 0.0)),
@@ -6399,6 +7119,7 @@ def resolved_calibration_summary(calibration_rows, calibration_summary, fixed_re
             source.get("max_calibration_error"),
             calibration_summary.get("max_calibration_error", 0.0),
         ),
+        "calibration_report_skipped_reason": skipped_reason,
     }
 
 
@@ -6437,6 +7158,30 @@ def single_month_label(rows):
     if len(months) == 1:
         return months[0]
     return "{}..{}".format(months[0], months[-1])
+
+
+EXECUTION_AUDIT_METRIC_KEYS = [
+    "execution_chronological_processing",
+    "execution_chronological_sort_applied",
+    "execution_chronological_audit_status",
+    "execution_input_candidate_count",
+    "execution_input_time_decrease_count",
+    "execution_input_max_backward_minutes",
+    "execution_bucket_count",
+    "max_execution_bucket_size",
+    "max_execution_bucket_executed_count",
+    "topk_bucket_count",
+    "max_topk_bucket_size",
+    "max_topk_bucket_ranked_count",
+    "max_topk_bucket_selected_count",
+    "topk_bucket_limit_violation_count",
+    "max_same_timestamp_executed_trades",
+    "max_concurrent_positions",
+    "max_simultaneous_capital",
+    "max_capital_usage_fraction",
+    "max_capital_usage_pct_initial",
+    "capital_overallocated_count",
+]
 
 
 WALKFORWARD_DIAGNOSTIC_COLUMNS = [
@@ -6512,6 +7257,7 @@ WALKFORWARD_DIAGNOSTIC_COLUMNS = [
     "portfolio_profit",
     "portfolio_return",
     "max_capital_drawdown",
+    *EXECUTION_AUDIT_METRIC_KEYS,
     "profit_factor",
     "worst_trade",
     "average_position_size",
@@ -6535,8 +7281,28 @@ WALKFORWARD_DIAGNOSTIC_COLUMNS = [
     "ranker_score_upper_quantile",
     "ranker_score_upper_cap",
     "ranker_score_upper_cap_blocked",
+    "ranker_threshold_score",
+    "ranker_utility_target_margin",
+    "ranker_selection_calibration",
+    "ranker_selection_calibration_enabled",
+    "ranker_selection_calibration_rows",
+    "ranker_selection_calibration_bins",
+    "ranker_selection_calibration_global_avg_utility",
+    "ranker_selection_calibration_positive_utility_rate",
+    "ranker_selection_calibration_top_bin_avg_utility",
+    "ranker_selection_calibration_top_bin_score",
+    "ranker_selection_calibration_bottom_bin_avg_utility",
+    "ranker_selection_calibration_disabled_reason",
+    "ranker_selection_calibration_top_bin_rejected",
+    "ranker_selection_calibration_top_bin_rejection_floor",
+    "ranker_selection_calibration_top_bin_rejection_reason",
     "selected_base_objective_score",
     "selected_penalized_objective_score",
+    "selected_validation_cost_stress_multiplier",
+    "selected_validation_cost_stress_score",
+    "selected_validation_cost_stress_portfolio_profit",
+    "selected_validation_cost_stress_extra_cost_drag",
+    "selected_cost_stress_penalty_total",
     "selected_validation_trade_count",
     "selected_validation_raw_signal_count",
     "selected_validation_portfolio_profit",
@@ -6599,6 +7365,13 @@ WALKFORWARD_DIAGNOSTIC_COLUMNS = [
     "hybrid_gate_rows_above_configured_floor",
     "hybrid_gate_rows_above_effective_floor",
     "hybrid_gate_rows_between_effective_and_configured_floor",
+    "score_edge_value_name",
+    "score_edge_units",
+    "score_edge_floor",
+    "score_edge_candidate_count_before",
+    "score_edge_candidate_count_after",
+    "score_edge_removal_pct",
+    "score_edge_removed_all_candidates",
     "hybrid_score_mode",
     "hybrid_uncertainty_method",
     "hybrid_uncertainty_penalty",
@@ -6695,6 +7468,20 @@ def build_walkforward_diagnostic_record(fold_index, split_name, train_rows, vali
         "selected_score_threshold": validation_metrics.get("selected_score_threshold", selected_threshold),
         "selected_ev_safety_margin": metrics.get("selected_ev_safety_margin", 0.0),
         "selected_objective_score": validation_metrics.get("selected_objective_score", selected_score),
+        "ranker_utility_target_margin": calibration_info.get("ranker_utility_target_margin", getattr(args, "ranker_utility_target_margin", 0.0)),
+        "ranker_selection_calibration": calibration_info.get("ranker_selection_calibration", validation_metrics.get("ranker_selection_calibration", "none")),
+        "ranker_selection_calibration_enabled": calibration_info.get("ranker_selection_calibration_enabled", validation_metrics.get("ranker_selection_calibration_enabled", 0)),
+        "ranker_selection_calibration_rows": calibration_info.get("ranker_selection_calibration_rows", validation_metrics.get("ranker_selection_calibration_rows", 0)),
+        "ranker_selection_calibration_bins": calibration_info.get("ranker_selection_calibration_bins", validation_metrics.get("ranker_selection_calibration_bins", 0)),
+        "ranker_selection_calibration_global_avg_utility": calibration_info.get("ranker_selection_calibration_global_avg_utility", validation_metrics.get("ranker_selection_calibration_global_avg_utility", 0.0)),
+        "ranker_selection_calibration_positive_utility_rate": calibration_info.get("ranker_selection_calibration_positive_utility_rate", validation_metrics.get("ranker_selection_calibration_positive_utility_rate", 0.0)),
+        "ranker_selection_calibration_top_bin_avg_utility": calibration_info.get("ranker_selection_calibration_top_bin_avg_utility", validation_metrics.get("ranker_selection_calibration_top_bin_avg_utility", 0.0)),
+        "ranker_selection_calibration_top_bin_score": calibration_info.get("ranker_selection_calibration_top_bin_score", validation_metrics.get("ranker_selection_calibration_top_bin_score", 0.0)),
+        "ranker_selection_calibration_bottom_bin_avg_utility": calibration_info.get("ranker_selection_calibration_bottom_bin_avg_utility", validation_metrics.get("ranker_selection_calibration_bottom_bin_avg_utility", 0.0)),
+        "ranker_selection_calibration_disabled_reason": calibration_info.get("ranker_selection_calibration_disabled_reason", validation_metrics.get("ranker_selection_calibration_disabled_reason", "")),
+        "ranker_selection_calibration_top_bin_rejected": calibration_info.get("ranker_selection_calibration_top_bin_rejected", validation_metrics.get("ranker_selection_calibration_top_bin_rejected", 0)),
+        "ranker_selection_calibration_top_bin_rejection_floor": calibration_info.get("ranker_selection_calibration_top_bin_rejection_floor", validation_metrics.get("ranker_selection_calibration_top_bin_rejection_floor", 0.0)),
+        "ranker_selection_calibration_top_bin_rejection_reason": calibration_info.get("ranker_selection_calibration_top_bin_rejection_reason", validation_metrics.get("ranker_selection_calibration_top_bin_rejection_reason", "")),
         "calibration": calibration_info.get("calibration", "none"),
         "calibration_a": calibration_info.get("calibration_a", 0.0),
         "calibration_b": calibration_info.get("calibration_b", 0.0),
@@ -6717,6 +7504,9 @@ def build_walkforward_diagnostic_record(fold_index, split_name, train_rows, vali
         "average_gross_return_before_costs": metrics.get("average_gross_return_before_costs", 0.0),
         "average_net_return_after_costs": metrics.get("average_net_return_after_costs", 0.0),
         "average_cost_drag_per_trade": metrics.get("average_cost_drag_per_trade", 0.0),
+        "total_fee_amount": metrics.get("total_fee_amount", 0.0),
+        "total_slippage_amount": metrics.get("total_slippage_amount", 0.0),
+        "total_latency_cost_amount": metrics.get("total_latency_cost_amount", 0.0),
         "total_cost_drag": metrics.get("total_cost_drag", 0.0),
         "executed_winning_trade_count": metrics.get("executed_winning_trade_count", 0),
         "executed_losing_trade_count": metrics.get("executed_losing_trade_count", 0),
@@ -6731,6 +7521,29 @@ def build_walkforward_diagnostic_record(fold_index, split_name, train_rows, vali
         "portfolio_profit": portfolio_profit,
         "portfolio_return": metrics.get("portfolio_return", 0.0),
         "max_capital_drawdown": metrics.get("max_capital_drawdown", 0.0),
+        "candidate_artifact_path": metrics.get("candidate_artifact_path", ""),
+        "candidate_artifact_rows": metrics.get("candidate_artifact_rows", 0),
+        "candidate_artifact_file_size": metrics.get("candidate_artifact_file_size", 0),
+        "candidate_artifact_complete": metrics.get("candidate_artifact_complete", 0),
+        "candidate_artifact_full_coverage": metrics.get("candidate_artifact_full_coverage", 0),
+        "drawdown_precision": metrics.get("drawdown_precision", "legacy_approximate"),
+        "exact_realized_drawdown": metrics.get("exact_realized_drawdown", 0.0),
+        "exact_mark_to_market_drawdown": metrics.get("exact_mark_to_market_drawdown", 0.0),
+        "mark_to_market_drawdown_available": metrics.get("mark_to_market_drawdown_available", 0),
+        "portfolio_ledger_path": metrics.get("portfolio_ledger_path", ""),
+        "portfolio_event_count": metrics.get("portfolio_event_count", 0),
+        "portfolio_reconciliation_status": metrics.get("portfolio_reconciliation_status", ""),
+        "portfolio_reconciliation_passed": metrics.get("portfolio_reconciliation_passed", 0),
+        "portfolio_reconciliation_failed": metrics.get("portfolio_reconciliation_failed", 0),
+        "maximum_capital_utilization": metrics.get("maximum_capital_utilization", 0.0),
+        "maximum_open_exposure": metrics.get("maximum_open_exposure", 0.0),
+        "maximum_per_symbol_exposure": metrics.get("maximum_per_symbol_exposure", 0.0),
+        "longest_underwater_duration_minutes": metrics.get("longest_underwater_duration_minutes", 0.0),
+        "time_to_recovery_minutes": metrics.get("time_to_recovery_minutes", 0.0),
+        **{
+            key: metrics.get(key, "" if key == "execution_chronological_audit_status" else 0.0)
+            for key in EXECUTION_AUDIT_METRIC_KEYS
+        },
         "profit_factor": metrics.get("profit_factor", 0.0),
         "worst_trade": metrics.get("worst_trade", 0.0),
         "average_position_size": metrics.get("average_position_size", 0.0),
@@ -6754,8 +7567,20 @@ def build_walkforward_diagnostic_record(fold_index, split_name, train_rows, vali
         "ranker_score_upper_quantile": metrics.get("ranker_score_upper_quantile", getattr(args, "ranker_score_upper_quantile", 1.0)),
         "ranker_score_upper_cap": metrics.get("ranker_score_upper_cap", 0.0),
         "ranker_score_upper_cap_blocked": metrics.get("ranker_score_upper_cap_blocked", 0),
+        "ranker_threshold_score": ranker_threshold_score_mode(args),
         "selected_base_objective_score": validation_metrics.get("selected_base_objective_score", 0.0),
         "selected_penalized_objective_score": validation_metrics.get("selected_penalized_objective_score", selected_score),
+        "selected_validation_cost_stress_multiplier": validation_metrics.get("selected_validation_cost_stress_multiplier", 1.0),
+        "selected_validation_cost_stress_score": validation_metrics.get(
+            "selected_validation_cost_stress_score",
+            validation_metrics.get("selected_base_objective_score", 0.0),
+        ),
+        "selected_validation_cost_stress_portfolio_profit": validation_metrics.get(
+            "selected_validation_cost_stress_portfolio_profit",
+            validation_metrics.get("selected_validation_portfolio_profit", 0.0),
+        ),
+        "selected_validation_cost_stress_extra_cost_drag": validation_metrics.get("selected_validation_cost_stress_extra_cost_drag", 0.0),
+        "selected_cost_stress_penalty_total": validation_metrics.get("selected_cost_stress_penalty_total", 0.0),
         "selected_validation_trade_count": validation_metrics.get("selected_validation_trade_count", 0),
         "selected_validation_raw_signal_count": validation_metrics.get("selected_validation_raw_signal_count", 0),
         "selected_validation_portfolio_profit": validation_metrics.get("selected_validation_portfolio_profit", 0.0),
@@ -6825,6 +7650,13 @@ def build_walkforward_diagnostic_record(fold_index, split_name, train_rows, vali
         "hybrid_gate_rows_above_configured_floor": calibration_info.get("hybrid_gate_rows_above_configured_floor", validation_metrics.get("hybrid_gate_rows_above_configured_floor", 0)),
         "hybrid_gate_rows_above_effective_floor": calibration_info.get("hybrid_gate_rows_above_effective_floor", validation_metrics.get("hybrid_gate_rows_above_effective_floor", 0)),
         "hybrid_gate_rows_between_effective_and_configured_floor": calibration_info.get("hybrid_gate_rows_between_effective_and_configured_floor", validation_metrics.get("hybrid_gate_rows_between_effective_and_configured_floor", 0)),
+        "score_edge_value_name": calibration_info.get("score_edge_value_name", validation_metrics.get("score_edge_value_name", "")),
+        "score_edge_units": calibration_info.get("score_edge_units", validation_metrics.get("score_edge_units", "")),
+        "score_edge_floor": calibration_info.get("score_edge_floor", validation_metrics.get("score_edge_floor", 0.0)),
+        "score_edge_candidate_count_before": calibration_info.get("score_edge_candidate_count_before", validation_metrics.get("score_edge_candidate_count_before", 0)),
+        "score_edge_candidate_count_after": calibration_info.get("score_edge_candidate_count_after", validation_metrics.get("score_edge_candidate_count_after", 0)),
+        "score_edge_removal_pct": calibration_info.get("score_edge_removal_pct", validation_metrics.get("score_edge_removal_pct", 0.0)),
+        "score_edge_removed_all_candidates": calibration_info.get("score_edge_removed_all_candidates", validation_metrics.get("score_edge_removed_all_candidates", 0)),
         "hybrid_score_mode": calibration_info.get("hybrid_score_mode", getattr(args, "hybrid_score_mode", "basic")),
         "hybrid_uncertainty_method": calibration_info.get("hybrid_uncertainty_method", getattr(args, "hybrid_uncertainty_method", "none")),
         "hybrid_uncertainty_penalty": calibration_info.get("hybrid_uncertainty_penalty", getattr(args, "hybrid_uncertainty_penalty", 0.0)),
@@ -7182,6 +8014,19 @@ class RawKlineExecutionPriceSource(object):
                     continue
                 if open_price <= 0.0 or close_price <= 0.0:
                     continue
+                existing_candle = candles.get(open_time)
+                if existing_candle is not None:
+                    existing_open, existing_close = existing_candle
+                    if existing_open != open_price or existing_close != close_price:
+                        raise ValueError(
+                            "trailing_stop requires ordered future candle path; no shard/cache modification was performed. "
+                            "Conflicting duplicate raw kline candle for {} at {} under {}.".format(
+                                symbol,
+                                open_time,
+                                self.raw_kline_dir,
+                            )
+                        )
+                    continue
                 candles[open_time] = (open_price, close_price)
         if not candles:
             raise ValueError(
@@ -7207,11 +8052,11 @@ class RawKlineExecutionPriceSource(object):
                     self.raw_kline_dir,
                 )
             )
-        entry_open = float(entry_candle[0])
-        if entry_open <= 0.0:
+        entry_price = float(entry_candle[1])
+        if entry_price <= 0.0:
             raise ValueError(
                 "trailing_stop requires ordered future candle path; no shard/cache modification was performed. "
-                "Entry candle for {} at {} has non-positive open price.".format(
+                "Entry candle for {} at {} has non-positive close price.".format(
                     symbol,
                     entry_time,
                 )
@@ -7230,7 +8075,7 @@ class RawKlineExecutionPriceSource(object):
                         self.raw_kline_dir,
                     )
                 )
-            path.append(float(candle[1]) / entry_open - 1.0)
+            path.append(float(candle[1]) / entry_price - 1.0)
         return path
 
 
@@ -7403,8 +8248,21 @@ def candidate_rank(bucket, trade_selection, use_expected_value_ranking, top_k_pe
     validation_dominance_shares = validation_dominance_shares or {}
     if ranking_state is not None:
         ranking_state.setdefault("candidate_indices", set()).update(int(item[0]) for item in bucket)
+
+    def item_selection_score(item):
+        if use_expected_value_ranking:
+            return float(item[6])
+        if len(item) > 11:
+            value = float(item[11])
+            if trade_selection == "top_utility":
+                return value if math.isfinite(value) else -float("inf")
+            if math.isfinite(value):
+                return value
+        return float(item[7])
+
     def sort_key(item):
-        primary_score = float(item[6]) if use_expected_value_ranking else float(item[7])
+        primary_score = item_selection_score(item)
+        raw_trade_score = float(item[7])
         secondary_score = float(item[8])
         penalty = candidate_dominance_penalty(
             item,
@@ -7418,12 +8276,21 @@ def candidate_rank(bucket, trade_selection, use_expected_value_ranking, top_k_pe
             runtime_args,
         )
         adjustment = max(0.0, 1.0 - penalty)
-        adjusted_primary = primary_score * adjustment
-        adjusted_secondary = secondary_score * adjustment
+        adjusted_primary = primary_score * adjustment if math.isfinite(primary_score) else primary_score
+        adjusted_secondary = secondary_score * adjustment if math.isfinite(secondary_score) else secondary_score
         if ranking_state is not None:
             ranking_state.setdefault("dominance_penalty_by_index", {})[int(item[0])] = penalty
             ranking_state.setdefault("adjusted_score_by_index", {})[int(item[0])] = adjusted_primary
-        return (-adjusted_primary, -adjusted_secondary, -primary_score, -secondary_score)
+        return (-adjusted_primary, -adjusted_secondary, -primary_score, -raw_trade_score, -secondary_score)
+
+    def top_utility_floor():
+        if trade_selection != "top_utility":
+            return -float("inf")
+        if use_expected_value_ranking:
+            return max(0.0, float(getattr(runtime_args, "ev_safety_margin", 0.0) or 0.0))
+        return max(0.0, ranker_min_calibration_top_bin_utility(runtime_args))
+
+    utility_floor = top_utility_floor()
     if use_expected_value_ranking:
         ranked = sorted(bucket, key=sort_key)
     else:
@@ -7452,6 +8319,8 @@ def candidate_rank(bucket, trade_selection, use_expected_value_ranking, top_k_pe
         return True
 
     for item in ranked:
+        if trade_selection == "top_utility" and item_selection_score(item) < utility_floor:
+            continue
         symbol_name = item[3]
         if prefer_unique_symbols and chosen_symbols.get(symbol_name, 0) > 0:
             deferred.append(item)
@@ -7461,6 +8330,8 @@ def candidate_rank(bucket, trade_selection, use_expected_value_ranking, top_k_pe
             return chosen
 
     for item in deferred:
+        if trade_selection == "top_utility" and item_selection_score(item) < utility_floor:
+            continue
         try_choose(item)
         if limit > 0 and len(chosen) >= limit:
             break
@@ -7581,14 +8452,33 @@ def execution_stats_result(executed, executed_pnls, executed_minutes, executed_t
                            realized_pnl_by_day, exit_policy,
                            trailing_activation_return, trailing_drawdown,
                            stop_loss, max_holding_period_minutes,
-                           ranker_upper_quantile=1.0, ranker_upper_cap=None):
+                           ranker_upper_quantile=1.0, ranker_upper_cap=None,
+                           candidate_utility_metrics=None, execution_audit_metrics=None):
     portfolio_profit = cash - initial_capital
+    max_drawdown_amount = float(max_drawdown)
+    max_drawdown_fraction = (
+        max_drawdown_amount / float(initial_capital)
+        if float(initial_capital) > 0.0
+        else 0.0
+    )
     position_sizes = list(executed.values())
     exit_minute_values = [int(value) for value in executed_exit_minutes.values()]
     dynamic_trade_return_values = [float(value) for value in executed_dynamic_trade_returns.values()]
     fixed_trade_return_values = [float(value) for value in executed_fixed_horizon_trade_returns.values()]
     all_in_cost = max(0.0, float(effective_fee) + float(slippage) + float(latency_penalty))
     net_return_values = [value - all_in_cost for value in dynamic_trade_return_values]
+    total_position_size = sum(float(size) for size in position_sizes)
+    weighted_gross_return = 0.0
+    weighted_net_return = 0.0
+    if total_position_size > 0.0:
+        weighted_gross_return = sum(
+            float(executed.get(index, 0.0)) * float(executed_dynamic_trade_returns.get(index, 0.0))
+            for index in executed
+        ) / total_position_size
+        weighted_net_return = weighted_gross_return - all_in_cost
+    total_fee_amount = sum(float(size) * float(effective_fee) for size in position_sizes)
+    total_slippage_amount = sum(float(size) * float(slippage) for size in position_sizes)
+    total_latency_cost_amount = sum(float(size) * float(latency_penalty) for size in position_sizes)
     total_cost_drag = sum(float(size) * all_in_cost for size in position_sizes)
     winning_score_values = []
     losing_score_values = []
@@ -7639,6 +8529,8 @@ def execution_stats_result(executed, executed_pnls, executed_minutes, executed_t
         "executed_max_favorable_excursion_before_exit": executed_max_favorable_excursion_before_exit,
         "executed_max_adverse_excursion_before_exit": executed_max_adverse_excursion_before_exit,
         "raw_selected": raw_selected,
+        "raw_candidate_trade_scores": raw_candidate_trade_scores,
+        "ranked_candidate_trade_scores": ranked_candidate_trade_scores,
         "blocked_flags": blocked_flags or {},
         "blocked_by_symbol": blocked_by_symbol,
         "blocked_by_bucket": blocked_by_bucket,
@@ -7652,7 +8544,8 @@ def execution_stats_result(executed, executed_pnls, executed_minutes, executed_t
         "portfolio_return": portfolio_profit / initial_capital,
         "applied_fee": effective_fee,
         "position_sizing_mode": position_sizing_mode,
-        "max_capital_drawdown": max_drawdown,
+        "max_capital_drawdown": max_drawdown_fraction,
+        "max_capital_drawdown_amount": max_drawdown_amount,
         "average_position_size": sum(position_sizes) / len(position_sizes) if position_sizes else 0.0,
         "median_position_size": median(position_sizes),
         "min_position_size": min(position_sizes) if position_sizes else 0.0,
@@ -7673,6 +8566,7 @@ def execution_stats_result(executed, executed_pnls, executed_minutes, executed_t
         "same_symbol_streak_blocked": blocked_counts["same_symbol_streak_blocked"],
         "symbol_fold_share_blocked": blocked_counts["symbol_fold_share_blocked"],
         "symbol_minute_cap_blocked": blocked_counts["symbol_minute_cap_blocked"],
+        "regime_filter_blocked": blocked_counts["regime_filter_blocked"],
         "ranker_score_upper_quantile": float(ranker_upper_quantile),
         "ranker_score_upper_cap": float(ranker_upper_cap) if ranker_upper_cap is not None else 0.0,
         "ranker_score_upper_cap_blocked": blocked_counts["ranker_score_upper_cap_blocked"],
@@ -7699,6 +8593,7 @@ def execution_stats_result(executed, executed_pnls, executed_minutes, executed_t
             + blocked_counts["same_symbol_streak_blocked"]
             + blocked_counts["symbol_fold_share_blocked"]
             + blocked_counts["symbol_minute_cap_blocked"]
+            + blocked_counts["regime_filter_blocked"]
             + blocked_counts["ranker_score_upper_cap_blocked"]
         ),
         "blocked_by_trade_frequency": (
@@ -7729,7 +8624,12 @@ def execution_stats_result(executed, executed_pnls, executed_minutes, executed_t
         ) if dynamic_trade_return_values and fixed_trade_return_values else 0.0,
         "average_gross_return_before_costs": sum(dynamic_trade_return_values) / float(len(dynamic_trade_return_values)) if dynamic_trade_return_values else 0.0,
         "average_net_return_after_costs": sum(net_return_values) / float(len(net_return_values)) if net_return_values else 0.0,
+        "trade_weighted_average_gross_return_before_costs": weighted_gross_return,
+        "trade_weighted_average_net_return_after_costs": weighted_net_return,
         "average_cost_drag_per_trade": all_in_cost if position_sizes else 0.0,
+        "total_fee_amount": total_fee_amount,
+        "total_slippage_amount": total_slippage_amount,
+        "total_latency_cost_amount": total_latency_cost_amount,
         "total_cost_drag": total_cost_drag,
         "executed_winning_trade_count": len(winning_score_values),
         "executed_losing_trade_count": len(losing_score_values),
@@ -7741,6 +8641,8 @@ def execution_stats_result(executed, executed_pnls, executed_minutes, executed_t
         "losing_days": losing_days,
         "worst_day_profit": min(realized_day_profits) if realized_day_profits else 0.0,
         "best_day_profit": max(realized_day_profits) if realized_day_profits else 0.0,
+        **(execution_audit_metrics or {}),
+        **(candidate_utility_metrics or candidate_utility_diagnostic_defaults()),
         **score_distribution_summary(raw_candidate_trade_scores.values(), "raw_candidate_score"),
         **score_distribution_summary(ranked_candidate_trade_scores.values(), "ranked_candidate_score"),
         **score_distribution_summary(executed_trade_scores.values(), "executed_trade_score"),
@@ -7801,6 +8703,191 @@ def resolve_execution_fee(fee, args):
     return float(fee)
 
 
+CANDIDATE_UTILITY_METRIC_KEYS = [
+    "candidate_utility_count",
+    "candidate_utility_diagnostic_rows",
+    "candidate_utility_diagnostics_skipped",
+    "candidate_utility_diagnostics_max_rows",
+    "candidate_utility_diagnostics_sample_rate",
+    "candidate_avg_net_utility",
+    "candidate_positive_utility_count",
+    "candidate_positive_utility_share",
+    "candidate_ranked_positive_utility_count",
+    "candidate_executed_positive_utility_count",
+    "candidate_ranking_positive_utility_recall",
+    "candidate_positive_utility_recall",
+    "candidate_missed_positive_utility_count",
+    "candidate_rank_rejected_positive_utility_count",
+    "candidate_execution_rejected_positive_utility_count",
+    "candidate_missed_best_net_utility",
+    "candidate_missed_avg_net_utility",
+    "candidate_top_1pct_net_utility",
+    "candidate_top_decile_net_utility",
+    "candidate_high_score_loss_count",
+    "candidate_high_score_loss_share",
+    "candidate_high_score_loss_avg_net_utility",
+    "candidate_high_score_loss_total_net_utility",
+    "candidate_positive_score_avg",
+    "candidate_nonpositive_score_avg",
+    "candidate_score_positive_utility_gap",
+    "candidate_net_utility_count",
+    "candidate_net_utility_min",
+    "candidate_net_utility_p50",
+    "candidate_net_utility_p90",
+    "candidate_net_utility_max",
+    "executed_candidate_net_utility_count",
+    "executed_candidate_net_utility_min",
+    "executed_candidate_net_utility_p50",
+    "executed_candidate_net_utility_p90",
+    "executed_candidate_net_utility_max",
+    "rejected_candidate_net_utility_count",
+    "rejected_candidate_net_utility_min",
+    "rejected_candidate_net_utility_p50",
+    "rejected_candidate_net_utility_p90",
+    "rejected_candidate_net_utility_max",
+]
+
+
+def candidate_utility_diagnostic_defaults(candidate_count=0, max_rows=DEFAULT_CANDIDATE_UTILITY_DIAGNOSTIC_MAX_ROWS, skipped=0):
+    result = {
+        "candidate_utility_count": int(candidate_count),
+        "candidate_utility_diagnostic_rows": 0,
+        "candidate_utility_diagnostics_skipped": int(skipped),
+        "candidate_utility_diagnostics_max_rows": int(max_rows),
+        "candidate_utility_diagnostics_sample_rate": 0.0,
+        "candidate_avg_net_utility": 0.0,
+        "candidate_positive_utility_count": 0,
+        "candidate_positive_utility_share": 0.0,
+        "candidate_ranked_positive_utility_count": 0,
+        "candidate_executed_positive_utility_count": 0,
+        "candidate_ranking_positive_utility_recall": 0.0,
+        "candidate_positive_utility_recall": 0.0,
+        "candidate_missed_positive_utility_count": 0,
+        "candidate_rank_rejected_positive_utility_count": 0,
+        "candidate_execution_rejected_positive_utility_count": 0,
+        "candidate_missed_best_net_utility": 0.0,
+        "candidate_missed_avg_net_utility": 0.0,
+        "candidate_top_1pct_net_utility": 0.0,
+        "candidate_top_decile_net_utility": 0.0,
+        "candidate_high_score_loss_count": 0,
+        "candidate_high_score_loss_share": 0.0,
+        "candidate_high_score_loss_avg_net_utility": 0.0,
+        "candidate_high_score_loss_total_net_utility": 0.0,
+        "candidate_positive_score_avg": 0.0,
+        "candidate_nonpositive_score_avg": 0.0,
+        "candidate_score_positive_utility_gap": 0.0,
+    }
+    result.update(score_distribution_summary([], "candidate_net_utility"))
+    result.update(score_distribution_summary([], "executed_candidate_net_utility"))
+    result.update(score_distribution_summary([], "rejected_candidate_net_utility"))
+    return result
+
+
+def candidate_utility_diagnostics(rows, raw_candidate_trade_scores, ranked_candidate_trade_scores,
+                                  executed, effective_fee, slippage, latency_penalty,
+                                  hybrid_runtime_args=None):
+    candidate_count = len(raw_candidate_trade_scores or {})
+    max_rows = int(getattr(
+        hybrid_runtime_args,
+        "candidate_utility_diagnostic_max_rows",
+        DEFAULT_CANDIDATE_UTILITY_DIAGNOSTIC_MAX_ROWS,
+    )) if hybrid_runtime_args is not None else DEFAULT_CANDIDATE_UTILITY_DIAGNOSTIC_MAX_ROWS
+    max_rows = max(0, max_rows)
+    if candidate_count <= 0:
+        return candidate_utility_diagnostic_defaults(0, max_rows)
+    if max_rows > 0 and candidate_count > max_rows:
+        return candidate_utility_diagnostic_defaults(candidate_count, max_rows, skipped=1)
+
+    trade_returns = actual_trade_returns(rows)
+    total_cost = max(0.0, float(effective_fee) + float(slippage) + float(latency_penalty))
+    ranked_indices = set(int(index) for index in (ranked_candidate_trade_scores or {}))
+    executed_indices = set(int(index) for index in (executed or {}))
+    records = []
+    for local_index, score in (raw_candidate_trade_scores or {}).items():
+        local_index = int(local_index)
+        if local_index < 0 or local_index >= len(trade_returns):
+            continue
+        net_utility = float(trade_returns[local_index]) - total_cost
+        score_value = safe_float(score, float("nan"))
+        if not math.isfinite(net_utility):
+            continue
+        records.append((local_index, score_value, net_utility))
+    if not records:
+        return candidate_utility_diagnostic_defaults(candidate_count, max_rows)
+
+    positive = [item for item in records if item[2] > 0.0]
+    nonpositive = [item for item in records if item[2] <= 0.0]
+    positive_count = len(positive)
+    ranked_positive = [item for item in positive if item[0] in ranked_indices]
+    executed_positive = [item for item in positive if item[0] in executed_indices]
+    missed_positive = [item for item in positive if item[0] not in executed_indices]
+    rank_rejected_positive = [item for item in positive if item[0] not in ranked_indices]
+    execution_rejected_positive = [
+        item for item in positive
+        if item[0] in ranked_indices and item[0] not in executed_indices
+    ]
+    net_values = [item[2] for item in records]
+    executed_net_values = [item[2] for item in records if item[0] in executed_indices]
+    rejected_net_values = [item[2] for item in records if item[0] not in executed_indices]
+
+    scored = [item for item in records if math.isfinite(item[1])]
+    scored.sort(key=lambda item: item[1], reverse=True)
+    if scored:
+        top_1pct_count = max(1, int(math.ceil(len(scored) * 0.01)))
+        top_decile_count = max(1, int(math.ceil(len(scored) * 0.10)))
+        top_1pct = scored[:top_1pct_count]
+        top_decile = scored[:top_decile_count]
+        top_1pct_net = sum(item[2] for item in top_1pct) / float(len(top_1pct))
+        top_decile_net = sum(item[2] for item in top_decile) / float(len(top_decile))
+        high_score_losses = [item for item in top_decile if item[2] <= 0.0]
+    else:
+        top_decile = []
+        top_1pct_net = 0.0
+        top_decile_net = 0.0
+        high_score_losses = []
+
+    positive_scores = [item[1] for item in positive if math.isfinite(item[1])]
+    nonpositive_scores = [item[1] for item in nonpositive if math.isfinite(item[1])]
+    positive_score_avg = sum(positive_scores) / float(len(positive_scores)) if positive_scores else 0.0
+    nonpositive_score_avg = sum(nonpositive_scores) / float(len(nonpositive_scores)) if nonpositive_scores else 0.0
+    high_score_loss_total = sum(item[2] for item in high_score_losses)
+    result = {
+        "candidate_utility_count": candidate_count,
+        "candidate_utility_diagnostic_rows": len(records),
+        "candidate_utility_diagnostics_skipped": 0,
+        "candidate_utility_diagnostics_max_rows": max_rows,
+        "candidate_utility_diagnostics_sample_rate": float(len(records)) / float(candidate_count) if candidate_count else 0.0,
+        "candidate_avg_net_utility": sum(net_values) / float(len(net_values)) if net_values else 0.0,
+        "candidate_positive_utility_count": positive_count,
+        "candidate_positive_utility_share": float(positive_count) / float(len(records)) if records else 0.0,
+        "candidate_ranked_positive_utility_count": len(ranked_positive),
+        "candidate_executed_positive_utility_count": len(executed_positive),
+        "candidate_ranking_positive_utility_recall": float(len(ranked_positive)) / float(positive_count) if positive_count else 0.0,
+        "candidate_positive_utility_recall": float(len(executed_positive)) / float(positive_count) if positive_count else 0.0,
+        "candidate_missed_positive_utility_count": len(missed_positive),
+        "candidate_rank_rejected_positive_utility_count": len(rank_rejected_positive),
+        "candidate_execution_rejected_positive_utility_count": len(execution_rejected_positive),
+        "candidate_missed_best_net_utility": max([item[2] for item in missed_positive]) if missed_positive else 0.0,
+        "candidate_missed_avg_net_utility": (
+            sum(item[2] for item in missed_positive) / float(len(missed_positive))
+            if missed_positive else 0.0
+        ),
+        "candidate_top_1pct_net_utility": top_1pct_net,
+        "candidate_top_decile_net_utility": top_decile_net,
+        "candidate_high_score_loss_count": len(high_score_losses),
+        "candidate_high_score_loss_share": float(len(high_score_losses)) / float(len(top_decile)) if top_decile else 0.0,
+        "candidate_high_score_loss_avg_net_utility": high_score_loss_total / float(len(high_score_losses)) if high_score_losses else 0.0,
+        "candidate_high_score_loss_total_net_utility": high_score_loss_total,
+        "candidate_positive_score_avg": positive_score_avg,
+        "candidate_nonpositive_score_avg": nonpositive_score_avg,
+        "candidate_score_positive_utility_gap": positive_score_avg - nonpositive_score_avg if positive_scores and nonpositive_scores else 0.0,
+    }
+    result.update(score_distribution_summary(net_values, "candidate_net_utility"))
+    result.update(score_distribution_summary(executed_net_values, "executed_candidate_net_utility"))
+    result.update(score_distribution_summary(rejected_net_values, "rejected_candidate_net_utility"))
+    return result
+
+
 def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_capital,
                         max_position_fraction, max_volume_fraction, max_trades_per_period,
                         trade_period_minutes, holding_period_minutes,
@@ -7813,10 +8900,14 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
                         max_daily_drawdown=0.0, pause_after_drawdown_minutes=0,
                         capture_blocked_details=False,
                         hybrid_runtime_args=None,
-                        symbol_filter_info=None):
+                        symbol_filter_info=None,
+                        portfolio_event_recorder=None,
+                        portfolio_fold_id="",
+                        candidate_id_namespace=""):
     if initial_capital <= 0.0:
         raise ValueError("--initial-capital must be positive")
     bundle = normalize_prediction_bundle(predictions)
+    candidate_id_namespace = candidate_id_namespace or "portfolio"
     raw_selected = {}
     raw_candidate_trade_scores = {}
     ranked_candidate_trade_scores = {}
@@ -7860,6 +8951,7 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
         "same_symbol_streak_blocked": 0,
         "symbol_fold_share_blocked": 0,
         "symbol_minute_cap_blocked": 0,
+        "regime_filter_blocked": 0,
         "ranker_score_upper_cap_blocked": 0,
         "lot_size_adjusted": 0,
         "tick_size_adjusted": 0,
@@ -7877,6 +8969,20 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
     last_executed_symbol = None
     same_symbol_streak = 0
     fold_trade_count = 0
+    max_concurrent_positions = 0
+    max_simultaneous_capital = 0.0
+    max_capital_usage_fraction = 0.0
+    max_capital_usage_pct_initial = 0.0
+    capital_overallocated_count = 0
+    execution_bucket_count = 0
+    max_execution_bucket_size = 0
+    max_execution_bucket_executed_count = 0
+    topk_bucket_count = 0
+    max_topk_bucket_size = 0
+    max_topk_bucket_ranked_count = 0
+    max_topk_bucket_selected_count = 0
+    topk_bucket_limit_violation_count = 0
+    max_same_timestamp_executed_trades = 0
     ranking_state = {
         "candidate_indices": set(),
         "ranked_candidate_indices": set(),
@@ -7933,6 +9039,63 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
         if objective_mode == "economic_ranking"
         else None
     )
+    portfolio_event_sequence = 0
+    last_portfolio_event_timestamp = 0
+
+    def first_evaluation_minute():
+        if len(rows) <= 0:
+            return 0
+        try:
+            if is_compact_rows(rows):
+                position = 0 if rows.indices is None else int(rows.indices[0])
+                return open_time_minute(rows.table.open_times[position])
+            return open_time_minute(rows[0].open_time)
+        except Exception:
+            return 0
+
+    def emit_portfolio_event(event_type, timestamp, trade_id="", candidate_id="",
+                             symbol_name="", decision_timestamp="", entry_timestamp="",
+                             exit_timestamp="", position_notional=0.0, realized_pnl=0.0,
+                             unrealized_pnl=0.0, fee_amount=0.0, slippage_amount=0.0,
+                             latency_cost=0.0):
+        nonlocal portfolio_event_sequence, last_portfolio_event_timestamp
+        if portfolio_event_recorder is None:
+            return
+        timestamp = int(timestamp)
+        last_portfolio_event_timestamp = max(last_portfolio_event_timestamp, timestamp)
+        portfolio_event_recorder.record_event({
+            "event_sequence": portfolio_event_sequence,
+            "timestamp": timestamp,
+            "event_type": event_type,
+            "trade_id": trade_id,
+            "candidate_id": candidate_id,
+            "symbol": symbol_name,
+            "fold_id": portfolio_fold_id,
+            "decision_timestamp": decision_timestamp,
+            "entry_timestamp": entry_timestamp,
+            "exit_timestamp": exit_timestamp,
+            "position_quantity": "",
+            "position_notional": position_notional,
+            "entry_price": "",
+            "current_price": "",
+            "realized_pnl": realized_pnl,
+            "unrealized_pnl": unrealized_pnl,
+            "fee": fee_amount,
+            "slippage": slippage_amount,
+            "latency_cost": latency_cost,
+            "cash_balance": cash,
+            "reserved_capital": invested,
+            "total_open_exposure": invested,
+            "equity": cash + invested,
+            "concurrent_position_count": len(open_positions),
+        })
+        portfolio_event_sequence += 1
+
+    emit_portfolio_event(
+        "evaluation_start",
+        first_evaluation_minute(),
+        position_notional=0.0,
+    )
 
     def record_block(index, reason, symbol_name="", minute=None):
         blocked_counts[reason] += 1
@@ -7954,6 +9117,7 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
                 "blocked_by_fold_trade_limit": 0,
                 "blocked_by_daily_loss_limit": 0,
                 "blocked_by_daily_drawdown_limit": 0,
+                "blocked_by_regime_filter": 0,
             })
             if reason == "daily_trade_limit_blocked":
                 flags["blocked_by_daily_trade_limit"] = 1
@@ -7964,10 +9128,34 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
             elif reason == "daily_drawdown_limit_blocked":
                 flags["blocked_by_daily_drawdown_limit"] = 1
 
+    def record_regime_filter_block(index):
+        blocked_counts["regime_filter_blocked"] += 1
+        if capture_blocked_details:
+            flags = blocked_flags.setdefault(index, {
+                "blocked_by_daily_trade_limit": 0,
+                "blocked_by_fold_trade_limit": 0,
+                "blocked_by_daily_loss_limit": 0,
+                "blocked_by_daily_drawdown_limit": 0,
+                "blocked_by_regime_filter": 0,
+            })
+            flags["blocked_by_regime_filter"] = 1
+
     def release_positions(until_minute):
         nonlocal cash, invested, peak_equity, max_drawdown
         while open_positions and open_positions[0][0] <= until_minute:
-            release_minute, position_size, pnl, entry_day_id, symbol_name = heapq.heappop(open_positions)
+            (
+                release_minute,
+                local_index,
+                position_size,
+                pnl,
+                entry_day_id,
+                symbol_name,
+                entry_minute,
+                fee_amount,
+                slippage_amount,
+                latency_cost_amount,
+                candidate_id,
+            ) = heapq.heappop(open_positions)
             invested -= position_size
             cash += position_size + pnl
             day_id = entry_day_id if entry_day_id is not None else minute_day_id(release_minute)
@@ -7998,6 +9186,35 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
             equity = cash + invested
             peak_equity = max(peak_equity, equity)
             max_drawdown = max(max_drawdown, peak_equity - equity)
+            emit_portfolio_event(
+                "position_close",
+                release_minute,
+                trade_id=local_index,
+                candidate_id=candidate_id,
+                symbol_name=symbol_name,
+                decision_timestamp=entry_minute,
+                entry_timestamp=entry_minute,
+                exit_timestamp=release_minute,
+                position_notional=position_size,
+                realized_pnl=pnl,
+                fee_amount=fee_amount,
+                slippage_amount=slippage_amount,
+                latency_cost=latency_cost_amount,
+            )
+
+    def record_exposure():
+        nonlocal max_concurrent_positions, max_simultaneous_capital
+        nonlocal max_capital_usage_fraction, max_capital_usage_pct_initial
+        nonlocal capital_overallocated_count
+        equity = cash + invested
+        max_concurrent_positions = max(max_concurrent_positions, len(open_positions))
+        max_simultaneous_capital = max(max_simultaneous_capital, invested)
+        if initial_capital > 0.0:
+            max_capital_usage_pct_initial = max(max_capital_usage_pct_initial, invested / float(initial_capital))
+        if equity > 0.0:
+            max_capital_usage_fraction = max(max_capital_usage_fraction, invested / equity)
+        if cash < -1e-9 or (equity > 0.0 and invested > equity + 1e-9):
+            capital_overallocated_count += 1
 
     def position_size_multiplier(probability_value, threshold_value, expected_value, volatility_value):
         if position_sizing_mode == "confidence_weighted":
@@ -8026,7 +9243,7 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
             calibrated_probability,
             meta_probability,
             volatility_value,
-        ) = item
+        ) = item[:11]
         release_positions(minute)
         if meta_filter_active and meta_probability < meta_filter_min_probability:
             return False
@@ -8122,7 +9339,40 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
             blocked_counts["latency_penalty_adjusted"] += 1
         pnl = position_size * net_return
         release_minute = minute + int(exit_details["exit_minutes"])
-        heapq.heappush(open_positions, (release_minute, position_size, pnl, day_id, symbol_name))
+        fee_amount = position_size * effective_fee
+        slippage_amount = position_size * slippage
+        latency_cost_amount = position_size * latency_penalty
+        candidate_id = candidate_artifacts.deterministic_candidate_id(
+            candidate_id_namespace,
+            portfolio_fold_id,
+            local_index,
+            symbol_name,
+            open_time_value,
+        )
+        heapq.heappush(open_positions, (
+            release_minute,
+            local_index,
+            position_size,
+            pnl,
+            day_id,
+            symbol_name,
+            minute,
+            fee_amount,
+            slippage_amount,
+            latency_cost_amount,
+            candidate_id,
+        ))
+        record_exposure()
+        emit_portfolio_event(
+            "position_open",
+            minute,
+            trade_id=local_index,
+            candidate_id=candidate_id,
+            symbol_name=symbol_name,
+            decision_timestamp=minute,
+            entry_timestamp=minute,
+            position_notional=position_size,
+        )
         recent_entry_minutes.append(minute)
         recent_entry_minutes_by_symbol.setdefault(symbol_name, deque()).append(minute)
         if symbol_reentry_cooldown_minutes > 0:
@@ -8156,9 +9406,17 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
         return True
 
     def flush_bucket(bucket):
+        nonlocal execution_bucket_count, max_execution_bucket_size, max_execution_bucket_executed_count
+        nonlocal topk_bucket_count, max_topk_bucket_size, max_topk_bucket_ranked_count
+        nonlocal max_topk_bucket_selected_count, topk_bucket_limit_violation_count
+        nonlocal max_same_timestamp_executed_trades
         if not bucket:
             return
+        execution_bucket_count += 1
+        max_execution_bucket_size = max(max_execution_bucket_size, len(bucket))
         if trade_selection in ("topk_ev", "topk_score", "top_percent_score", "top_utility"):
+            topk_bucket_count += 1
+            max_topk_bucket_size = max(max_topk_bucket_size, len(bucket))
             if trade_selection == "top_percent_score":
                 top_percent = max(0.0, min(1.0, float(getattr(hybrid_runtime_args, "top_percent_per_period", 0.0))))
                 target_limit = int(math.ceil(len(bucket) * top_percent)) if top_percent > 0.0 else max(0, int(top_k_per_minute))
@@ -8182,6 +9440,7 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
                 limit_candidates=False,
                 mark_ranked=False,
             )
+            max_topk_bucket_ranked_count = max(max_topk_bucket_ranked_count, len(ranked))
             executed_in_bucket = 0
             for rank, item in enumerate(ranked, 1):
                 ranking_state["ranked_candidate_indices"].add(int(item[0]))
@@ -8190,20 +9449,36 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
                     executed_in_bucket += 1
                     if target_limit > 0 and executed_in_bucket >= target_limit:
                         break
+            max_topk_bucket_selected_count = max(max_topk_bucket_selected_count, executed_in_bucket)
+            max_execution_bucket_executed_count = max(max_execution_bucket_executed_count, executed_in_bucket)
+            max_same_timestamp_executed_trades = max(max_same_timestamp_executed_trades, executed_in_bucket)
+            if target_limit > 0 and executed_in_bucket > target_limit:
+                topk_bucket_limit_violation_count += 1
             return
 
         if objective_mode == "classification":
             ordered = sorted(bucket, key=lambda item: (-item[8], -item[7]))
         else:
-            ordered = sorted(bucket, key=lambda item: (-item[7], -item[8]))
+            def threshold_selection_score(item):
+                if len(item) > 11:
+                    value = float(item[11])
+                    if math.isfinite(value):
+                        return value
+                return float(item[7])
+            ordered = sorted(bucket, key=lambda item: (-threshold_selection_score(item), -item[7], -item[8]))
+        executed_in_bucket = 0
         for item in ordered:
             ranking_state["candidate_indices"].add(int(item[0]))
             ranking_state["ranked_candidate_indices"].add(int(item[0]))
             ranked_candidate_trade_scores[int(item[0])] = float(item[7])
-            execute_candidate(item, 1, 0)
+            if execute_candidate(item, 1, 0):
+                executed_in_bucket += 1
+        max_execution_bucket_executed_count = max(max_execution_bucket_executed_count, executed_in_bucket)
+        max_same_timestamp_executed_trades = max(max_same_timestamp_executed_trades, executed_in_bucket)
 
     current_minute = None
     current_bucket = []
+    pending_candidates = []
 
     def push_candidate(item):
         nonlocal current_minute, current_bucket
@@ -8224,13 +9499,14 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
         if objective_mode != "economic_ranking" or ranker_upper_cap is None or np is None:
             return
         ranker_values = maybe_float32_array(bundle.get("ranker_score"))
-        if ranker_values is None:
+        threshold_values_source = maybe_float32_array(ranker_threshold_scores_for_bundle(bundle, hybrid_runtime_args))
+        if ranker_values is None or threshold_values_source is None:
             return
         if isinstance(threshold, list) or isinstance(threshold, tuple) or isinstance(threshold, np.ndarray):
             threshold_values = np.asarray(threshold, dtype=np.float32)
-            lower_mask = ranker_values >= threshold_values
+            lower_mask = threshold_values_source >= threshold_values
         else:
-            lower_mask = ranker_values >= np.float32(float(threshold))
+            lower_mask = threshold_values_source >= np.float32(float(threshold))
         upper_mask = ranker_values > np.float32(float(ranker_upper_cap) + 1e-12)
         blocked_counts["ranker_score_upper_cap_blocked"] += int(np.count_nonzero(lower_mask & upper_mask))
 
@@ -8259,6 +9535,12 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
                 hybrid_runtime_args=hybrid_runtime_args,
                 ranker_score_upper_cap=ranker_upper_cap,
             )
+            signal_indices, regime_filter_blocked = trade_regime_filter_signal_indices(
+                rows,
+                signal_indices,
+                hybrid_runtime_args,
+            )
+            blocked_counts["regime_filter_blocked"] += int(regime_filter_blocked)
             if rows.indices is None:
                 absolute_positions = signal_indices
             else:
@@ -8274,6 +9556,7 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
                     predicted_returns = maybe_float32_array(bundle.get("raw_predicted_trade_return"))
                 predicted_uncertainty = maybe_float32_array(bundle.get("predicted_return_uncertainty"))
                 ranker_scores = maybe_float32_array(bundle.get("ranker_score"))
+                ranker_selection_scores = maybe_float32_array(bundle.get("ranker_selection_score"))
                 if calibrated_values is not None:
                     selected_calibrated = calibrated_values[signal_indices].astype(np.float32, copy=False)
                     selected_expected_values = score_batch_ev(
@@ -8318,6 +9601,12 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
                         selected_trade_scores = ranker_scores[signal_indices].astype(np.float32, copy=False)
                 else:
                     raise ValueError("unknown trade score: {}".format(trade_score_name))
+                if trade_score_name in ("ranker_score", "economic_rank_score") and ranker_selection_scores is not None:
+                    selected_selection_scores = ranker_selection_scores[signal_indices].astype(np.float32, copy=False)
+                elif objective_mode == "economic_ranking" and trade_selection == "top_utility":
+                    selected_selection_scores = np.full(len(signal_indices), -np.inf, dtype=np.float32)
+                else:
+                    selected_selection_scores = selected_trade_scores
 
                 for offset, local_index in enumerate(signal_indices):
                     local_index = int(local_index)
@@ -8326,7 +9615,7 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
                         continue
                     raw_selected[local_index] = 1
                     position = int(absolute_positions[offset])
-                    push_candidate((
+                    pending_candidates.append((
                         local_index,
                         int(signal_minutes[offset]),
                         int(signal_day_ids[offset]),
@@ -8338,6 +9627,7 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
                         float(selected_calibrated[offset]),
                         meta_probability_value(bundle, local_index),
                         feature_value(rows, local_index, "rolling_volatility_60m", feature_value(rows, local_index, "btc_volatility_60m", 0.0)),
+                        float(selected_selection_scores[offset]),
                     ))
         else:
             for local_index in range(len(rows)):
@@ -8352,7 +9642,8 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
                         continue
                 elif objective_mode == "economic_ranking":
                     score = ranker_score_value(bundle, local_index)
-                    if not ranker_entry_threshold_passes(local_index, score):
+                    threshold_score = ranker_threshold_score_value(bundle, local_index, hybrid_runtime_args, score)
+                    if not ranker_entry_threshold_passes(local_index, threshold_score):
                         continue
                     if ranker_score_above_upper_cap(score, ranker_upper_cap):
                         position = local_index if rows.indices is None else int(rows.indices[local_index])
@@ -8366,11 +9657,14 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
                     continue
                 if allowed_symbols is not None and row_symbol_name(rows, local_index) not in allowed_symbols:
                     continue
+                if not trade_regime_filter_allows(rows, local_index, hybrid_runtime_args):
+                    record_regime_filter_block(local_index)
+                    continue
                 position = local_index if rows.indices is None else int(rows.indices[local_index])
                 minute = open_time_minute(rows.table.open_times[position])
                 symbol_name = row_symbol_name(rows, local_index)
                 raw_selected[local_index] = 1
-                push_candidate((
+                pending_candidates.append((
                     int(local_index),
                     minute,
                     minute_day_id(minute),
@@ -8382,6 +9676,16 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
                     calibrated_probability_value(bundle, local_index),
                     meta_probability_value(bundle, local_index),
                     feature_value(rows, local_index, "rolling_volatility_60m", feature_value(rows, local_index, "btc_volatility_60m", 0.0)),
+                    (
+                        -float("inf")
+                        if objective_mode == "economic_ranking" and trade_selection == "top_utility" and bundle.get("ranker_selection_score") is None
+                        else selection_score_value(
+                            bundle,
+                            local_index,
+                            trade_score_name,
+                            trade_score_value(bundle, local_index, trade_score_name, upside_target, downside_stop, fee, slippage, hybrid_score_mode, hybrid_uncertainty_penalty, hybrid_runtime_args),
+                        )
+                    ),
                 ))
     else:
         for local_index in range(len(rows)):
@@ -8396,7 +9700,8 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
                     continue
             elif objective_mode == "economic_ranking":
                 score = ranker_score_value(bundle, local_index)
-                if not ranker_entry_threshold_passes(local_index, score):
+                threshold_score = ranker_threshold_score_value(bundle, local_index, hybrid_runtime_args, score)
+                if not ranker_entry_threshold_passes(local_index, threshold_score):
                     continue
                 if ranker_score_above_upper_cap(score, ranker_upper_cap):
                     minute = open_time_minute(rows[local_index].open_time)
@@ -8409,10 +9714,13 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
                 continue
             if allowed_symbols is not None and row_symbol_name(rows, local_index) not in allowed_symbols:
                 continue
+            if not trade_regime_filter_allows(rows, local_index, hybrid_runtime_args):
+                record_regime_filter_block(local_index)
+                continue
             minute = open_time_minute(rows[local_index].open_time)
             symbol_name = row_symbol_name(rows, local_index)
             raw_selected[local_index] = 1
-            push_candidate((
+            pending_candidates.append((
                 local_index,
                 minute,
                 minute_day_id(minute),
@@ -8424,11 +9732,76 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
                 calibrated_probability_value(bundle, local_index),
                 meta_probability_value(bundle, local_index),
                 feature_value(rows, local_index, "rolling_volatility_60m", feature_value(rows, local_index, "btc_volatility_60m", 0.0)),
+                (
+                    -float("inf")
+                    if objective_mode == "economic_ranking" and trade_selection == "top_utility" and bundle.get("ranker_selection_score") is None
+                    else selection_score_value(
+                        bundle,
+                        local_index,
+                        trade_score_name,
+                        trade_score_value(bundle, local_index, trade_score_name, upside_target, downside_stop, fee, slippage, hybrid_score_mode, hybrid_uncertainty_penalty, hybrid_runtime_args),
+                    )
+                ),
             ))
 
+    execution_input_time_decrease_count = 0
+    execution_input_max_backward_minutes = 0
+    previous_input_minute = None
+    for item in pending_candidates:
+        minute = int(item[1])
+        if previous_input_minute is not None and minute < previous_input_minute:
+            execution_input_time_decrease_count += 1
+            execution_input_max_backward_minutes = max(execution_input_max_backward_minutes, previous_input_minute - minute)
+        previous_input_minute = minute
+    if not pending_candidates:
+        chronological_audit_status = "no_candidates"
+    elif execution_input_time_decrease_count:
+        chronological_audit_status = "sorted_nonmonotonic_input"
+    else:
+        chronological_audit_status = "already_chronological"
+
+    for item in sorted(pending_candidates, key=lambda candidate: (int(candidate[1]), int(candidate[0]))):
+        push_candidate(item)
     flush_bucket(current_bucket)
 
     release_positions(sys.maxsize)
+    emit_portfolio_event(
+        "evaluation_end",
+        last_portfolio_event_timestamp,
+        position_notional=0.0,
+    )
+    execution_audit_metrics = {
+        "execution_chronological_processing": 1,
+        "execution_chronological_sort_applied": 1 if pending_candidates else 0,
+        "execution_chronological_audit_status": chronological_audit_status,
+        "execution_input_candidate_count": len(pending_candidates),
+        "execution_input_time_decrease_count": execution_input_time_decrease_count,
+        "execution_input_max_backward_minutes": execution_input_max_backward_minutes,
+        "execution_bucket_count": execution_bucket_count,
+        "max_execution_bucket_size": max_execution_bucket_size,
+        "max_execution_bucket_executed_count": max_execution_bucket_executed_count,
+        "topk_bucket_count": topk_bucket_count,
+        "max_topk_bucket_size": max_topk_bucket_size,
+        "max_topk_bucket_ranked_count": max_topk_bucket_ranked_count,
+        "max_topk_bucket_selected_count": max_topk_bucket_selected_count,
+        "topk_bucket_limit_violation_count": topk_bucket_limit_violation_count,
+        "max_same_timestamp_executed_trades": max_same_timestamp_executed_trades,
+        "max_concurrent_positions": max_concurrent_positions,
+        "max_simultaneous_capital": max_simultaneous_capital,
+        "max_capital_usage_fraction": max_capital_usage_fraction,
+        "max_capital_usage_pct_initial": max_capital_usage_pct_initial,
+        "capital_overallocated_count": capital_overallocated_count,
+    }
+    candidate_utility_metrics = candidate_utility_diagnostics(
+        rows,
+        raw_candidate_trade_scores,
+        ranked_candidate_trade_scores,
+        executed,
+        effective_fee,
+        slippage,
+        latency_penalty,
+        hybrid_runtime_args,
+    )
     return execution_stats_result(
         executed,
         executed_pnls,
@@ -8469,6 +9842,8 @@ def portfolio_execution(rows, predictions, threshold, fee, slippage, initial_cap
         max_holding_period_minutes,
         ranker_upper_quantile,
         ranker_upper_cap,
+        candidate_utility_metrics,
+        execution_audit_metrics,
     )
 
 
@@ -8506,7 +9881,8 @@ def raw_classification_metrics(rows, predictions, threshold, batch_size=1000000,
             return predicted_net_return_value(bundle, local_index, fee, slippage) >= max(threshold, min_predicted_net_return)
         if objective_mode == "economic_ranking":
             score = ranker_score_value(bundle, local_index)
-            return score >= float(threshold) and not ranker_score_above_upper_cap(score, ranker_upper_cap)
+            threshold_score = ranker_threshold_score_value(bundle, local_index, hybrid_runtime_args, score)
+            return threshold_score >= float(threshold) and not ranker_score_above_upper_cap(score, ranker_upper_cap)
         if hybrid_score_value(bundle, local_index, fee, slippage, hybrid_score_mode, hybrid_uncertainty_penalty, hybrid_runtime_args, upside_target, downside_stop) < (
             float(effective_hybrid_thresholds[local_index]) if effective_hybrid_thresholds is not None else max(threshold, hybrid_min_score)
         ):
@@ -8517,6 +9893,8 @@ def raw_classification_metrics(rows, predictions, threshold, batch_size=1000000,
 
     raw_trades = 0
     raw_true_positives = 0
+    raw_trades_before_regime_filter = 0
+    raw_signal_regime_filter_blocked = 0
     if is_compact_rows(rows) and np is not None:
         labels_array = rows.labels_array()
         signal_indices = compact_signal_indices_for_bundle(
@@ -8543,6 +9921,12 @@ def raw_classification_metrics(rows, predictions, threshold, batch_size=1000000,
             hybrid_runtime_args=hybrid_runtime_args,
             ranker_score_upper_cap=ranker_upper_cap,
         )
+        raw_trades_before_regime_filter = int(len(signal_indices))
+        signal_indices, raw_signal_regime_filter_blocked = trade_regime_filter_signal_indices(
+            rows,
+            signal_indices,
+            hybrid_runtime_args,
+        )
         raw_trades = int(len(signal_indices))
         if raw_trades:
             raw_true_positives = int(np.sum(labels_array[signal_indices]))
@@ -8551,6 +9935,10 @@ def raw_classification_metrics(rows, predictions, threshold, batch_size=1000000,
         actual_positive = sum(row.label for row in rows)
         for index, row in enumerate(rows):
             if signal(index):
+                raw_trades_before_regime_filter += 1
+                if not trade_regime_filter_allows(rows, index, hybrid_runtime_args):
+                    raw_signal_regime_filter_blocked += 1
+                    continue
                 raw_trades += 1
                 raw_true_positives += row.label
     raw_false_positives = raw_trades - raw_true_positives
@@ -8558,6 +9946,8 @@ def raw_classification_metrics(rows, predictions, threshold, batch_size=1000000,
     raw_recall = float(raw_true_positives) / actual_positive if actual_positive else 0.0
     raw_f1 = 2.0 * raw_precision * raw_recall / (raw_precision + raw_recall) if raw_precision + raw_recall else 0.0
     return {
+        "raw_signal_trades_before_regime_filter": raw_trades_before_regime_filter,
+        "raw_signal_regime_filter_blocked": raw_signal_regime_filter_blocked,
         "raw_signal_trades": raw_trades,
         "raw_true_positive_rows": raw_true_positives,
         "raw_false_positive_rows": raw_false_positives,
@@ -8780,7 +10170,12 @@ def finalize_evaluation_metrics(rows, metrics, execution, compute_auc, bundle):
         "dynamic_minus_fixed_avg_return",
         "average_gross_return_before_costs",
         "average_net_return_after_costs",
+        "trade_weighted_average_gross_return_before_costs",
+        "trade_weighted_average_net_return_after_costs",
         "average_cost_drag_per_trade",
+        "total_fee_amount",
+        "total_slippage_amount",
+        "total_latency_cost_amount",
         "total_cost_drag",
         "executed_winning_trade_count",
         "executed_losing_trade_count",
@@ -8790,7 +10185,12 @@ def finalize_evaluation_metrics(rows, metrics, execution, compute_auc, bundle):
         "ranker_score_upper_quantile",
         "ranker_score_upper_cap",
         "ranker_score_upper_cap_blocked",
+        "regime_filter_blocked",
     ):
+        metrics[key] = execution.get(key, metrics.get(key, 0.0))
+    for key in EXECUTION_AUDIT_METRIC_KEYS:
+        metrics[key] = execution.get(key, metrics.get(key, "" if key == "execution_chronological_audit_status" else 0.0))
+    for key in CANDIDATE_UTILITY_METRIC_KEYS:
         metrics[key] = execution.get(key, metrics.get(key, 0.0))
     metrics.update(execution_frequency_metrics(execution))
     metrics.update(execution_symbol_summary(rows, execution))
@@ -9004,6 +10404,7 @@ def evaluate_compact(rows, predictions, threshold, fee, slippage, compute_auc=Tr
         "same_symbol_streak_blocked": execution.get("same_symbol_streak_blocked", 0),
         "symbol_fold_share_blocked": execution.get("symbol_fold_share_blocked", 0),
         "symbol_minute_cap_blocked": execution.get("symbol_minute_cap_blocked", 0),
+        "regime_filter_blocked": execution.get("regime_filter_blocked", 0),
         "ranker_score_upper_quantile": execution.get("ranker_score_upper_quantile", 1.0),
         "ranker_score_upper_cap": execution.get("ranker_score_upper_cap", 0.0),
         "ranker_score_upper_cap_blocked": execution.get("ranker_score_upper_cap_blocked", 0),
@@ -9777,6 +11178,8 @@ def recalibrate_symbol_filter_validation(rows, bundle, threshold, args, selectio
         getattr(args, "threshold_max_trade_top1_concentration", 0.0),
         getattr(args, "threshold_concentration_cap_mode", "soft"),
         getattr(args, "threshold_diversity_penalty_weight", 0.0),
+        threshold_cost_stress_multiplier=getattr(args, "threshold_cost_stress_multiplier", 1.0),
+        threshold_cost_stress_weight=getattr(args, "threshold_cost_stress_weight", 0.0),
     )
     trade_count = int(filtered_selection["validation_metrics"].get("predicted_trades", 0))
     precision = float(filtered_selection["validation_metrics"].get("precision", 0.0))
@@ -10120,6 +11523,70 @@ def threshold_score(metrics, objective, zero_trade_profit_score=0.0,
     return metrics["portfolio_profit"]
 
 
+COST_STRESS_THRESHOLD_OBJECTIVES = set(["profit", "profit_balanced", "avg_profit"])
+
+
+def threshold_cost_stress_extra_cost_drag(metrics, cost_stress_multiplier=1.0):
+    multiplier = max(1.0, float(cost_stress_multiplier))
+    predicted_trades = int(metrics.get("predicted_trades", 0))
+    if multiplier <= 1.0 or predicted_trades <= 0:
+        return 0.0
+    total_cost_drag = max(0.0, float(metrics.get("total_cost_drag", 0.0)))
+    if total_cost_drag <= 0.0:
+        average_cost_drag = max(0.0, float(metrics.get("average_cost_drag_per_trade", 0.0)))
+        average_position_size = max(0.0, float(metrics.get("average_position_size", 0.0)))
+        total_cost_drag = average_cost_drag * average_position_size * float(predicted_trades)
+    return total_cost_drag * (multiplier - 1.0)
+
+
+def threshold_cost_stressed_metrics(metrics, cost_stress_multiplier=1.0):
+    stressed = dict(metrics)
+    extra_cost_drag = threshold_cost_stress_extra_cost_drag(metrics, cost_stress_multiplier)
+    stressed_profit = float(metrics.get("portfolio_profit", 0.0)) - extra_cost_drag
+    predicted_trades = int(metrics.get("predicted_trades", 0))
+    stressed["portfolio_profit"] = stressed_profit
+    stressed["threshold_cost_stress_multiplier"] = max(1.0, float(cost_stress_multiplier))
+    stressed["threshold_cost_stress_extra_cost_drag"] = extra_cost_drag
+    stressed["threshold_cost_stress_portfolio_profit"] = stressed_profit
+    stressed["total_profit_after_fee_and_slippage"] = (
+        float(metrics.get("total_profit_after_fee_and_slippage", metrics.get("portfolio_profit", 0.0)))
+        - extra_cost_drag
+    )
+    stressed["average_profit_after_fee_and_slippage"] = (
+        stressed["total_profit_after_fee_and_slippage"] / float(predicted_trades)
+        if predicted_trades > 0
+        else 0.0
+    )
+    return stressed
+
+
+def threshold_cost_stress_penalty(metrics, objective, base_score, zero_trade_profit_score=0.0,
+                                  target_validation_trades=0, min_validation_trades=0,
+                                  max_validation_trades=0, cost_stress_multiplier=1.0,
+                                  cost_stress_weight=0.0):
+    multiplier = max(1.0, float(cost_stress_multiplier))
+    weight = max(0.0, float(cost_stress_weight))
+    stressed_metrics = threshold_cost_stressed_metrics(metrics, multiplier)
+    stressed_score = threshold_score(
+        stressed_metrics,
+        objective,
+        zero_trade_profit_score,
+        target_validation_trades,
+        min_validation_trades,
+        max_validation_trades,
+    )
+    if (
+        weight <= 0.0
+        or multiplier <= 1.0
+        or int(metrics.get("predicted_trades", 0)) <= 0
+        or objective not in COST_STRESS_THRESHOLD_OBJECTIVES
+        or not math.isfinite(float(base_score))
+        or not math.isfinite(float(stressed_score))
+    ):
+        return 0.0, stressed_score, stressed_metrics
+    return weight * max(0.0, float(base_score) - float(stressed_score)), stressed_score, stressed_metrics
+
+
 def concentration_cap_overflow_penalty(actual_value, cap_value, configured_penalty):
     actual = float(actual_value)
     cap = float(cap_value)
@@ -10212,7 +11679,13 @@ def threshold_penalty_breakdown(metrics, base_score, drawdown_penalty=0.0,
                                 threshold=0.0,
                                 effective_floor=0.0,
                                 floor_snap_penalty_weight=0.0,
-                                floor_snap_tolerance=0.0):
+                                floor_snap_tolerance=0.0,
+                                threshold_cost_stress_multiplier=1.0,
+                                threshold_cost_stress_weight=0.0,
+                                objective="profit",
+                                zero_trade_profit_score=0.0,
+                                min_validation_trades=0,
+                                max_validation_trades=0):
     components = {
         "drawdown_penalty": 0.0,
         "trade_count_penalty": 0.0,
@@ -10226,6 +11699,11 @@ def threshold_penalty_breakdown(metrics, base_score, drawdown_penalty=0.0,
         "burst_penalty": 0.0,
         "short_history_penalty": 0.0,
         "floor_snap_penalty": 0.0,
+        "cost_stress_penalty": 0.0,
+        "cost_stress_score": float(base_score),
+        "cost_stress_portfolio_profit": float(metrics.get("portfolio_profit", 0.0)),
+        "cost_stress_extra_cost_drag": 0.0,
+        "cost_stress_multiplier": max(1.0, float(threshold_cost_stress_multiplier)),
     }
     if int(metrics.get("predicted_trades", 0)) <= 0:
         components["concentration_penalty_total"] = 0.0
@@ -10284,6 +11762,25 @@ def threshold_penalty_breakdown(metrics, base_score, drawdown_penalty=0.0,
         floor_snap_penalty_weight,
         floor_snap_tolerance,
     )
+    cost_stress_penalty, cost_stress_score, cost_stress_metrics = threshold_cost_stress_penalty(
+        metrics,
+        objective,
+        base_score,
+        zero_trade_profit_score,
+        target_validation_trades,
+        min_validation_trades,
+        max_validation_trades,
+        threshold_cost_stress_multiplier,
+        threshold_cost_stress_weight,
+    )
+    components["cost_stress_penalty"] = cost_stress_penalty
+    components["cost_stress_score"] = float(cost_stress_score)
+    components["cost_stress_portfolio_profit"] = float(
+        cost_stress_metrics.get("threshold_cost_stress_portfolio_profit", cost_stress_metrics.get("portfolio_profit", 0.0))
+    )
+    components["cost_stress_extra_cost_drag"] = float(
+        cost_stress_metrics.get("threshold_cost_stress_extra_cost_drag", 0.0)
+    )
     components["concentration_penalty_total"] = (
         components["top1_concentration_penalty"]
         + components["top3_concentration_penalty"]
@@ -10300,6 +11797,7 @@ def threshold_penalty_breakdown(metrics, base_score, drawdown_penalty=0.0,
         + components["burst_penalty"]
         + components["short_history_penalty"]
         + components["floor_snap_penalty"]
+        + components["cost_stress_penalty"]
     )
     return components
 
@@ -10324,7 +11822,9 @@ def threshold_penalized_score(metrics, objective, zero_trade_profit_score=0.0,
                               threshold=0.0,
                               effective_floor=0.0,
                               floor_snap_penalty_weight=0.0,
-                              floor_snap_tolerance=0.0):
+                              floor_snap_tolerance=0.0,
+                              threshold_cost_stress_multiplier=1.0,
+                              threshold_cost_stress_weight=0.0):
     base_score = threshold_score(
         metrics,
         objective,
@@ -10356,6 +11856,12 @@ def threshold_penalized_score(metrics, objective, zero_trade_profit_score=0.0,
         effective_floor,
         floor_snap_penalty_weight,
         floor_snap_tolerance,
+        threshold_cost_stress_multiplier,
+        threshold_cost_stress_weight,
+        objective,
+        zero_trade_profit_score,
+        min_validation_trades,
+        max_validation_trades,
     )
     penalized_score = base_score - float(penalty_breakdown.get("total_penalty", 0.0))
     return base_score, penalized_score
@@ -10568,6 +12074,8 @@ def selected_score_name_for_mode(args):
     if args.objective_mode == "return_regression":
         return "predicted_return"
     if args.objective_mode == "economic_ranking":
+        if ranker_threshold_score_mode(args) == "selection":
+            return "ranker_selection_score"
         return "ranker_score"
     return "hybrid"
 
@@ -10578,7 +12086,12 @@ def annotate_selected_validation_metrics(metrics, threshold, selected_score_name
                                          diversity_penalty_total=0.0,
                                          floor_snap_penalty_total=0.0,
                                          effective_floor=0.0,
-                                         floor_snap_tolerance=0.0):
+                                         floor_snap_tolerance=0.0,
+                                         cost_stress_penalty_total=0.0,
+                                         cost_stress_multiplier=1.0,
+                                         cost_stress_score=0.0,
+                                         cost_stress_portfolio_profit=0.0,
+                                         cost_stress_extra_cost_drag=0.0):
     selected_trade_count = int(metrics.get("predicted_trades", 0))
     selected_active_days = int(metrics.get("active_days", 0))
     threshold_value = float(threshold)
@@ -10619,6 +12132,11 @@ def annotate_selected_validation_metrics(metrics, threshold, selected_score_name
     metrics["selected_concentration_penalty_total"] = float(concentration_penalty_total)
     metrics["selected_diversity_penalty_total"] = float(diversity_penalty_total)
     metrics["selected_floor_snap_penalty_total"] = float(floor_snap_penalty_total)
+    metrics["selected_cost_stress_penalty_total"] = float(cost_stress_penalty_total)
+    metrics["selected_validation_cost_stress_multiplier"] = float(cost_stress_multiplier)
+    metrics["selected_validation_cost_stress_score"] = float(cost_stress_score)
+    metrics["selected_validation_cost_stress_portfolio_profit"] = float(cost_stress_portfolio_profit)
+    metrics["selected_validation_cost_stress_extra_cost_drag"] = float(cost_stress_extra_cost_drag)
     metrics["threshold_floor_snap_applied"] = 1 if floor_snap_applied else 0
     metrics["threshold_floor_snap_distance"] = float(floor_snap_gap)
     return metrics
@@ -10643,7 +12161,9 @@ def build_selected_threshold_result(threshold, metrics, objective, zero_trade_pr
                                     short_history_penalty=0.0,
                                     effective_floor=0.0,
                                     floor_snap_penalty_weight=0.0,
-                                    floor_snap_tolerance=0.0):
+                                    floor_snap_tolerance=0.0,
+                                    threshold_cost_stress_multiplier=1.0,
+                                    threshold_cost_stress_weight=0.0):
     base_score = threshold_score(
         metrics,
         objective,
@@ -10675,6 +12195,12 @@ def build_selected_threshold_result(threshold, metrics, objective, zero_trade_pr
         effective_floor,
         floor_snap_penalty_weight,
         floor_snap_tolerance,
+        threshold_cost_stress_multiplier,
+        threshold_cost_stress_weight,
+        objective,
+        zero_trade_profit_score,
+        min_validation_trades,
+        max_validation_trades,
     )
     base_score, penalized_score = threshold_penalized_score(
         metrics,
@@ -10702,6 +12228,8 @@ def build_selected_threshold_result(threshold, metrics, objective, zero_trade_pr
         effective_floor,
         floor_snap_penalty_weight,
         floor_snap_tolerance,
+        threshold_cost_stress_multiplier,
+        threshold_cost_stress_weight,
     )
     annotate_selected_validation_metrics(
         metrics,
@@ -10714,6 +12242,11 @@ def build_selected_threshold_result(threshold, metrics, objective, zero_trade_pr
         penalty_breakdown.get("floor_snap_penalty", 0.0),
         effective_floor,
         floor_snap_tolerance,
+        penalty_breakdown.get("cost_stress_penalty", 0.0),
+        penalty_breakdown.get("cost_stress_multiplier", 1.0),
+        penalty_breakdown.get("cost_stress_score", base_score),
+        penalty_breakdown.get("cost_stress_portfolio_profit", metrics.get("portfolio_profit", 0.0)),
+        penalty_breakdown.get("cost_stress_extra_cost_drag", 0.0),
     )
     return {
         "threshold": threshold,
@@ -10727,6 +12260,13 @@ def build_selected_threshold_result(threshold, metrics, objective, zero_trade_pr
         "concentration_penalty_total": float(penalty_breakdown.get("concentration_penalty_total", 0.0)),
         "diversity_penalty_total": float(penalty_breakdown.get("diversity_penalty", 0.0)),
         "floor_snap_penalty_total": float(penalty_breakdown.get("floor_snap_penalty", 0.0)),
+        "cost_stress_penalty_total": float(penalty_breakdown.get("cost_stress_penalty", 0.0)),
+        "cost_stress_score": float(penalty_breakdown.get("cost_stress_score", base_score)),
+        "cost_stress_portfolio_profit": float(
+            penalty_breakdown.get("cost_stress_portfolio_profit", metrics.get("portfolio_profit", 0.0))
+        ),
+        "cost_stress_extra_cost_drag": float(penalty_breakdown.get("cost_stress_extra_cost_drag", 0.0)),
+        "cost_stress_multiplier": float(penalty_breakdown.get("cost_stress_multiplier", 1.0)),
         "validation_trade_count": int(metrics.get("predicted_trades", 0)),
         "validation_raw_signal_count": int(metrics.get("raw_signal_trades", 0)),
         "validation_max_drawdown": float(metrics.get("max_capital_drawdown", 0.0)),
@@ -10740,6 +12280,47 @@ def no_trade_threshold_for_mode(objective_mode):
     if objective_mode == "economic_ranking":
         return 1e30
     return 1.01
+
+
+def annotate_threshold_selection_status(result, objective_mode, min_validation_trades):
+    if not isinstance(result, dict):
+        return result
+    metrics = result.setdefault("validation_metrics", {})
+    threshold = float(result.get("threshold", metrics.get("selected_threshold", 0.0)) or 0.0)
+    selected_trades = int(metrics.get(
+        "selected_validation_trade_count",
+        metrics.get("predicted_trades", result.get("validation_trade_count", 0)),
+    ) or 0)
+    tie_reason = str(
+        result.get("tie_rank_reason")
+        or metrics.get("selected_threshold_tie_rank_reason")
+        or ""
+    )
+    no_trade_threshold = no_trade_threshold_for_mode(objective_mode)
+    status = THRESHOLD_STATUS_VALID
+    fallback_reason = ""
+    threshold_is_valid = 1
+    if selected_trades <= 0 and (
+        tie_reason in ("no_trade_fallback", "strict_profit_no_trade_baseline")
+        or threshold >= no_trade_threshold - 1e-12
+    ):
+        status = THRESHOLD_STATUS_NO_VALID
+        fallback_reason = THRESHOLD_STATUS_NO_VALID if tie_reason != "strict_profit_no_trade_baseline" else tie_reason
+        threshold_is_valid = 0
+    elif int(min_validation_trades or 0) > 0 and selected_trades < int(min_validation_trades or 0):
+        status = THRESHOLD_STATUS_INSUFFICIENT_VALIDATION
+        fallback_reason = THRESHOLD_STATUS_INSUFFICIENT_VALIDATION
+        threshold_is_valid = 0
+
+    result["threshold_selection_status"] = status
+    result["threshold_is_valid"] = threshold_is_valid
+    result["threshold_fallback_reason"] = fallback_reason
+    result["execution_threshold"] = threshold
+    metrics["threshold_selection_status"] = status
+    metrics["threshold_is_valid"] = threshold_is_valid
+    metrics["threshold_fallback_reason"] = fallback_reason
+    metrics["execution_threshold"] = threshold
+    return result
 
 
 def tune_threshold(rows, predictions, thresholds, objective, fee, slippage,
@@ -10763,6 +12344,12 @@ def tune_threshold(rows, predictions, thresholds, objective, fee, slippage,
     zero_trade_profit_score = 0.0 if strict_profit else -float("inf")
     fallback_result = None
     selected_score_name = "probability" if objective_mode == "classification" else trade_score_name
+    if (
+        objective_mode == "economic_ranking"
+        and hybrid_runtime_args is not None
+        and ranker_threshold_score_mode(hybrid_runtime_args) == "selection"
+    ):
+        selected_score_name = "ranker_selection_score"
     no_trade_threshold = no_trade_threshold_for_mode(objective_mode)
     rejection_summary = {
         "candidate_threshold_count": len(thresholds),
@@ -10835,8 +12422,12 @@ def tune_threshold(rows, predictions, thresholds, objective, fee, slippage,
     short_history_penalty = float(getattr(hybrid_runtime_args, "threshold_short_history_penalty", 0.0)) if hybrid_runtime_args is not None else 0.0
     floor_snap_penalty_weight = float(getattr(hybrid_runtime_args, "threshold_floor_snap_penalty_weight", 0.0)) if hybrid_runtime_args is not None else 0.0
     floor_snap_tolerance = float(getattr(hybrid_runtime_args, "threshold_floor_snap_tolerance", 0.0)) if hybrid_runtime_args is not None else 0.0
+    threshold_cost_stress_multiplier = float(getattr(hybrid_runtime_args, "threshold_cost_stress_multiplier", 1.0)) if hybrid_runtime_args is not None else 1.0
+    threshold_cost_stress_weight = float(getattr(hybrid_runtime_args, "threshold_cost_stress_weight", 0.0)) if hybrid_runtime_args is not None else 0.0
     concentration_cap_mode = getattr(hybrid_runtime_args, "threshold_concentration_cap_mode", "soft") if hybrid_runtime_args is not None else "soft"
     concentration_cap_hard_reject = concentration_cap_mode == "hard"
+    profit_concentration_cap_mode = getattr(hybrid_runtime_args, "threshold_profit_concentration_cap_mode", "hard") if hybrid_runtime_args is not None else "hard"
+    profit_concentration_hard_reject = concentration_cap_hard_reject and profit_concentration_cap_mode == "hard"
     require_positive_top_1pct = bool(getattr(hybrid_runtime_args, "threshold_require_positive_top_1pct", False)) if hybrid_runtime_args is not None else False
     max_raw_signal_share = max(0.0, float(getattr(hybrid_runtime_args, "threshold_max_raw_signal_share", 0.0))) if hybrid_runtime_args is not None else 0.0
     min_avg_net_return = float(getattr(hybrid_runtime_args, "threshold_min_avg_net_return", -999.0)) if hybrid_runtime_args is not None else -999.0
@@ -10906,6 +12497,8 @@ def tune_threshold(rows, predictions, thresholds, objective, fee, slippage,
             effective_floor,
             floor_snap_penalty_weight,
             floor_snap_tolerance,
+            threshold_cost_stress_multiplier,
+            threshold_cost_stress_weight,
         )
         best_result["tie_rank_reason"] = "strict_profit_no_trade_baseline"
         best_result["validation_metrics"]["selected_threshold_tie_rank_reason"] = "strict_profit_no_trade_baseline"
@@ -10967,6 +12560,8 @@ def tune_threshold(rows, predictions, thresholds, objective, fee, slippage,
             effective_floor,
             floor_snap_penalty_weight,
             floor_snap_tolerance,
+            threshold_cost_stress_multiplier,
+            threshold_cost_stress_weight,
         )
         trade_count = int(metrics.get("predicted_trades", 0))
         precision = float(metrics.get("precision", 0.0))
@@ -10982,6 +12577,8 @@ def tune_threshold(rows, predictions, thresholds, objective, fee, slippage,
         winner_score_count = int(metrics.get("executed_winning_trade_count", 0))
         loser_score_count = int(metrics.get("executed_losing_trade_count", 0))
         raw_signal_count = int(metrics.get("raw_signal_trades", 0))
+        raw_signal_count_before_regime_filter = int(metrics.get("raw_signal_trades_before_regime_filter", raw_signal_count))
+        raw_signal_regime_filter_blocked = int(metrics.get("raw_signal_regime_filter_blocked", 0))
         raw_signal_share = float(raw_signal_count) / float(max(1, len(rows)))
         if rejection_summary["lowest_trade_count_seen"] == 0 or trade_count < rejection_summary["lowest_trade_count_seen"]:
             rejection_summary["lowest_trade_count_seen"] = trade_count
@@ -11029,14 +12626,14 @@ def tune_threshold(rows, predictions, thresholds, objective, fee, slippage,
                 rejection_summary["closest_under_min_precision"] = precision
                 rejection_summary["closest_under_min_precision_threshold"] = float(threshold)
                 rejection_summary["closest_under_min_precision_trades"] = int(metrics["predicted_trades"])
-        if concentration_cap_hard_reject and too_top1_concentrated:
+        if profit_concentration_hard_reject and too_top1_concentrated:
             rejection_summary["rejected_over_top1_concentration_count"] += 1
             top1_gap = top1_concentration - max_top1_concentration
             if closest_top1_gap is None or top1_gap < closest_top1_gap:
                 closest_top1_gap = top1_gap
                 rejection_summary["closest_top1_concentration"] = top1_concentration
                 rejection_summary["closest_top1_concentration_threshold"] = float(threshold)
-        if concentration_cap_hard_reject and too_top3_concentrated:
+        if profit_concentration_hard_reject and too_top3_concentrated:
             rejection_summary["rejected_over_top3_concentration_count"] += 1
             top3_gap = top3_concentration - max_top3_concentration
             if closest_top3_gap is None or top3_gap < closest_top3_gap:
@@ -11088,10 +12685,35 @@ def tune_threshold(rows, predictions, thresholds, objective, fee, slippage,
             "threshold": float(threshold),
             "predicted_trades": trade_count,
             "raw_signal_trades": raw_signal_count,
+            "raw_signal_trades_before_regime_filter": raw_signal_count_before_regime_filter,
+            "raw_signal_regime_filter_blocked": raw_signal_regime_filter_blocked,
             "raw_signal_share": raw_signal_share,
+            "trade_regime_filter": trade_regime_filter_mode(hybrid_runtime_args),
             "precision": precision,
             "portfolio_profit": float(metrics.get("portfolio_profit", 0.0)),
             "average_net_return_after_costs": avg_net_return,
+            "candidate_utility_count": int(metrics.get("candidate_utility_count", 0)),
+            "candidate_utility_diagnostic_rows": int(metrics.get("candidate_utility_diagnostic_rows", 0)),
+            "candidate_utility_diagnostics_skipped": int(metrics.get("candidate_utility_diagnostics_skipped", 0)),
+            "candidate_avg_net_utility": float(metrics.get("candidate_avg_net_utility", 0.0)),
+            "candidate_positive_utility_count": int(metrics.get("candidate_positive_utility_count", 0)),
+            "candidate_positive_utility_share": float(metrics.get("candidate_positive_utility_share", 0.0)),
+            "candidate_ranked_positive_utility_count": int(metrics.get("candidate_ranked_positive_utility_count", 0)),
+            "candidate_executed_positive_utility_count": int(metrics.get("candidate_executed_positive_utility_count", 0)),
+            "candidate_ranking_positive_utility_recall": float(metrics.get("candidate_ranking_positive_utility_recall", 0.0)),
+            "candidate_positive_utility_recall": float(metrics.get("candidate_positive_utility_recall", 0.0)),
+            "candidate_missed_positive_utility_count": int(metrics.get("candidate_missed_positive_utility_count", 0)),
+            "candidate_rank_rejected_positive_utility_count": int(metrics.get("candidate_rank_rejected_positive_utility_count", 0)),
+            "candidate_execution_rejected_positive_utility_count": int(metrics.get("candidate_execution_rejected_positive_utility_count", 0)),
+            "candidate_missed_best_net_utility": float(metrics.get("candidate_missed_best_net_utility", 0.0)),
+            "candidate_missed_avg_net_utility": float(metrics.get("candidate_missed_avg_net_utility", 0.0)),
+            "candidate_top_1pct_net_utility": float(metrics.get("candidate_top_1pct_net_utility", 0.0)),
+            "candidate_top_decile_net_utility": float(metrics.get("candidate_top_decile_net_utility", 0.0)),
+            "candidate_high_score_loss_count": int(metrics.get("candidate_high_score_loss_count", 0)),
+            "candidate_high_score_loss_share": float(metrics.get("candidate_high_score_loss_share", 0.0)),
+            "candidate_high_score_loss_avg_net_utility": float(metrics.get("candidate_high_score_loss_avg_net_utility", 0.0)),
+            "candidate_high_score_loss_total_net_utility": float(metrics.get("candidate_high_score_loss_total_net_utility", 0.0)),
+            "candidate_score_positive_utility_gap": float(metrics.get("candidate_score_positive_utility_gap", 0.0)),
             "executed_score_top_1pct_rows": top_1pct_rows,
             "executed_score_top_1pct_avg_net_return": top_1pct_avg_net_return,
             "executed_score_top_decile_rows": top_decile_rows,
@@ -11114,6 +12736,7 @@ def tune_threshold(rows, predictions, thresholds, objective, fee, slippage,
             "top_blocked_bucket_reason": metrics.get("top_blocked_bucket_reason", ""),
             "top_blocked_bucket_count": int(metrics.get("top_blocked_bucket_count", 0)),
             "threshold_concentration_cap_mode": concentration_cap_mode,
+            "threshold_profit_concentration_cap_mode": profit_concentration_cap_mode,
             "over_top1_concentration": 1 if too_top1_concentrated else 0,
             "over_top3_concentration": 1 if too_top3_concentrated else 0,
             "over_trade_top1_concentration": 1 if too_trade_top1_concentrated else 0,
@@ -11123,8 +12746,8 @@ def tune_threshold(rows, predictions, thresholds, objective, fee, slippage,
             "rejected_under_min_trades": 1 if too_few else 0,
             "rejected_over_max_trades": 1 if too_many else 0,
             "rejected_under_min_precision": 1 if too_imprecise else 0,
-            "rejected_over_top1_concentration": 1 if concentration_cap_hard_reject and too_top1_concentrated else 0,
-            "rejected_over_top3_concentration": 1 if concentration_cap_hard_reject and too_top3_concentrated else 0,
+            "rejected_over_top1_concentration": 1 if profit_concentration_hard_reject and too_top1_concentrated else 0,
+            "rejected_over_top3_concentration": 1 if profit_concentration_hard_reject and too_top3_concentrated else 0,
             "rejected_over_trade_top1_concentration": 1 if concentration_cap_hard_reject and too_trade_top1_concentrated else 0,
         })
         if sum(
@@ -11133,8 +12756,8 @@ def tune_threshold(rows, predictions, thresholds, objective, fee, slippage,
                 too_few,
                 too_many,
                 too_imprecise,
-                concentration_cap_hard_reject and too_top1_concentrated,
-                concentration_cap_hard_reject and too_top3_concentrated,
+                profit_concentration_hard_reject and too_top1_concentrated,
+                profit_concentration_hard_reject and too_top3_concentrated,
                 concentration_cap_hard_reject and too_trade_top1_concentrated,
                 negative_top_1pct,
                 too_raw_signal_broad,
@@ -11148,8 +12771,8 @@ def tune_threshold(rows, predictions, thresholds, objective, fee, slippage,
         if (
             too_many
             or too_imprecise
-            or (concentration_cap_hard_reject and too_top1_concentrated)
-            or (concentration_cap_hard_reject and too_top3_concentrated)
+            or (profit_concentration_hard_reject and too_top1_concentrated)
+            or (profit_concentration_hard_reject and too_top3_concentrated)
             or (concentration_cap_hard_reject and too_trade_top1_concentrated)
             or negative_top_1pct
             or too_raw_signal_broad
@@ -11260,6 +12883,8 @@ def tune_threshold(rows, predictions, thresholds, objective, fee, slippage,
                 effective_floor,
                 floor_snap_penalty_weight,
                 floor_snap_tolerance,
+                threshold_cost_stress_multiplier,
+                threshold_cost_stress_weight,
             )
             best_result["tie_rank_reason"] = "no_trade_fallback"
             best_result["validation_metrics"]["selected_threshold_tie_rank_reason"] = "no_trade_fallback"
@@ -11268,6 +12893,7 @@ def tune_threshold(rows, predictions, thresholds, objective, fee, slippage,
     if best_result is not None:
         best_result["validation_metrics"].update(rejection_summary)
         best_result["validation_metrics"]["threshold_rejection_diagnostics"] = threshold_rejection_diagnostics
+        annotate_threshold_selection_status(best_result, objective_mode, min_validation_trades)
     return best_result
 
 
@@ -11687,9 +13313,7 @@ def copy_prediction_values(values, args, prefix):
 
 def cleanup_prediction_bundle(bundle):
     seen = set()
-    for key in ("probability", "calibrated_probability", "predicted_trade_return",
-                "raw_predicted_trade_return", "predicted_return_uncertainty",
-                "ranker_score", "meta_probability"):
+    for key in PREDICTION_BUNDLE_VALUE_KEYS:
         values = bundle.get(key)
         if values is None:
             continue
@@ -11727,6 +13351,42 @@ def rows_prediction_signature(rows):
     if length <= 0:
         return {"rows": 0}
     sample_points = sorted(set([0, length // 2, length - 1]))
+    digest = hashlib.sha1()
+
+    def update_array(name, values):
+        array = np.ascontiguousarray(values)
+        digest.update(str(name).encode("utf-8"))
+        digest.update(str(array.dtype).encode("utf-8"))
+        digest.update(str(array.shape).encode("utf-8"))
+        digest.update(array.view(np.uint8))
+
+    if is_compact_rows(rows) and np is not None:
+        positions = compact_positions_array(rows)
+        chunk_size = 100000
+        for start in range(0, len(positions), chunk_size):
+            end = min(len(positions), start + chunk_size)
+            chunk_positions = positions[start:end]
+            update_array("symbol_codes", rows.table.symbol_codes[chunk_positions])
+            update_array("month_codes", rows.table.month_codes[chunk_positions])
+            update_array("month_indices", rows.table.month_indices[chunk_positions])
+            update_array("open_times", rows.table.open_times[chunk_positions])
+            update_array("features", rows.table.features[chunk_positions])
+    else:
+        for index in range(length):
+            row = rows[index]
+            digest.update(str(getattr(row, "symbol", "")).encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(str(getattr(row, "month", "")).encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(str(int(getattr(row, "month_index", 0))).encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(str(int(getattr(row, "open_time", 0))).encode("utf-8"))
+            digest.update(b"\0")
+            for value in getattr(row, "features", ()):
+                digest.update(repr(float(value)).encode("utf-8"))
+                digest.update(b",")
+            digest.update(b"\n")
+
     return {
         "rows": length,
         "first_open_time": row_open_time_value(rows, sample_points[0]),
@@ -11734,6 +13394,7 @@ def rows_prediction_signature(rows):
         "last_open_time": row_open_time_value(rows, sample_points[-1]),
         "first_symbol": row_symbol_name(rows, sample_points[0]),
         "last_symbol": row_symbol_name(rows, sample_points[-1]),
+        "identity_sha1": digest.hexdigest(),
     }
 
 
@@ -11748,6 +13409,7 @@ def selected_prediction_signature(selected):
     uncertainty_model = selected.get("uncertainty_model") or {}
     meta_filter_info = selected.get("meta_filter_info") or {}
     symbol_filter_info = selected.get("symbol_filter_info") or {}
+    ranker_selection_calibration = selected.get("ranker_selection_calibration") or {}
     return {
         "params": selected.get("params", {}),
         "best_iteration": selected.get("best_iteration"),
@@ -11755,6 +13417,8 @@ def selected_prediction_signature(selected):
         "has_classification_model": 1 if selected.get("classification_model") is not None else 0,
         "has_regression_model": 1 if selected.get("regression_model") is not None else 0,
         "has_ranker_model": 1 if selected.get("ranker_model") is not None else 0,
+        "has_ranker_utility_model": 1 if selected.get("ranker_utility_model") is not None else 0,
+        "ranker_utility_regression_blend": selected.get("ranker_utility_regression_blend", selected.get("calibration_info", {}).get("ranker_utility_regression_blend", 0.0)),
         "calibration": {
             "mode": calibration.get("mode", "none"),
             "a": calibration.get("a", 0.0),
@@ -11778,6 +13442,19 @@ def selected_prediction_signature(selected):
             "mode": symbol_filter_info.get("mode", "none"),
             "enabled": 1 if symbol_filter_info.get("enabled") else 0,
             "allowed": len(symbol_filter_info.get("allowed_symbols", [])),
+        },
+        "ranker_selection_calibration": {
+            "mode": ranker_selection_calibration.get("mode", "none"),
+            "enabled": 1 if ranker_selection_calibration.get("enabled") else 0,
+            "rows": ranker_selection_calibration.get("rows", 0),
+            "bins": [
+                (
+                    item.get("lower_score", 0.0),
+                    item.get("upper_score", 0.0),
+                    item.get("calibrated_utility", 0.0),
+                )
+                for item in ranker_selection_calibration.get("bins", [])
+            ],
         },
     }
 
@@ -11810,9 +13487,7 @@ def prediction_bundle_cache_enabled(args):
 
 def prediction_bundle_to_cache_arrays(bundle):
     arrays = {}
-    for key in ("probability", "calibrated_probability", "predicted_trade_return",
-                "raw_predicted_trade_return", "predicted_return_uncertainty",
-                "ranker_score", "meta_probability"):
+    for key in PREDICTION_BUNDLE_VALUE_KEYS:
         values = bundle.get(key)
         if values is None:
             continue
@@ -11831,6 +13506,8 @@ def prediction_bundle_from_cache_arrays(arrays, selected):
         raw_predicted_trade_return=arrays.get("raw_predicted_trade_return"),
         predicted_return_uncertainty=arrays.get("predicted_return_uncertainty"),
         ranker_score=arrays.get("ranker_score"),
+        ranker_utility_score=arrays.get("ranker_utility_score"),
+        ranker_selection_score=arrays.get("ranker_selection_score"),
         meta_probability=arrays.get("meta_probability"),
         ev_context=selected.get("ev_payoff_info"),
         hybrid_return_context=selected.get("hybrid_return_info"),
@@ -11901,6 +13578,8 @@ def average_prediction_bundles(rows, args, bundles):
     raw_predicted_trade_return = None
     predicted_return_uncertainty = None
     ranker_score = None
+    ranker_utility_score = None
+    ranker_selection_score = None
     meta_probability = None
     counts = {
         "probability": 0,
@@ -11909,6 +13588,8 @@ def average_prediction_bundles(rows, args, bundles):
         "raw_predicted_trade_return": 0,
         "predicted_return_uncertainty": 0,
         "ranker_score": 0,
+        "ranker_utility_score": 0,
+        "ranker_selection_score": 0,
         "meta_probability": 0,
     }
     for bundle in bundles:
@@ -11948,6 +13629,18 @@ def average_prediction_bundles(rows, args, bundles):
                 ranker_score[:] = 0.0
             add_prediction_values_in_place(ranker_score, bundle["ranker_score"])
             counts["ranker_score"] += 1
+        if bundle.get("ranker_utility_score") is not None:
+            if ranker_utility_score is None:
+                ranker_utility_score = allocate_prediction_values(row_count, args, "gbdt_ensemble_ranker_utility_score_")
+                ranker_utility_score[:] = 0.0
+            add_prediction_values_in_place(ranker_utility_score, bundle["ranker_utility_score"])
+            counts["ranker_utility_score"] += 1
+        if bundle.get("ranker_selection_score") is not None:
+            if ranker_selection_score is None:
+                ranker_selection_score = allocate_prediction_values(row_count, args, "gbdt_ensemble_ranker_selection_score_")
+                ranker_selection_score[:] = 0.0
+            add_prediction_values_in_place(ranker_selection_score, bundle["ranker_selection_score"])
+            counts["ranker_selection_score"] += 1
         if bundle.get("meta_probability") is not None:
             if meta_probability is None:
                 meta_probability = allocate_prediction_values(row_count, args, "gbdt_ensemble_meta_probability_")
@@ -11961,6 +13654,8 @@ def average_prediction_bundles(rows, args, bundles):
     divide_prediction_values_in_place(raw_predicted_trade_return, counts["raw_predicted_trade_return"])
     divide_prediction_values_in_place(predicted_return_uncertainty, counts["predicted_return_uncertainty"])
     divide_prediction_values_in_place(ranker_score, counts["ranker_score"])
+    divide_prediction_values_in_place(ranker_utility_score, counts["ranker_utility_score"])
+    divide_prediction_values_in_place(ranker_selection_score, counts["ranker_selection_score"])
     divide_prediction_values_in_place(meta_probability, counts["meta_probability"])
     return build_prediction_bundle(
         probability,
@@ -11969,6 +13664,8 @@ def average_prediction_bundles(rows, args, bundles):
         raw_predicted_trade_return=raw_predicted_trade_return,
         predicted_return_uncertainty=predicted_return_uncertainty,
         ranker_score=ranker_score,
+        ranker_utility_score=ranker_utility_score,
+        ranker_selection_score=ranker_selection_score,
         meta_probability=meta_probability,
         ev_context=bundles[0].get("ev_context") if bundles else None,
         hybrid_return_context=bundles[0].get("hybrid_return_context") if bundles else None,
@@ -12007,6 +13704,8 @@ def prediction_bundle_for_models(selected, rows, kind, args, stage_prefix):
     raw_predicted_trade_return = None
     predicted_return_uncertainty = None
     ranker_score = None
+    ranker_utility_score = None
+    ranker_selection_score = None
     if selected.get("classification_model") is not None:
         probability = predict_model_values(
             selected["classification_model"],
@@ -12045,6 +13744,23 @@ def prediction_bundle_for_models(selected, rows, kind, args, stage_prefix):
             args,
             "{} economic ranker prediction".format(stage_prefix),
         )
+        if selected.get("ranker_utility_model") is not None:
+            ranker_utility_score = clip_ranker_utility_values(
+                predict_model_values(
+                    selected["ranker_utility_model"],
+                    rows,
+                    kind,
+                    args,
+                    "{} ranker utility prediction".format(stage_prefix),
+                ),
+                args,
+            )
+        ranker_selection_score = rank_selection_score_with_calibration_gate(
+            ranker_score,
+            selected.get("ranker_selection_calibration"),
+            ranker_utility_score,
+            args,
+        )
     bundle = build_prediction_bundle(
         probability,
         calibrated_probability,
@@ -12052,6 +13768,8 @@ def prediction_bundle_for_models(selected, rows, kind, args, stage_prefix):
         raw_predicted_trade_return=raw_predicted_trade_return,
         predicted_return_uncertainty=predicted_return_uncertainty,
         ranker_score=ranker_score,
+        ranker_utility_score=ranker_utility_score,
+        ranker_selection_score=ranker_selection_score,
         ev_context=selected.get("ev_payoff_info"),
         hybrid_return_context=selected.get("hybrid_return_info"),
         uncertainty_context=selected.get("uncertainty_model"),
@@ -12217,6 +13935,13 @@ def predict_probabilities(model, rows, kind, args, stage="prediction"):
 
 def selection_is_no_trade_fallback(selection):
     metrics = (selection or {}).get("validation_metrics") or {}
+    status = str(
+        (selection or {}).get("threshold_selection_status")
+        or metrics.get("threshold_selection_status")
+        or ""
+    )
+    if status == THRESHOLD_STATUS_NO_VALID:
+        return True
     tie_reason = str(
         (selection or {}).get("tie_rank_reason")
         or metrics.get("selected_threshold_tie_rank_reason")
@@ -12358,6 +14083,13 @@ def hybrid_gate_score_diagnostics(score_values, configured_floor, effective_floo
         "hybrid_gate_rows_above_configured_floor": 0,
         "hybrid_gate_rows_above_effective_floor": 0,
         "hybrid_gate_rows_between_effective_and_configured_floor": 0,
+        "score_edge_value_name": "hybrid_score",
+        "score_edge_units": "net_return_score",
+        "score_edge_floor": float(effective_floor),
+        "score_edge_candidate_count_before": 0,
+        "score_edge_candidate_count_after": 0,
+        "score_edge_removal_pct": 0.0,
+        "score_edge_removed_all_candidates": 0,
     })
     if not finite_scores:
         return diagnostics
@@ -12374,6 +14106,13 @@ def hybrid_gate_score_diagnostics(score_values, configured_floor, effective_floo
     diagnostics["hybrid_gate_rows_above_configured_floor"] = above_configured
     diagnostics["hybrid_gate_rows_above_effective_floor"] = above_effective
     diagnostics["hybrid_gate_rows_between_effective_and_configured_floor"] = rescued_between_floors
+    diagnostics["score_edge_candidate_count_before"] = len(finite_scores)
+    diagnostics["score_edge_candidate_count_after"] = above_effective
+    diagnostics["score_edge_removal_pct"] = (
+        (len(finite_scores) - above_effective) / float(len(finite_scores))
+        if finite_scores else 0.0
+    )
+    diagnostics["score_edge_removed_all_candidates"] = 1 if finite_scores and above_effective == 0 else 0
     return diagnostics
 
 
@@ -12582,6 +14321,13 @@ def fit_select_model(train_rows, validation_rows, feature_names, args, kind):
             "hybrid_gate_rows_above_configured_floor": selection["validation_metrics"].get("hybrid_gate_rows_above_configured_floor", 0),
             "hybrid_gate_rows_above_effective_floor": selection["validation_metrics"].get("hybrid_gate_rows_above_effective_floor", 0),
             "hybrid_gate_rows_between_effective_and_configured_floor": selection["validation_metrics"].get("hybrid_gate_rows_between_effective_and_configured_floor", 0),
+            "score_edge_value_name": selection["validation_metrics"].get("score_edge_value_name", ""),
+            "score_edge_units": selection["validation_metrics"].get("score_edge_units", ""),
+            "score_edge_floor": selection["validation_metrics"].get("score_edge_floor", 0.0),
+            "score_edge_candidate_count_before": selection["validation_metrics"].get("score_edge_candidate_count_before", 0),
+            "score_edge_candidate_count_after": selection["validation_metrics"].get("score_edge_candidate_count_after", 0),
+            "score_edge_removal_pct": selection["validation_metrics"].get("score_edge_removal_pct", 0.0),
+            "score_edge_removed_all_candidates": selection["validation_metrics"].get("score_edge_removed_all_candidates", 0),
             "hybrid_score_mode": args.hybrid_score_mode,
             "hybrid_uncertainty_method": args.hybrid_uncertainty_method,
             "hybrid_uncertainty_penalty": args.hybrid_uncertainty_penalty,
@@ -12709,6 +14455,8 @@ def fit_select_model(train_rows, validation_rows, feature_names, args, kind):
     x_rank_validation = None
     y_rank_train = None
     y_rank_validation = None
+    y_rank_utility_train = None
+    y_rank_utility_validation = None
     if args.objective_mode in ("classification", "hybrid"):
         y_class_train = model_targets(fit_train_rows, kind, "classification")
         y_class_validation = model_targets(fit_validation_rows, kind, "classification")
@@ -12723,19 +14471,31 @@ def fit_select_model(train_rows, validation_rows, feature_names, args, kind):
         x_rank_validation = model_matrix(rank_validation_rows, kind, args)
         y_rank_train = ranker_relevance_labels(rank_train_rows, args, ranker_context)
         y_rank_validation = ranker_relevance_labels(rank_validation_rows, args, ranker_context)
+        if float(getattr(args, "ranker_utility_regression_blend", 0.0)) > 0.0:
+            y_rank_utility_train = clip_ranker_utility_values(
+                ranker_net_utility_values(fit_train_rows, args, getattr(args, "validation_slippage_multiplier", 1.0)),
+                args,
+            )
+            y_rank_utility_validation = clip_ranker_utility_values(
+                ranker_net_utility_values(fit_validation_rows, args, getattr(args, "validation_slippage_multiplier", 1.0)),
+                args,
+            )
 
     best = None
     for params in candidate_params(kind, args):
         classification_model = None
         regression_model = None
         ranker_model = None
+        ranker_utility_model = None
         raw_probabilities = None
         calibrated_probabilities = None
         predicted_trade_return = None
         ranker_score = None
+        ranker_utility_score = None
         calibration = None
         regression_calibration = None
         uncertainty_model = None
+        ranker_selection_calibration = None
 
         if args.objective_mode in ("classification", "hybrid"):
             classification_model = make_model(kind, params, positive_weight, "classification")
@@ -12794,6 +14554,19 @@ def fit_select_model(train_rows, validation_rows, feature_names, args, kind):
             ranker_score = ranker_model.predict_values(x_validation)
             finish_profile_stage(sampled_ranker_token, rows_processed=len(fit_validation_rows), extra_info=json.dumps(params, sort_keys=True))
             memory_checkpoint("Sampled validation economic ranker prediction complete", args)
+            if y_rank_utility_train is not None:
+                ranker_utility_model = make_model(kind, params, positive_weight, "return_regression")
+                utility_fit_token = start_profile_stage("ranker_utility_regression_fit", json.dumps(params, sort_keys=True))
+                ranker_utility_model.fit(x_train, y_rank_utility_train, feature_names, x_validation, y_rank_utility_validation, args)
+                finish_profile_stage(utility_fit_token, rows_processed=len(fit_train_rows), extra_info=json.dumps(params, sort_keys=True))
+                memory_checkpoint(
+                    "LightGBM ranker utility regression candidate fit complete" if kind == "lightgbm" else "Internal ranker utility regression candidate fit complete",
+                    args,
+                )
+                sampled_utility_token = start_profile_stage("sampled_validation_ranker_utility_prediction", json.dumps(params, sort_keys=True))
+                ranker_utility_score = clip_ranker_utility_values(ranker_utility_model.predict_values(x_validation), args)
+                finish_profile_stage(sampled_utility_token, rows_processed=len(fit_validation_rows), extra_info=json.dumps(params, sort_keys=True))
+                memory_checkpoint("Sampled validation ranker utility prediction complete", args)
 
         bundle = build_prediction_bundle(
             raw_probabilities,
@@ -12802,12 +14575,23 @@ def fit_select_model(train_rows, validation_rows, feature_names, args, kind):
             raw_predicted_trade_return=raw_predicted_trade_return,
             predicted_return_uncertainty=apply_uncertainty_model(predicted_trade_return, uncertainty_model) if predicted_trade_return is not None else None,
             ranker_score=ranker_score,
+            ranker_utility_score=ranker_utility_score,
             uncertainty_context=uncertainty_model,
         )
         bundle["regression_calibration"] = regression_calibration or {}
         bundle["ev_context"] = fit_ev_payoff_context(fit_validation_rows, bundle, args)
         bundle["hybrid_return_context"] = fit_hybrid_return_context(fit_validation_rows, bundle, args)
+        if args.objective_mode == "economic_ranking":
+            ranker_selection_calibration = fit_ranker_selection_calibration(fit_validation_rows, bundle, args)
+            bundle["ranker_selection_score"] = rank_selection_score_with_calibration_gate(
+                bundle.get("ranker_score"),
+                ranker_selection_calibration,
+                bundle.get("ranker_utility_score"),
+                args,
+            )
         selection = select_threshold_for_bundle(fit_validation_rows, bundle, args, score_name)
+        if ranker_selection_calibration is not None:
+            selection["validation_metrics"].update(ranker_selection_calibration_metrics(ranker_selection_calibration))
         threshold = selection["threshold"]
         metrics = selection["validation_metrics"]
         zero_trade_score = 0.0 if args.threshold_objective in ("profit", "profit_balanced", "avg_profit", "ev") and args.profit_safety == "strict" else -float("inf")
@@ -12839,13 +14623,16 @@ def fit_select_model(train_rows, validation_rows, feature_names, args, kind):
                 old_classification = best.pop("classification_model", None)
                 old_regression = best.pop("regression_model", None)
                 old_ranker = best.pop("ranker_model", None)
+                old_ranker_utility = best.pop("ranker_utility_model", None)
                 del old_classification
                 del old_regression
                 del old_ranker
+                del old_ranker_utility
             best = {
                 "classification_model": classification_model,
                 "regression_model": regression_model,
                 "ranker_model": ranker_model,
+                "ranker_utility_model": ranker_utility_model,
                 "params": dict(params),
                 "threshold": threshold,
                 "validation_metrics": metrics,
@@ -12859,7 +14646,9 @@ def fit_select_model(train_rows, validation_rows, feature_names, args, kind):
                 "uncertainty_model": uncertainty_model,
                 "trade_score_name": score_name,
                 "selected_score_name": selected_score_name,
+                "ranker_utility_regression_blend": getattr(args, "ranker_utility_regression_blend", 0.0),
                 "ranker_relevance_context": dict(ranker_context or {}),
+                "ranker_selection_calibration": dict(ranker_selection_calibration or disabled_ranker_selection_calibration("not_fit", args)),
                 "ranker_group_info": {
                     "train": dict(rank_train_info or {}),
                     "validation": dict(rank_validation_info or {}),
@@ -12880,6 +14669,7 @@ def fit_select_model(train_rows, validation_rows, feature_names, args, kind):
             del classification_model
             del regression_model
             del ranker_model
+            del ranker_utility_model
             calibration = None
         cleanup_prediction_bundle(bundle)
         del bundle
@@ -12906,7 +14696,19 @@ def fit_select_model(train_rows, validation_rows, feature_names, args, kind):
         bundle["regression_calibration"] = best.get("regression_calibration") or {}
         bundle["ev_context"] = fit_ev_payoff_context(validation_rows, bundle, args)
         bundle["hybrid_return_context"] = fit_hybrid_return_context(validation_rows, bundle, args)
+        if args.objective_mode == "economic_ranking":
+            best["ranker_selection_calibration"] = fit_ranker_selection_calibration(validation_rows, bundle, args)
+            bundle["ranker_selection_score"] = rank_selection_score_with_calibration_gate(
+                bundle.get("ranker_score"),
+                best.get("ranker_selection_calibration"),
+                bundle.get("ranker_utility_score"),
+                args,
+            )
         selection = select_threshold_for_bundle(validation_rows, bundle, args, score_name)
+        if args.objective_mode == "economic_ranking":
+            selection["validation_metrics"].update(
+                ranker_selection_calibration_metrics(best.get("ranker_selection_calibration"))
+            )
         best["threshold"] = selection["threshold"]
         metrics = selection["validation_metrics"]
         best["validation_metrics"] = metrics
@@ -13044,13 +14846,24 @@ def fit_select_model(train_rows, validation_rows, feature_names, args, kind):
             "ranker_relevance_mode": (best.get("ranker_relevance_context") or {}).get("mode", "none"),
             "ranker_utility_rows": (best.get("ranker_relevance_context") or {}).get("utility_rows", 0),
             "ranker_positive_utility_rows": (best.get("ranker_relevance_context") or {}).get("positive_utility_rows", 0),
+            "ranker_utility_target_margin": (best.get("ranker_relevance_context") or {}).get("ranker_utility_target_margin", getattr(args, "ranker_utility_target_margin", 0.0)),
             "ranker_weak_positive_threshold": (best.get("ranker_relevance_context") or {}).get("weak_positive_threshold", 0.0),
             "ranker_useful_positive_threshold": (best.get("ranker_relevance_context") or {}).get("useful_positive_threshold", 0.0),
             "ranker_strong_positive_threshold": (best.get("ranker_relevance_context") or {}).get("strong_positive_threshold", 0.0),
+            "ranker_label_0_rows": (best.get("ranker_relevance_context") or {}).get("ranker_label_0_rows", 0),
+            "ranker_label_1_rows": (best.get("ranker_relevance_context") or {}).get("ranker_label_1_rows", 0),
+            "ranker_label_2_rows": (best.get("ranker_relevance_context") or {}).get("ranker_label_2_rows", 0),
+            "ranker_label_3_rows": (best.get("ranker_relevance_context") or {}).get("ranker_label_3_rows", 0),
+            "ranker_label_4_rows": (best.get("ranker_relevance_context") or {}).get("ranker_label_4_rows", 0),
+            "ranker_relevant_rows": (best.get("ranker_relevance_context") or {}).get("ranker_relevant_rows", 0),
+            "ranker_relevant_row_share": (best.get("ranker_relevance_context") or {}).get("ranker_relevant_row_share", 0.0),
+            "ranker_utility_regression_blend": getattr(args, "ranker_utility_regression_blend", 0.0),
+            "ranker_utility_regression_enabled": 1 if best.get("ranker_utility_model") is not None else 0,
             "ranker_train_group_count": ((best.get("ranker_group_info") or {}).get("train") or {}).get("ranker_group_count", 0),
             "ranker_validation_group_count": ((best.get("ranker_group_info") or {}).get("validation") or {}).get("ranker_group_count", 0),
             "ranker_train_average_group_size": ((best.get("ranker_group_info") or {}).get("train") or {}).get("ranker_average_group_size", 0.0),
             "ranker_validation_average_group_size": ((best.get("ranker_group_info") or {}).get("validation") or {}).get("ranker_average_group_size", 0.0),
+            **ranker_selection_calibration_metrics(best.get("ranker_selection_calibration")),
             "hybrid_return_combination": hybrid_return_info.get("hybrid_return_combination", getattr(args, "hybrid_return_combination", "probability_times_return")),
             "hybrid_min_probability": hybrid_return_info.get("hybrid_min_probability", getattr(args, "hybrid_min_probability", 0.0)),
             "configured_hybrid_min_score": best["validation_metrics"].get("configured_hybrid_min_score", getattr(args, "hybrid_min_score", 0.0)),
@@ -13072,6 +14885,13 @@ def fit_select_model(train_rows, validation_rows, feature_names, args, kind):
             "hybrid_gate_rows_above_configured_floor": best["validation_metrics"].get("hybrid_gate_rows_above_configured_floor", 0),
             "hybrid_gate_rows_above_effective_floor": best["validation_metrics"].get("hybrid_gate_rows_above_effective_floor", 0),
             "hybrid_gate_rows_between_effective_and_configured_floor": best["validation_metrics"].get("hybrid_gate_rows_between_effective_and_configured_floor", 0),
+            "score_edge_value_name": best["validation_metrics"].get("score_edge_value_name", ""),
+            "score_edge_units": best["validation_metrics"].get("score_edge_units", ""),
+            "score_edge_floor": best["validation_metrics"].get("score_edge_floor", 0.0),
+            "score_edge_candidate_count_before": best["validation_metrics"].get("score_edge_candidate_count_before", 0),
+            "score_edge_candidate_count_after": best["validation_metrics"].get("score_edge_candidate_count_after", 0),
+            "score_edge_removal_pct": best["validation_metrics"].get("score_edge_removal_pct", 0.0),
+            "score_edge_removed_all_candidates": best["validation_metrics"].get("score_edge_removed_all_candidates", 0),
             "hybrid_score_mode": args.hybrid_score_mode,
             "hybrid_uncertainty_method": uncertainty_model.get("mode", "none"),
             "hybrid_uncertainty_penalty": args.hybrid_uncertainty_penalty,
@@ -13161,6 +14981,21 @@ def prediction_exit_fields(execution, index, fixed_trade_return, fixed_mfe, fixe
     }
 
 
+def prediction_output_indices(output_mode, row_count, raw_selected, executed, executed_selected_by_topk):
+    if output_mode == "trades":
+        return sorted(int(index) for index in executed)
+    if output_mode == "candidates":
+        indices = set(int(index) for index in raw_selected)
+        indices.update(int(index) for index in executed)
+        indices.update(
+            int(index)
+            for index, selected in executed_selected_by_topk.items()
+            if int(selected or 0) != 0
+        )
+        return sorted(indices)
+    return range(int(row_count))
+
+
 def write_predictions(path, rows, predictions, threshold, model_name,
                       append=False, output_mode="all",
                       initial_capital=10000.0, max_position_fraction=0.10,
@@ -13205,6 +15040,8 @@ def write_predictions(path, rows, predictions, threshold, model_name,
                 "predicted_net_return",
                 "predicted_return_uncertainty",
                 "ranker_score",
+                "ranker_selection_score",
+                "ranker_utility_score",
                 "base_hybrid_score",
                 "hybrid_score",
                 "hybrid_score_basic",
@@ -13264,6 +15101,7 @@ def write_predictions(path, rows, predictions, threshold, model_name,
                 "blocked_by_fold_trade_limit",
                 "blocked_by_daily_loss_limit",
                 "blocked_by_daily_drawdown_limit",
+                "blocked_by_regime_filter",
                 "model_name",
             ])
         if output_mode == "none":
@@ -13306,7 +15144,13 @@ def write_predictions(path, rows, predictions, threshold, model_name,
         if is_compact_rows(rows):
             table = rows.table
             threshold_is_list = isinstance(threshold, list) or (np is not None and isinstance(threshold, np.ndarray))
-            output_indices = sorted(executed) if output_mode == "trades" else range(len(rows))
+            output_indices = prediction_output_indices(
+                output_mode,
+                len(rows),
+                raw_selected,
+                executed,
+                execution["executed_selected_by_topk"],
+            )
             for index in output_indices:
                 position = index if rows.indices is None else int(rows.indices[index])
                 row_threshold = threshold[index] if threshold_is_list else threshold
@@ -13322,6 +15166,7 @@ def write_predictions(path, rows, predictions, threshold, model_name,
                     "blocked_by_fold_trade_limit": 0,
                     "blocked_by_daily_loss_limit": 0,
                     "blocked_by_daily_drawdown_limit": 0,
+                    "blocked_by_regime_filter": 0,
                 })
                 ev_details = expected_value_details_for_bundle(bundle, index, upside_target, downside_stop, fee, slippage, hybrid_runtime_args)
                 hybrid_details = hybrid_score_details_for_bundle(
@@ -13340,6 +15185,9 @@ def write_predictions(path, rows, predictions, threshold, model_name,
                 hybrid_score_basic = hybrid_details["base_hybrid_score"]
                 hybrid_score_risk_adjusted = hybrid_score_value(bundle, index, fee, slippage, "risk_adjusted", hybrid_uncertainty_penalty, hybrid_runtime_args, upside_target, downside_stop)
                 hybrid_score = hybrid_details["hybrid_score"]
+                ranker_raw_score = ranker_score_value(bundle, index)
+                ranker_selection_score = ranker_selection_score_value(bundle, index, ranker_raw_score)
+                ranker_utility_score = ranker_utility_score_value(bundle, index)
                 effective_threshold = float(effective_hybrid_thresholds[index]) if effective_hybrid_thresholds is not None else (
                     max(float(row_threshold), float(hybrid_min_score)) if objective_mode == "hybrid" else float(row_threshold)
                 )
@@ -13370,7 +15218,9 @@ def write_predictions(path, rows, predictions, threshold, model_name,
                     "{:.12g}".format(hybrid_details["calibrated_predicted_trade_return"]),
                     "{:.12g}".format(predicted_net_return),
                     "{:.12g}".format(predicted_return_uncertainty_value(bundle, index)),
-                    "{:.12g}".format(ranker_score_value(bundle, index)),
+                    "{:.12g}".format(ranker_raw_score),
+                    "{:.12g}".format(ranker_selection_score),
+                    "{:.12g}".format(ranker_utility_score),
                     "{:.12g}".format(hybrid_details["base_hybrid_score"]),
                     "{:.12g}".format(hybrid_score),
                     "{:.12g}".format(hybrid_score_basic),
@@ -13433,13 +15283,20 @@ def write_predictions(path, rows, predictions, threshold, model_name,
                     block_flags["blocked_by_fold_trade_limit"],
                     block_flags["blocked_by_daily_loss_limit"],
                     block_flags["blocked_by_daily_drawdown_limit"],
+                    block_flags.get("blocked_by_regime_filter", 0),
                     model_name,
                 ])
             log_memory("Prediction CSV output complete: {}".format(path))
             return
 
         threshold_is_list = isinstance(threshold, list) or (np is not None and isinstance(threshold, np.ndarray))
-        output_indices = sorted(executed) if output_mode == "trades" else range(len(rows))
+        output_indices = prediction_output_indices(
+            output_mode,
+            len(rows),
+            raw_selected,
+            executed,
+            execution["executed_selected_by_topk"],
+        )
         for index in output_indices:
             row = rows[index]
             probability = raw_probability_value(bundle, index)
@@ -13454,6 +15311,7 @@ def write_predictions(path, rows, predictions, threshold, model_name,
                 "blocked_by_fold_trade_limit": 0,
                 "blocked_by_daily_loss_limit": 0,
                 "blocked_by_daily_drawdown_limit": 0,
+                "blocked_by_regime_filter": 0,
             })
             ev_details = expected_value_details_for_bundle(bundle, index, upside_target, downside_stop, fee, slippage, hybrid_runtime_args)
             hybrid_details = hybrid_score_details_for_bundle(
@@ -13472,6 +15330,9 @@ def write_predictions(path, rows, predictions, threshold, model_name,
             hybrid_score_basic = hybrid_details["base_hybrid_score"]
             hybrid_score_risk_adjusted = hybrid_score_value(bundle, index, fee, slippage, "risk_adjusted", hybrid_uncertainty_penalty, hybrid_runtime_args, upside_target, downside_stop)
             hybrid_score = hybrid_details["hybrid_score"]
+            ranker_raw_score = ranker_score_value(bundle, index)
+            ranker_selection_score = ranker_selection_score_value(bundle, index, ranker_raw_score)
+            ranker_utility_score = ranker_utility_score_value(bundle, index)
             effective_threshold = float(effective_hybrid_thresholds[index]) if effective_hybrid_thresholds is not None else (
                 max(float(row_threshold), float(hybrid_min_score)) if objective_mode == "hybrid" else float(row_threshold)
             )
@@ -13499,7 +15360,9 @@ def write_predictions(path, rows, predictions, threshold, model_name,
                 "{:.12g}".format(hybrid_details["calibrated_predicted_trade_return"]),
                 "{:.12g}".format(predicted_net_return),
                 "{:.12g}".format(predicted_return_uncertainty_value(bundle, index)),
-                "{:.12g}".format(ranker_score_value(bundle, index)),
+                "{:.12g}".format(ranker_raw_score),
+                "{:.12g}".format(ranker_selection_score),
+                "{:.12g}".format(ranker_utility_score),
                 "{:.12g}".format(hybrid_details["base_hybrid_score"]),
                 "{:.12g}".format(hybrid_score),
                 "{:.12g}".format(hybrid_score_basic),
@@ -13562,9 +15425,521 @@ def write_predictions(path, rows, predictions, threshold, model_name,
                 block_flags["blocked_by_fold_trade_limit"],
                 block_flags["blocked_by_daily_loss_limit"],
                 block_flags["blocked_by_daily_drawdown_limit"],
+                block_flags.get("blocked_by_regime_filter", 0),
                 model_name,
             ])
     log_memory("Prediction CSV output complete: {}".format(path))
+
+
+def artifact_run_id(args, split_name):
+    return artifact_contracts.stable_hash_json({
+        "input": getattr(args, "input", ""),
+        "split": split_name,
+        "objective_mode": getattr(args, "objective_mode", ""),
+        "trade_selection": getattr(args, "trade_selection", ""),
+        "trade_score": getattr(args, "trade_score", ""),
+        "threshold_grid": getattr(args, "threshold_grid", ""),
+        "fee": getattr(args, "fee", 0.0),
+        "slippage": getattr(args, "slippage", 0.0),
+    })[:16]
+
+
+def candidate_artifact_metadata(args, feature_names, split_name, source_run_id, model_name):
+    serialization_stage = getattr(args, "candidate_serialization_stage", CANDIDATE_SERIALIZATION_POST_SELECTION)
+    return {
+        "source_run_id": source_run_id,
+        "dataset_manifest_signature": getattr(args, "training_manifest_signature", ""),
+        "cache_signature": artifact_contracts.stable_hash_json(getattr(args, "_manifest_for_cache", {}))[:16] if hasattr(args, "_manifest_for_cache") else "",
+        "feature_list_hash": artifact_contracts.stable_hash_json(list(feature_names or [])),
+        "model": model_name,
+        "objective_mode": getattr(args, "objective_mode", ""),
+        "score_names_included": [
+            "raw_probability",
+            "calibrated_probability",
+            "expected_value",
+            "hybrid_score",
+            "ranker_score",
+            "ranker_selection_score",
+            "ranker_utility_score",
+            "final_preselection_score",
+        ],
+        "fold_definitions": {"split": split_name},
+        "candidate_generation_settings": {
+            "prediction_output_mode": getattr(args, "prediction_output_mode", "trades"),
+            "trade_selection": getattr(args, "trade_selection", ""),
+            "trade_score": getattr(args, "trade_score", ""),
+            "top_k_per_minute": getattr(args, "top_k_per_minute", 0),
+            "top_percent_per_period": getattr(args, "top_percent_per_period", 0.0),
+            "top_k_per_symbol_minute": getattr(args, "top_k_per_symbol_minute", 0),
+            "max_trades_per_period": getattr(args, "max_trades_per_period", 0),
+            "trade_period_minutes": getattr(args, "trade_period_minutes", 60),
+        },
+        "fees": {
+            "fee": getattr(args, "fee", 0.0),
+            "fee_mode": getattr(args, "fee_mode", "fixed"),
+            "maker_fee": getattr(args, "maker_fee", None),
+            "taker_fee": getattr(args, "taker_fee", None),
+        },
+        "slippage": getattr(args, "slippage", 0.0) * getattr(args, "test_slippage_multiplier", 1.0),
+        "exit_policy": getattr(args, "exit_policy", "fixed_horizon"),
+        "candidate_serialization_stage": serialization_stage,
+        "pre_filter_candidates_included": serialization_stage == CANDIDATE_SERIALIZATION_PRE_FILTER,
+        "full_candidate_coverage": True,
+    }
+
+
+def row_candidate_context(rows, local_index):
+    if is_compact_rows(rows):
+        position = local_index if rows.indices is None else int(rows.indices[local_index])
+        table = rows.table
+        symbol_code = int(table.symbol_codes[position])
+        return {
+            "symbol": table.symbols[symbol_code],
+            "month": table.months[int(table.month_codes[position])],
+            "month_index": int(table.month_indices[position]),
+            "open_time": int(table.open_times[position]),
+            "label": int(table.labels[position]),
+            "forward_return": float(table.forward_returns[position]),
+            "trade_return": float(table.trade_returns[position]),
+            "max_future_high_return": float(table.max_future_high_returns[position]),
+            "max_future_low_return": float(table.max_future_low_returns[position]),
+            "quote_volume": compact_quote_volume(table, position),
+        }
+    row = rows[local_index]
+    return {
+        "symbol": row.symbol,
+        "month": row.month,
+        "month_index": int(row.month_index),
+        "open_time": int(row.open_time),
+        "label": int(row.label),
+        "forward_return": float(row.forward_return),
+        "trade_return": float(row.trade_return),
+        "max_future_high_return": float(row.max_future_high_return),
+        "max_future_low_return": float(row.max_future_low_return),
+        "quote_volume": float(row.quote_volume),
+    }
+
+
+def rejection_reason_for_candidate(index, execution):
+    if index in execution.get("executed", {}):
+        return "", "executed"
+    ranked = execution.get("ranked_candidate_trade_scores", {})
+    if index not in ranked:
+        return "rank_rejected", "ranking"
+    flags = execution.get("blocked_flags", {}).get(index, {})
+    for key, reason in (
+        ("blocked_by_daily_trade_limit", "daily_trade_limit"),
+        ("blocked_by_fold_trade_limit", "fold_trade_limit"),
+        ("blocked_by_daily_loss_limit", "daily_loss_limit"),
+        ("blocked_by_daily_drawdown_limit", "daily_drawdown_limit"),
+        ("blocked_by_regime_filter", "regime_filter"),
+    ):
+        if int(flags.get(key, 0) or 0):
+            return reason, "execution_constraints"
+    return "capital_or_execution_constraint", "execution_constraints"
+
+
+def candidate_artifact_records(rows, bundle, execution, threshold, args, source, fold_id, source_run_id,
+                               symbol_filter_info=None, threshold_selection_status=None):
+    raw_scores = execution.get("raw_candidate_trade_scores", {})
+    ranked_scores = execution.get("ranked_candidate_trade_scores", {})
+    executed = execution.get("executed", {})
+    serialization_stage = getattr(args, "candidate_serialization_stage", CANDIDATE_SERIALIZATION_POST_SELECTION)
+    raw_selected = execution.get("raw_selected", {})
+    if serialization_stage == CANDIDATE_SERIALIZATION_PRE_FILTER:
+        indices = list(range(len(rows)))
+    else:
+        indices = sorted(int(index) for index in raw_selected)
+    threshold_selection_status = (
+        threshold_selection_status
+        or getattr(args, "threshold_selection_status", "")
+        or (
+            THRESHOLD_STATUS_NO_VALID
+            if not isinstance(threshold, list)
+            and not (np is not None and isinstance(threshold, np.ndarray))
+            and float(threshold) >= no_trade_threshold_for_mode(getattr(args, "objective_mode", "")) - 1e-12
+            else THRESHOLD_STATUS_VALID
+        )
+    )
+    threshold_valid = threshold_selection_status == THRESHOLD_STATUS_VALID
+    allowed_symbols = None
+    if symbol_filter_info and symbol_filter_info.get("enabled"):
+        allowed_symbols = set(symbol_filter_info.get("allowed_symbols", []))
+    objective_mode = getattr(args, "objective_mode", "classification")
+    hybrid_score_mode = getattr(args, "hybrid_score_mode", "basic")
+    hybrid_uncertainty_penalty = getattr(args, "hybrid_uncertainty_penalty", 0.0)
+    selected_score_name = selected_score_name_for_mode(args) if hasattr(args, "threshold_objective") else "probability"
+    threshold_is_list = isinstance(threshold, list) or (np is not None and isinstance(threshold, np.ndarray))
+    hybrid_edge_thresholds = None
+    if objective_mode == "hybrid" and getattr(args, "dynamic_hybrid_thresholds", "none") != "none":
+        hybrid_edge_thresholds, _ = compute_dynamic_hybrid_thresholds(
+            rows,
+            args,
+            float(getattr(args, "hybrid_min_score", 0.0)),
+        )
+    bucket_width = max(1, int(getattr(args, "trade_period_minutes", 60) or 60))
+    execution_buckets = {}
+    period_buckets = {}
+    context_by_index = {}
+    for index in indices:
+        context = row_candidate_context(rows, index)
+        context_by_index[index] = context
+        minute = open_time_minute(context["open_time"])
+        execution_buckets.setdefault(minute, []).append(index)
+        period_bucket_id = minute - (minute % bucket_width)
+        period_buckets.setdefault(period_bucket_id, []).append(index)
+
+    def bucket_rank_maps(buckets):
+        rank_by_index = {}
+        count_by_index = {}
+        for bucket_indices in buckets.values():
+            ordered = sorted(
+                bucket_indices,
+                key=lambda index: (
+                    -float(raw_scores.get(index, ranked_scores.get(index, 0.0))),
+                    -calibrated_probability_value(bundle, index),
+                    index,
+                ),
+            )
+            for rank, index in enumerate(ordered, 1):
+                rank_by_index[index] = rank
+                count_by_index[index] = len(ordered)
+        return rank_by_index, count_by_index
+
+    execution_rank_by_index, execution_count_by_index = bucket_rank_maps(execution_buckets)
+    period_rank_by_index, period_count_by_index = bucket_rank_maps(period_buckets)
+
+    def row_threshold_value(index):
+        return threshold[index] if threshold_is_list else threshold
+
+    def final_preselection_score(index):
+        return raw_scores.get(
+            index,
+            trade_score_value(
+                bundle,
+                index,
+                selected_score_name,
+                getattr(args, "upside_target", 0.05),
+                getattr(args, "downside_stop", 0.02),
+                getattr(args, "fee", 0.0),
+                getattr(args, "slippage", 0.0),
+                hybrid_score_mode,
+                hybrid_uncertainty_penalty,
+                args,
+            ),
+        )
+
+    def threshold_score_value_for_row(index):
+        if objective_mode == "classification":
+            return calibrated_probability_value(bundle, index)
+        if objective_mode == "return_regression":
+            return predicted_net_return_value(
+                bundle,
+                index,
+                getattr(args, "fee", 0.0),
+                getattr(args, "slippage", 0.0),
+            )
+        if objective_mode == "economic_ranking":
+            raw_ranker_score = ranker_score_value(bundle, index)
+            return ranker_threshold_score_value(bundle, index, args, raw_ranker_score)
+        if objective_mode == "hybrid":
+            return hybrid_score_value(
+                bundle,
+                index,
+                getattr(args, "fee", 0.0),
+                getattr(args, "slippage", 0.0),
+                hybrid_score_mode,
+                hybrid_uncertainty_penalty,
+                args,
+                getattr(args, "upside_target", 0.05),
+                getattr(args, "downside_stop", 0.02),
+            )
+        return final_preselection_score(index)
+
+    def score_edge_threshold_for_row(index):
+        if objective_mode != "hybrid":
+            return None
+        if hybrid_edge_thresholds is not None:
+            return float(hybrid_edge_thresholds[index])
+        return float(getattr(args, "hybrid_min_score", 0.0))
+
+    def candidate_filter_flags(index, context):
+        threshold_score = threshold_score_value_for_row(index)
+        row_threshold = float(row_threshold_value(index))
+        score_edge_threshold = score_edge_threshold_for_row(index)
+        selected_by_score_edge = 1
+        if score_edge_threshold is not None:
+            selected_by_score_edge = 1 if threshold_score >= score_edge_threshold else 0
+        selected_by_threshold = 1 if threshold_valid and threshold_score >= row_threshold else 0
+        selected_by_symbol_filter = (
+            1 if allowed_symbols is None or context["symbol"] in allowed_symbols else 0
+        )
+        raw_signal = 1 if index in raw_selected else 0
+        return selected_by_threshold, selected_by_score_edge, selected_by_symbol_filter, raw_signal
+
+    def prefilter_rejection(index, context):
+        selected_by_threshold, selected_by_score_edge, selected_by_symbol_filter, raw_signal = candidate_filter_flags(index, context)
+        if raw_signal:
+            return rejection_reason_for_candidate(index, execution)
+        if not selected_by_symbol_filter:
+            return "symbol_filter_blocked", "symbol_filter"
+        if not selected_by_score_edge:
+            return "score_edge_blocked", "score_edge"
+        if not selected_by_threshold:
+            return "threshold_blocked", "threshold"
+        if not trade_regime_filter_allows(rows, index, args):
+            return "regime_filter", "regime_filter"
+        return "preselection_filter", "preselection"
+
+    for index in indices:
+        context = context_by_index[index]
+        minute = open_time_minute(context["open_time"])
+        execution_bucket_id = minute
+        period_bucket_id = minute - (minute % bucket_width)
+        row_threshold = row_threshold_value(index)
+        if serialization_stage == CANDIDATE_SERIALIZATION_PRE_FILTER:
+            rejection_reason, rejection_stage = prefilter_rejection(index, context)
+        else:
+            rejection_reason, rejection_stage = rejection_reason_for_candidate(index, execution)
+        exit_minutes = execution.get("executed_exit_minutes", {}).get(index, "")
+        exit_timestamp = ""
+        if exit_minutes != "":
+            exit_timestamp = (minute + int(exit_minutes)) * 60 * 1000
+        trade_score = final_preselection_score(index)
+        selected_by_threshold, selected_by_score_edge, selected_by_symbol_filter, raw_signal = candidate_filter_flags(index, context)
+        public_selected_threshold = row_threshold if threshold_valid else ""
+        candidate_id = candidate_artifacts.deterministic_candidate_id(
+            source_run_id,
+            fold_id,
+            index,
+            context["symbol"],
+            context["open_time"],
+        )
+        yield {
+            "candidate_id": candidate_id,
+            "source": source,
+            "stable_row_id": "{}:{}:{}".format(source, fold_id, index),
+            "symbol": context["symbol"],
+            "month": context["month"],
+            "month_index": context["month_index"],
+            "open_time": context["open_time"],
+            "fold_id": fold_id,
+            "decision_bucket_id": execution_bucket_id,
+            "execution_bucket_id": execution_bucket_id,
+            "period_bucket_id": period_bucket_id,
+            "row_position": index,
+            "label": context["label"],
+            "forward_return": context["forward_return"],
+            "trade_return": context["trade_return"],
+            "max_future_high_return": context["max_future_high_return"],
+            "max_future_low_return": context["max_future_low_return"],
+            "quote_volume": context["quote_volume"],
+            "actual_exit_return": execution.get("executed_dynamic_trade_returns", {}).get(index, ""),
+            "exit_timestamp": exit_timestamp,
+            "holding_period_minutes": exit_minutes,
+            "raw_probability": raw_probability_value(bundle, index),
+            "calibrated_probability": calibrated_probability_value(bundle, index),
+            "raw_predicted_return": raw_predicted_trade_return_value(bundle, index),
+            "calibrated_predicted_return": predicted_trade_return_value(bundle, index),
+            "expected_value": expected_value_for_bundle(
+                bundle,
+                index,
+                getattr(args, "upside_target", 0.05),
+                getattr(args, "downside_stop", 0.02),
+                getattr(args, "fee", 0.0),
+                getattr(args, "slippage", 0.0),
+                args,
+            ),
+            "hybrid_score": hybrid_score_value(
+                bundle,
+                index,
+                getattr(args, "fee", 0.0),
+                getattr(args, "slippage", 0.0),
+                getattr(args, "hybrid_score_mode", "basic"),
+                getattr(args, "hybrid_uncertainty_penalty", 0.0),
+                args,
+                getattr(args, "upside_target", 0.05),
+                getattr(args, "downside_stop", 0.02),
+            ),
+            "ranker_score": ranker_score_value(bundle, index),
+            "ranker_selection_score": ranker_selection_score_value(bundle, index, ranker_score_value(bundle, index)),
+            "ranker_utility_score": ranker_utility_score_value(bundle, index),
+            "uncertainty": predicted_return_uncertainty_value(bundle, index),
+            "meta_probability": meta_probability_value(bundle, index),
+            "final_preselection_score": trade_score,
+            "selected_threshold": public_selected_threshold,
+            "candidate_serialization_stage": serialization_stage,
+            "selected_by_threshold": selected_by_threshold,
+            "selected_by_score_edge": selected_by_score_edge,
+            "selected_by_symbol_filter": selected_by_symbol_filter,
+            "selected_by_topk": 1 if index in ranked_scores else 0,
+            "raw_signal": raw_signal,
+            "predicted": 1 if index in executed else 0,
+            "threshold_percentile": "",
+            "candidate_generation_reason": "model_candidate",
+            "rejection_stage": rejection_stage,
+            "rejection_reason": rejection_reason,
+            "selected_by_score_before_execution": 1 if index in ranked_scores else 0,
+            "executed": 1 if index in executed else 0,
+            "position_size": executed.get(index, ""),
+            "rank_within_decision_bucket": execution_rank_by_index.get(index, 0),
+            "candidate_count_within_decision_bucket": execution_count_by_index.get(index, 0),
+            "rank_within_execution_bucket": execution_rank_by_index.get(index, 0),
+            "candidate_count_within_execution_bucket": execution_count_by_index.get(index, 0),
+            "rank_within_period_bucket": period_rank_by_index.get(index, 0),
+            "candidate_count_within_period_bucket": period_count_by_index.get(index, 0),
+            "configured_top_k": getattr(args, "top_k_per_minute", 0),
+            "symbol_exposure_before_selection": "",
+            "capital_available_before_selection": "",
+            "trade_day": day_id_to_string(minute_day_id(minute)),
+            "exit_reason": execution.get("executed_exit_reasons", {}).get(index, ""),
+        }
+
+
+def write_candidate_artifact_for_split(path, rows, bundle, threshold, args, source, fold_id,
+                                       model_name, feature_names, writer=None,
+                                       runtime_args=None, trade_score_name=None,
+                                       symbol_filter_info=None,
+                                       threshold_selection_status=None):
+    if not path and writer is None:
+        return {}
+    runtime_args = runtime_args or args
+    trade_score_name = trade_score_name or score_name_for_args(args)
+    source_run_id = artifact_run_id(args, "{}:{}".format(source, fold_id))
+    execution = portfolio_execution(
+        rows,
+        bundle,
+        threshold,
+        args.fee,
+        args.slippage * args.test_slippage_multiplier,
+        args.initial_capital,
+        args.max_position_fraction,
+        args.max_volume_fraction,
+        args.max_trades_per_period,
+        args.trade_period_minutes,
+        args.holding_period_minutes,
+        args.threshold_objective,
+        args.trade_selection,
+        args.top_k_per_minute,
+        args.upside_target,
+        args.downside_stop,
+        args.ev_safety_margin,
+        args.objective_mode,
+        trade_score_name,
+        args.min_predicted_net_return,
+        getattr(runtime_args, "hybrid_min_score", getattr(args, "hybrid_min_score", 0.0)),
+        args.max_trades_per_day,
+        args.max_trades_per_fold,
+        args.max_losing_trades_per_day,
+        args.max_daily_drawdown,
+        args.pause_after_drawdown_minutes,
+        capture_blocked_details=True,
+        hybrid_runtime_args=runtime_args,
+        symbol_filter_info=symbol_filter_info,
+        candidate_id_namespace=source_run_id,
+    )
+    records = candidate_artifact_records(
+        rows,
+        bundle,
+        execution,
+        threshold,
+        runtime_args,
+        source,
+        fold_id,
+        source_run_id,
+        symbol_filter_info=symbol_filter_info,
+        threshold_selection_status=threshold_selection_status,
+    )
+    if writer is not None:
+        writer.write_records(records)
+        return {}
+    metadata = candidate_artifact_metadata(args, feature_names, source, source_run_id, model_name)
+    return candidate_artifacts.write_candidate_artifact(
+        path,
+        records,
+        metadata=metadata,
+        artifact_format=args.candidate_artifact_format,
+        max_rows=args.candidate_artifact_max_rows,
+    )
+
+
+def write_portfolio_ledger_for_split(path, rows, bundle, threshold, args, source, fold_id,
+                                     runtime_args=None, trade_score_name=None,
+                                     symbol_filter_info=None, writer=None):
+    if (not path and writer is None) or getattr(args, "portfolio_timeline_mode", "none") == "none":
+        return {}
+    runtime_args = runtime_args or args
+    trade_score_name = trade_score_name or score_name_for_args(args)
+    metadata = {
+        "source": source,
+        "fold_id": fold_id,
+        "timeline_mode": getattr(args, "portfolio_timeline_mode", "events"),
+        "drawdown_definition": "realized_equity",
+        "mark_to_market_drawdown_available": False,
+        "source_run_id": artifact_run_id(args, "{}:{}".format(source, fold_id)),
+    }
+    collector = portfolio_ledger.PortfolioEventCollector()
+
+    def run_with_recorder(event_recorder):
+        return portfolio_execution(
+            rows,
+            bundle,
+            threshold,
+            args.fee,
+            args.slippage * args.test_slippage_multiplier,
+            args.initial_capital,
+            args.max_position_fraction,
+            args.max_volume_fraction,
+            args.max_trades_per_period,
+            args.trade_period_minutes,
+            args.holding_period_minutes,
+            args.threshold_objective,
+            args.trade_selection,
+            args.top_k_per_minute,
+            args.upside_target,
+            args.downside_stop,
+            args.ev_safety_margin,
+            args.objective_mode,
+            trade_score_name,
+            args.min_predicted_net_return,
+            getattr(runtime_args, "hybrid_min_score", getattr(args, "hybrid_min_score", 0.0)),
+            args.max_trades_per_day,
+            args.max_trades_per_fold,
+            args.max_losing_trades_per_day,
+            args.max_daily_drawdown,
+            args.pause_after_drawdown_minutes,
+            capture_blocked_details=False,
+            hybrid_runtime_args=runtime_args,
+            symbol_filter_info=symbol_filter_info,
+            portfolio_event_recorder=event_recorder,
+            portfolio_fold_id=fold_id,
+            candidate_id_namespace=metadata["source_run_id"],
+        )
+
+    if writer is not None:
+        execution = run_with_recorder(portfolio_ledger.PortfolioEventFanout(writer, collector))
+        reconciliation = portfolio_ledger.reconcile_events(
+            collector.events,
+            starting_capital=args.initial_capital,
+            reported_total_fees=execution.get("total_fee_amount"),
+            reported_total_slippage=execution.get("total_slippage_amount"),
+        )
+        output_path = str(getattr(writer, "path", path))
+    else:
+        ledger_writer = portfolio_ledger.PortfolioLedgerWriter(path, metadata)
+        with ledger_writer as open_writer:
+            execution = run_with_recorder(portfolio_ledger.PortfolioEventFanout(open_writer, collector))
+        reconciliation = portfolio_ledger.reconcile_ledger_file(
+            path,
+            starting_capital=args.initial_capital,
+            reported_total_fees=execution.get("total_fee_amount"),
+            reported_total_slippage=execution.get("total_slippage_amount"),
+        )
+        output_path = str(path)
+    reconciliation["portfolio_ledger_path"] = output_path
+    reconciliation["portfolio_event_count"] = reconciliation.get("event_count", len(collector.events))
+    reconciliation["drawdown_precision"] = reconciliation.get("drawdown_precision", "exact_realized")
+    return reconciliation
 
 
 METRIC_COLUMNS = [
@@ -13579,11 +15954,20 @@ METRIC_COLUMNS = [
     "test_ratio",
     "threshold_objective",
     "selected_threshold",
+    "threshold_selection_status",
+    "threshold_is_valid",
+    "threshold_fallback_reason",
+    "execution_threshold",
     "selected_score_name",
     "selected_score_threshold",
     "selected_objective_score",
     "selected_base_objective_score",
     "selected_penalized_objective_score",
+    "selected_validation_cost_stress_multiplier",
+    "selected_validation_cost_stress_score",
+    "selected_validation_cost_stress_portfolio_profit",
+    "selected_validation_cost_stress_extra_cost_drag",
+    "selected_cost_stress_penalty_total",
     "selected_validation_max_drawdown",
     "selected_validation_trade_count",
     "selected_validation_raw_signal_count",
@@ -13656,12 +16040,15 @@ METRIC_COLUMNS = [
     "predicted_trades",
     "true_positive_rows",
     "false_positive_rows",
+    "raw_signal_trades_before_regime_filter",
+    "raw_signal_regime_filter_blocked",
     "raw_signal_trades",
     "raw_true_positive_rows",
     "raw_false_positive_rows",
     "raw_precision",
     "raw_recall",
     "raw_f1",
+    *CANDIDATE_UTILITY_METRIC_KEYS,
     "win_rate",
     "average_forward_return",
     "median_forward_return",
@@ -13674,6 +16061,9 @@ METRIC_COLUMNS = [
     "average_gross_return_before_costs",
     "average_net_return_after_costs",
     "average_cost_drag_per_trade",
+    "total_fee_amount",
+    "total_slippage_amount",
+    "total_latency_cost_amount",
     "total_cost_drag",
     "executed_winning_trade_count",
     "executed_losing_trade_count",
@@ -13709,6 +16099,26 @@ METRIC_COLUMNS = [
     "average_profit_per_trade",
     "worst_trade",
     "max_capital_drawdown",
+    "candidate_artifact_path",
+    "candidate_artifact_rows",
+    "candidate_artifact_file_size",
+    "candidate_artifact_complete",
+    "candidate_artifact_full_coverage",
+    "drawdown_precision",
+    "exact_realized_drawdown",
+    "exact_mark_to_market_drawdown",
+    "mark_to_market_drawdown_available",
+    "portfolio_ledger_path",
+    "portfolio_event_count",
+    "portfolio_reconciliation_status",
+    "portfolio_reconciliation_passed",
+    "portfolio_reconciliation_failed",
+    "maximum_capital_utilization",
+    "maximum_open_exposure",
+    "maximum_per_symbol_exposure",
+    "longest_underwater_duration_minutes",
+    "time_to_recovery_minutes",
+    *EXECUTION_AUDIT_METRIC_KEYS,
     "symbol_profit_concentration_top1",
     "symbol_profit_concentration_top3",
     "symbol_trade_concentration_top1",
@@ -13735,6 +16145,7 @@ METRIC_COLUMNS = [
     "same_symbol_streak_blocked",
     "symbol_fold_share_blocked",
     "symbol_minute_cap_blocked",
+    "regime_filter_blocked",
     "ranker_score_upper_quantile",
     "ranker_score_upper_cap",
     "ranker_score_upper_cap_blocked",
@@ -13823,9 +16234,17 @@ METRIC_COLUMNS = [
     "hybrid_gate_rows_above_configured_floor",
     "hybrid_gate_rows_above_effective_floor",
     "hybrid_gate_rows_between_effective_and_configured_floor",
+    "score_edge_value_name",
+    "score_edge_units",
+    "score_edge_floor",
+    "score_edge_candidate_count_before",
+    "score_edge_candidate_count_after",
+    "score_edge_removal_pct",
+    "score_edge_removed_all_candidates",
     "ranker_objective",
     "ranker_min_score",
     "ranker_threshold_search",
+    "ranker_threshold_score",
     "ranker_group_minutes",
     "ranker_min_group_size",
     "ranker_relevance_q1",
@@ -13835,16 +16254,41 @@ METRIC_COLUMNS = [
     "ranker_relevance_mode",
     "ranker_utility_rows",
     "ranker_positive_utility_rows",
+    "ranker_utility_target_margin",
     "ranker_weak_positive_threshold",
     "ranker_useful_positive_threshold",
     "ranker_strong_positive_threshold",
+    "ranker_label_0_rows",
+    "ranker_label_1_rows",
+    "ranker_label_2_rows",
+    "ranker_label_3_rows",
+    "ranker_label_4_rows",
+    "ranker_relevant_rows",
+    "ranker_relevant_row_share",
+    "ranker_utility_regression_blend",
+    "ranker_utility_regression_enabled",
     "ranker_train_group_count",
     "ranker_validation_group_count",
     "ranker_train_average_group_size",
     "ranker_validation_average_group_size",
+    "ranker_selection_calibration",
+    "ranker_selection_calibration_enabled",
+    "ranker_selection_calibration_rows",
+    "ranker_selection_calibration_bins",
+    "ranker_selection_calibration_global_avg_utility",
+    "ranker_selection_calibration_positive_utility_rate",
+    "ranker_selection_calibration_top_bin_avg_utility",
+    "ranker_selection_calibration_top_bin_score",
+    "ranker_selection_calibration_bottom_bin_avg_utility",
+    "ranker_selection_calibration_disabled_reason",
+    "ranker_selection_calibration_top_bin_rejected",
+    "ranker_selection_calibration_top_bin_rejection_floor",
+    "ranker_selection_calibration_top_bin_rejection_reason",
     "threshold_drawdown_penalty",
     "threshold_trade_count_penalty",
     "threshold_diversity_penalty_weight",
+    "threshold_cost_stress_multiplier",
+    "threshold_cost_stress_weight",
     "threshold_top1_concentration_penalty",
     "threshold_top3_concentration_penalty",
     "threshold_trade_top1_concentration_penalty",
@@ -13852,11 +16296,13 @@ METRIC_COLUMNS = [
     "threshold_max_top3_concentration",
     "threshold_max_trade_top1_concentration",
     "threshold_concentration_cap_mode",
+    "threshold_profit_concentration_cap_mode",
     "threshold_require_positive_top_1pct",
     "threshold_max_raw_signal_share",
     "threshold_min_avg_net_return",
     "threshold_min_top_decile_net_return",
     "threshold_min_score_win_loss_gap",
+    "threshold_score_edge_gate",
     "target_validation_trades",
     "threshold_tiebreaker",
     "threshold_diversity_profit_tolerance_ratio",
@@ -13912,6 +16358,8 @@ METRIC_COLUMNS = [
     "ev_payoff_negative_rows",
     "ev_payoff_source",
     "dynamic_hybrid_thresholds",
+    "trade_regime_filter",
+    "trade_regime_breadth_threshold",
     "meta_filter",
     "meta_filter_rows",
     "meta_filter_positive_rate",
@@ -13977,6 +16425,9 @@ METRIC_COLUMNS = [
     "mean_selected_validation_profit_per_active_day",
     "mean_selected_base_objective_score",
     "mean_selected_penalized_objective_score",
+    "mean_selected_validation_cost_stress_score",
+    "mean_selected_validation_cost_stress_portfolio_profit",
+    "mean_selected_cost_stress_penalty_total",
     "active_fold_count",
     "inactive_fold_count",
     "active_fold_rate",
@@ -14023,6 +16474,7 @@ METRIC_COLUMNS = [
     "brier_score",
     "expected_calibration_error",
     "max_calibration_error",
+    "calibration_report_skipped_reason",
     "best_regime_by_avg_trade_return",
     "worst_regime_by_avg_trade_return",
     "best_regime_by_profit",
@@ -14046,6 +16498,14 @@ def metrics_record(model_name, split, objective, threshold, train_rows, validati
     calibration_info = validation_metrics.get("calibration_info", {}) or {}
     if not calibration_info and hasattr(args, "_selected_calibration_info"):
         calibration_info = getattr(args, "_selected_calibration_info") or {}
+    threshold_status = validation_metrics.get("threshold_selection_status", THRESHOLD_STATUS_VALID)
+    threshold_is_valid = int(validation_metrics.get("threshold_is_valid", 1) or 0)
+    public_selected_threshold = threshold if threshold_is_valid else None
+    public_selected_score_threshold = (
+        validation_metrics.get("selected_score_threshold", threshold)
+        if threshold_is_valid
+        else None
+    )
     record = {
         "model": model_name,
         "split": split,
@@ -14057,12 +16517,27 @@ def metrics_record(model_name, split, objective, threshold, train_rows, validati
         "validation_ratio": args.validation_ratio,
         "test_ratio": args.test_ratio,
         "threshold_objective": objective,
-        "selected_threshold": threshold,
+        "selected_threshold": public_selected_threshold,
+        "threshold_selection_status": threshold_status,
+        "threshold_is_valid": threshold_is_valid,
+        "threshold_fallback_reason": validation_metrics.get("threshold_fallback_reason", ""),
+        "execution_threshold": validation_metrics.get("execution_threshold", threshold),
         "selected_score_name": selected_score_name,
-        "selected_score_threshold": validation_metrics.get("selected_score_threshold", threshold),
+        "selected_score_threshold": public_selected_score_threshold,
         "selected_objective_score": resolved_selected_objective_score,
         "selected_base_objective_score": validation_metrics.get("selected_base_objective_score", 0.0),
         "selected_penalized_objective_score": validation_metrics.get("selected_penalized_objective_score", resolved_selected_objective_score),
+        "selected_validation_cost_stress_multiplier": validation_metrics.get("selected_validation_cost_stress_multiplier", 1.0),
+        "selected_validation_cost_stress_score": validation_metrics.get(
+            "selected_validation_cost_stress_score",
+            validation_metrics.get("selected_base_objective_score", 0.0),
+        ),
+        "selected_validation_cost_stress_portfolio_profit": validation_metrics.get(
+            "selected_validation_cost_stress_portfolio_profit",
+            validation_metrics.get("selected_validation_portfolio_profit", 0.0),
+        ),
+        "selected_validation_cost_stress_extra_cost_drag": validation_metrics.get("selected_validation_cost_stress_extra_cost_drag", 0.0),
+        "selected_cost_stress_penalty_total": validation_metrics.get("selected_cost_stress_penalty_total", 0.0),
         "selected_validation_max_drawdown": validation_metrics.get("selected_validation_max_drawdown", 0.0),
         "selected_validation_trade_count": validation_metrics.get("selected_validation_trade_count", 0),
         "selected_validation_raw_signal_count": validation_metrics.get("selected_validation_raw_signal_count", 0),
@@ -14139,6 +16614,15 @@ def metrics_record(model_name, split, objective, threshold, train_rows, validati
         "mean_selected_validation_profit_per_active_day": validation_metrics.get("selected_validation_profit_per_active_day", 0.0),
         "mean_selected_base_objective_score": validation_metrics.get("selected_base_objective_score", 0.0),
         "mean_selected_penalized_objective_score": validation_metrics.get("selected_penalized_objective_score", resolved_selected_objective_score),
+        "mean_selected_validation_cost_stress_score": validation_metrics.get(
+            "selected_validation_cost_stress_score",
+            validation_metrics.get("selected_base_objective_score", 0.0),
+        ),
+        "mean_selected_validation_cost_stress_portfolio_profit": validation_metrics.get(
+            "selected_validation_cost_stress_portfolio_profit",
+            validation_metrics.get("selected_validation_portfolio_profit", 0.0),
+        ),
+        "mean_selected_cost_stress_penalty_total": validation_metrics.get("selected_cost_stress_penalty_total", 0.0),
         "train_rows": len(train_rows),
         "validation_rows": len(validation_rows),
         "test_rows": len(test_rows),
@@ -14188,12 +16672,20 @@ def metrics_record(model_name, split, objective, threshold, train_rows, validati
         "hybrid_gate_rows_above_configured_floor": calibration_info.get("hybrid_gate_rows_above_configured_floor", validation_metrics.get("hybrid_gate_rows_above_configured_floor", 0)),
         "hybrid_gate_rows_above_effective_floor": calibration_info.get("hybrid_gate_rows_above_effective_floor", validation_metrics.get("hybrid_gate_rows_above_effective_floor", 0)),
         "hybrid_gate_rows_between_effective_and_configured_floor": calibration_info.get("hybrid_gate_rows_between_effective_and_configured_floor", validation_metrics.get("hybrid_gate_rows_between_effective_and_configured_floor", 0)),
+        "score_edge_value_name": calibration_info.get("score_edge_value_name", validation_metrics.get("score_edge_value_name", "")),
+        "score_edge_units": calibration_info.get("score_edge_units", validation_metrics.get("score_edge_units", "")),
+        "score_edge_floor": calibration_info.get("score_edge_floor", validation_metrics.get("score_edge_floor", 0.0)),
+        "score_edge_candidate_count_before": calibration_info.get("score_edge_candidate_count_before", validation_metrics.get("score_edge_candidate_count_before", 0)),
+        "score_edge_candidate_count_after": calibration_info.get("score_edge_candidate_count_after", validation_metrics.get("score_edge_candidate_count_after", 0)),
+        "score_edge_removal_pct": calibration_info.get("score_edge_removal_pct", validation_metrics.get("score_edge_removal_pct", 0.0)),
+        "score_edge_removed_all_candidates": calibration_info.get("score_edge_removed_all_candidates", validation_metrics.get("score_edge_removed_all_candidates", 0)),
         "ranker_objective": calibration_info.get("ranker_objective", getattr(args, "ranker_objective", "rank_xendcg") if args.objective_mode == "economic_ranking" else "none"),
         "ranker_min_score": getattr(args, "ranker_min_score", 0.0),
         "ranker_score_upper_quantile": metrics.get("ranker_score_upper_quantile", getattr(args, "ranker_score_upper_quantile", 1.0)),
         "ranker_score_upper_cap": metrics.get("ranker_score_upper_cap", 0.0),
         "ranker_score_upper_cap_blocked": metrics.get("ranker_score_upper_cap_blocked", 0),
         "ranker_threshold_search": int(bool(getattr(args, "ranker_threshold_search", False))),
+        "ranker_threshold_score": ranker_threshold_score_mode(args),
         "ranker_group_minutes": getattr(args, "ranker_group_minutes", 1),
         "ranker_min_group_size": getattr(args, "ranker_min_group_size", 2),
         "ranker_relevance_q1": getattr(args, "ranker_relevance_q1", 0.50),
@@ -14203,13 +16695,36 @@ def metrics_record(model_name, split, objective, threshold, train_rows, validati
         "ranker_relevance_mode": calibration_info.get("ranker_relevance_mode", "none"),
         "ranker_utility_rows": calibration_info.get("ranker_utility_rows", 0),
         "ranker_positive_utility_rows": calibration_info.get("ranker_positive_utility_rows", 0),
+        "ranker_utility_target_margin": calibration_info.get("ranker_utility_target_margin", getattr(args, "ranker_utility_target_margin", 0.0)),
         "ranker_weak_positive_threshold": calibration_info.get("ranker_weak_positive_threshold", 0.0),
         "ranker_useful_positive_threshold": calibration_info.get("ranker_useful_positive_threshold", 0.0),
         "ranker_strong_positive_threshold": calibration_info.get("ranker_strong_positive_threshold", 0.0),
+        "ranker_label_0_rows": calibration_info.get("ranker_label_0_rows", 0),
+        "ranker_label_1_rows": calibration_info.get("ranker_label_1_rows", 0),
+        "ranker_label_2_rows": calibration_info.get("ranker_label_2_rows", 0),
+        "ranker_label_3_rows": calibration_info.get("ranker_label_3_rows", 0),
+        "ranker_label_4_rows": calibration_info.get("ranker_label_4_rows", 0),
+        "ranker_relevant_rows": calibration_info.get("ranker_relevant_rows", 0),
+        "ranker_relevant_row_share": calibration_info.get("ranker_relevant_row_share", 0.0),
+        "ranker_utility_regression_blend": calibration_info.get("ranker_utility_regression_blend", getattr(args, "ranker_utility_regression_blend", 0.0)),
+        "ranker_utility_regression_enabled": calibration_info.get("ranker_utility_regression_enabled", 0),
         "ranker_train_group_count": calibration_info.get("ranker_train_group_count", 0),
         "ranker_validation_group_count": calibration_info.get("ranker_validation_group_count", 0),
         "ranker_train_average_group_size": calibration_info.get("ranker_train_average_group_size", 0.0),
         "ranker_validation_average_group_size": calibration_info.get("ranker_validation_average_group_size", 0.0),
+        "ranker_selection_calibration": calibration_info.get("ranker_selection_calibration", validation_metrics.get("ranker_selection_calibration", "none")),
+        "ranker_selection_calibration_enabled": calibration_info.get("ranker_selection_calibration_enabled", validation_metrics.get("ranker_selection_calibration_enabled", 0)),
+        "ranker_selection_calibration_rows": calibration_info.get("ranker_selection_calibration_rows", validation_metrics.get("ranker_selection_calibration_rows", 0)),
+        "ranker_selection_calibration_bins": calibration_info.get("ranker_selection_calibration_bins", validation_metrics.get("ranker_selection_calibration_bins", 0)),
+        "ranker_selection_calibration_global_avg_utility": calibration_info.get("ranker_selection_calibration_global_avg_utility", validation_metrics.get("ranker_selection_calibration_global_avg_utility", 0.0)),
+        "ranker_selection_calibration_positive_utility_rate": calibration_info.get("ranker_selection_calibration_positive_utility_rate", validation_metrics.get("ranker_selection_calibration_positive_utility_rate", 0.0)),
+        "ranker_selection_calibration_top_bin_avg_utility": calibration_info.get("ranker_selection_calibration_top_bin_avg_utility", validation_metrics.get("ranker_selection_calibration_top_bin_avg_utility", 0.0)),
+        "ranker_selection_calibration_top_bin_score": calibration_info.get("ranker_selection_calibration_top_bin_score", validation_metrics.get("ranker_selection_calibration_top_bin_score", 0.0)),
+        "ranker_selection_calibration_bottom_bin_avg_utility": calibration_info.get("ranker_selection_calibration_bottom_bin_avg_utility", validation_metrics.get("ranker_selection_calibration_bottom_bin_avg_utility", 0.0)),
+        "ranker_selection_calibration_disabled_reason": calibration_info.get("ranker_selection_calibration_disabled_reason", validation_metrics.get("ranker_selection_calibration_disabled_reason", "")),
+        "ranker_selection_calibration_top_bin_rejected": calibration_info.get("ranker_selection_calibration_top_bin_rejected", validation_metrics.get("ranker_selection_calibration_top_bin_rejected", 0)),
+        "ranker_selection_calibration_top_bin_rejection_floor": calibration_info.get("ranker_selection_calibration_top_bin_rejection_floor", validation_metrics.get("ranker_selection_calibration_top_bin_rejection_floor", 0.0)),
+        "ranker_selection_calibration_top_bin_rejection_reason": calibration_info.get("ranker_selection_calibration_top_bin_rejection_reason", validation_metrics.get("ranker_selection_calibration_top_bin_rejection_reason", "")),
         "hybrid_return_combination": getattr(args, "hybrid_return_combination", "probability_times_return"),
         "hybrid_min_probability": getattr(args, "hybrid_min_probability", 0.0),
         "regression_target": getattr(args, "regression_target", "trade_return"),
@@ -14219,6 +16734,8 @@ def metrics_record(model_name, split, objective, threshold, train_rows, validati
         "threshold_drawdown_penalty": args.threshold_drawdown_penalty,
         "threshold_trade_count_penalty": args.threshold_trade_count_penalty,
         "threshold_diversity_penalty_weight": getattr(args, "threshold_diversity_penalty_weight", 0.0),
+        "threshold_cost_stress_multiplier": getattr(args, "threshold_cost_stress_multiplier", 1.0),
+        "threshold_cost_stress_weight": getattr(args, "threshold_cost_stress_weight", 0.0),
         "threshold_top1_concentration_penalty": getattr(args, "threshold_top1_concentration_penalty", 0.0),
         "threshold_top3_concentration_penalty": getattr(args, "threshold_top3_concentration_penalty", 0.0),
         "threshold_trade_top1_concentration_penalty": getattr(args, "threshold_trade_top1_concentration_penalty", 0.0),
@@ -14226,11 +16743,13 @@ def metrics_record(model_name, split, objective, threshold, train_rows, validati
         "threshold_max_top3_concentration": getattr(args, "threshold_max_top3_concentration", 0.0),
         "threshold_max_trade_top1_concentration": getattr(args, "threshold_max_trade_top1_concentration", 0.0),
         "threshold_concentration_cap_mode": getattr(args, "threshold_concentration_cap_mode", "soft"),
+        "threshold_profit_concentration_cap_mode": getattr(args, "threshold_profit_concentration_cap_mode", "hard"),
         "threshold_require_positive_top_1pct": int(bool(getattr(args, "threshold_require_positive_top_1pct", False))),
         "threshold_max_raw_signal_share": getattr(args, "threshold_max_raw_signal_share", 0.0),
         "threshold_min_avg_net_return": getattr(args, "threshold_min_avg_net_return", -999.0),
         "threshold_min_top_decile_net_return": getattr(args, "threshold_min_top_decile_net_return", -999.0),
         "threshold_min_score_win_loss_gap": getattr(args, "threshold_min_score_win_loss_gap", -999.0),
+        "threshold_score_edge_gate": int(bool(getattr(args, "threshold_score_edge_gate", False))),
         "target_validation_trades": args.target_validation_trades,
         "threshold_tiebreaker": getattr(args, "threshold_tiebreaker", "fewer_trades"),
         "threshold_diversity_profit_tolerance_ratio": getattr(args, "threshold_diversity_profit_tolerance_ratio", 0.0),
@@ -14251,6 +16770,8 @@ def metrics_record(model_name, split, objective, threshold, train_rows, validati
         "acceptance_tier": getattr(args, "acceptance_tier", "none"),
         "normalized_microsecond_open_times": NORMALIZED_MICROSECOND_OPEN_TIMES,
         "dynamic_hybrid_thresholds": getattr(args, "dynamic_hybrid_thresholds", "none"),
+        "trade_regime_filter": getattr(args, "trade_regime_filter", "none"),
+        "trade_regime_breadth_threshold": getattr(args, "trade_regime_breadth_threshold", 0.5),
         "meta_filter": getattr(args, "meta_filter", "none"),
         "symbol_filter_min_active_days": getattr(args, "symbol_filter_min_active_days", 0),
         "symbol_filter_max_executed_trade_share": getattr(args, "symbol_filter_max_executed_trade_share", 0.0),
@@ -14554,6 +17075,42 @@ def run_fixed_split(rows, feature_names, args, kind, model_name):
     )
     test_metrics["calibration_info"] = selected.get("calibration_info") or {}
     accumulate_baseline_context(args, test_rows, test_metrics)
+    if getattr(args, "candidate_artifact_out", ""):
+        candidate_manifest = write_candidate_artifact_for_split(
+            args.candidate_artifact_out,
+            test_rows,
+            bundle,
+            selected["threshold"],
+            args,
+            "fixed",
+            "fixed",
+            model_name,
+            feature_names,
+            runtime_args=runtime_args,
+            trade_score_name=selected.get("trade_score_name", score_name_for_args(args)),
+            symbol_filter_info=selected.get("symbol_filter_info"),
+            threshold_selection_status=(selected.get("validation_metrics") or {}).get("threshold_selection_status"),
+        )
+        test_metrics.update({
+            "candidate_artifact_path": args.candidate_artifact_out,
+            "candidate_artifact_rows": candidate_manifest.get("row_count", 0),
+            "candidate_artifact_file_size": candidate_manifest.get("file_size", 0),
+            "candidate_artifact_complete": int(bool(candidate_manifest.get("complete"))),
+            "candidate_artifact_full_coverage": int(bool(candidate_manifest.get("full_candidate_coverage"))),
+        })
+    if getattr(args, "portfolio_ledger_out", "") and getattr(args, "portfolio_timeline_mode", "none") != "none":
+        test_metrics.update(write_portfolio_ledger_for_split(
+            args.portfolio_ledger_out,
+            test_rows,
+            bundle,
+            selected["threshold"],
+            args,
+            "fixed",
+            "fixed",
+            runtime_args=runtime_args,
+            trade_score_name=selected.get("trade_score_name", score_name_for_args(args)),
+            symbol_filter_info=selected.get("symbol_filter_info"),
+        ))
     prediction_write_token = start_profile_stage("prediction_output_write", args.predictions_out)
     write_predictions(
         args.predictions_out,
@@ -14662,6 +17219,9 @@ def aggregate_fold_records(records, model_name, objective):
     selected_objective_values = numeric_values("selected_objective_score", finite_only=True)
     selected_base_values = numeric_values("selected_base_objective_score", finite_only=True)
     selected_penalized_values = numeric_values("selected_penalized_objective_score", finite_only=True)
+    selected_cost_stress_values = numeric_values("selected_validation_cost_stress_score", finite_only=True)
+    selected_cost_stress_profit_values = numeric_values("selected_validation_cost_stress_portfolio_profit", finite_only=True)
+    selected_cost_stress_penalty_values = numeric_values("selected_cost_stress_penalty_total", finite_only=True)
     selected_validation_trade_counts = numeric_values("selected_validation_trade_count")
     selected_validation_drawdowns = numeric_values("selected_validation_max_drawdown")
     selected_validation_active_days = numeric_values("selected_validation_active_days")
@@ -14673,6 +17233,26 @@ def aggregate_fold_records(records, model_name, objective):
     selected_no_trade_folds = sum(
         1 for row in records if int(row.get("selected_validation_trade_count", 0)) <= 0
     )
+    invalid_threshold_folds = sum(
+        1 for row in records if int(row.get("threshold_is_valid", 1) or 0) <= 0
+    )
+    aggregate_threshold_status = (
+        THRESHOLD_STATUS_VALID
+        if invalid_threshold_folds == 0
+        else "mixed_invalid_thresholds"
+    )
+    valid_selected_thresholds = [
+        float(row.get("selected_threshold"))
+        for row in records
+        if int(row.get("threshold_is_valid", 1) or 0) > 0
+        and isinstance(row.get("selected_threshold"), (int, float))
+    ]
+    valid_selected_score_thresholds = [
+        float(row.get("selected_score_threshold"))
+        for row in records
+        if int(row.get("threshold_is_valid", 1) or 0) > 0
+        and isinstance(row.get("selected_score_threshold"), (int, float))
+    ]
     aggregate = {
         "model": model_name,
         "split": "walkforward_average",
@@ -14703,17 +17283,42 @@ def aggregate_fold_records(records, model_name, objective):
         "ensemble_windows": records[0].get("ensemble_windows", ""),
         "ensemble_model_count": records[0].get("ensemble_model_count", 0),
         "ensemble_enabled": records[0].get("ensemble_enabled", 0),
+        "threshold_score_edge_gate": records[0].get("threshold_score_edge_gate", 0),
+        "score_edge_value_name": records[0].get("score_edge_value_name", ""),
+        "score_edge_units": records[0].get("score_edge_units", ""),
+        "score_edge_floor": mean_or_default(numeric_values("score_edge_floor")),
+        "score_edge_candidate_count_before": sum(numeric_values("score_edge_candidate_count_before")),
+        "score_edge_candidate_count_after": sum(numeric_values("score_edge_candidate_count_after")),
+        "score_edge_removal_pct": mean_or_default(numeric_values("score_edge_removal_pct")),
+        "score_edge_removed_all_candidates": sum(numeric_values("score_edge_removed_all_candidates")),
         "train_ratio": records[0].get("train_ratio", 0.0),
         "validation_ratio": records[0].get("validation_ratio", 0.0),
         "test_ratio": records[0].get("test_ratio", 0.0),
         "threshold_objective": objective,
         "threshold_tiebreaker": records[0].get("threshold_tiebreaker", "fewer_trades"),
-        "selected_threshold": sum(float(row["selected_threshold"]) for row in records) / len(records),
+        "selected_threshold": (
+            mean_or_default(valid_selected_thresholds)
+            if invalid_threshold_folds == 0
+            else None
+        ),
+        "threshold_selection_status": aggregate_threshold_status,
+        "threshold_is_valid": 1 if invalid_threshold_folds == 0 else 0,
+        "threshold_fallback_reason": "invalid_threshold_folds={}".format(invalid_threshold_folds) if invalid_threshold_folds else "",
+        "execution_threshold": mean_or_default(numeric_values("execution_threshold")),
         "selected_score_name": records[0].get("selected_score_name", "probability"),
-        "selected_score_threshold": mean_or_default(numeric_values("selected_score_threshold")),
+        "selected_score_threshold": (
+            mean_or_default(valid_selected_score_thresholds)
+            if invalid_threshold_folds == 0
+            else None
+        ),
         "selected_objective_score": mean_or_default(selected_objective_values, -float("inf") if selected_nonfinite_folds == len(records) else 0.0),
         "selected_base_objective_score": mean_or_default(selected_base_values, -float("inf") if selected_nonfinite_folds == len(records) else 0.0),
         "selected_penalized_objective_score": mean_or_default(selected_penalized_values, -float("inf") if selected_nonfinite_folds == len(records) else 0.0),
+        "selected_validation_cost_stress_multiplier": records[0].get("selected_validation_cost_stress_multiplier", 1.0),
+        "selected_validation_cost_stress_score": mean_or_default(selected_cost_stress_values, -float("inf") if selected_nonfinite_folds == len(records) else 0.0),
+        "selected_validation_cost_stress_portfolio_profit": mean_or_default(selected_cost_stress_profit_values),
+        "selected_validation_cost_stress_extra_cost_drag": mean_or_default(numeric_values("selected_validation_cost_stress_extra_cost_drag")),
+        "selected_cost_stress_penalty_total": mean_or_default(selected_cost_stress_penalty_values),
         "selected_validation_trade_count": mean_or_default(selected_validation_trade_counts),
         "selected_validation_max_drawdown": mean_or_default(selected_validation_drawdowns),
         "selected_threshold_tie_rank_reason": records[0].get("selected_threshold_tie_rank_reason", ""),
@@ -14726,6 +17331,9 @@ def aggregate_fold_records(records, model_name, objective):
         "mean_selected_validation_profit_per_active_day": mean_or_default(selected_validation_profit_days),
         "mean_selected_base_objective_score": mean_or_default(selected_base_values, -float("inf") if selected_nonfinite_folds == len(records) else 0.0),
         "mean_selected_penalized_objective_score": mean_or_default(selected_penalized_values, -float("inf") if selected_nonfinite_folds == len(records) else 0.0),
+        "mean_selected_validation_cost_stress_score": mean_or_default(selected_cost_stress_values, -float("inf") if selected_nonfinite_folds == len(records) else 0.0),
+        "mean_selected_validation_cost_stress_portfolio_profit": mean_or_default(selected_cost_stress_profit_values),
+        "mean_selected_cost_stress_penalty_total": mean_or_default(selected_cost_stress_penalty_values),
         "average_gross_return_before_costs": mean_or_default(numeric_values("average_gross_return_before_costs")),
         "average_net_return_after_costs": mean_or_default(numeric_values("average_net_return_after_costs")),
         "trade_weighted_average_gross_return_before_costs": trade_weighted_mean("average_gross_return_before_costs"),
@@ -14741,6 +17349,11 @@ def aggregate_fold_records(records, model_name, objective):
         "ranker_score_upper_quantile": records[0].get("ranker_score_upper_quantile", 1.0),
         "ranker_score_upper_cap": mean_or_default(numeric_values("ranker_score_upper_cap")),
         "ranker_score_upper_cap_blocked": sum(numeric_values("ranker_score_upper_cap_blocked")),
+        "ranker_threshold_score": records[0].get("ranker_threshold_score", "raw"),
+        "ranker_utility_target_margin": records[0].get("ranker_utility_target_margin", 0.0),
+        "ranker_selection_calibration_top_bin_rejected": sum(numeric_values("ranker_selection_calibration_top_bin_rejected")),
+        "ranker_selection_calibration_top_bin_rejection_floor": records[0].get("ranker_selection_calibration_top_bin_rejection_floor", 0.0),
+        "ranker_selection_calibration_top_bin_rejection_reason": records[0].get("ranker_selection_calibration_top_bin_rejection_reason", ""),
         "train_rows": sum(int(row["train_rows"]) for row in records),
         "validation_rows": sum(int(row["validation_rows"]) for row in records),
         "test_rows": sum(int(row["test_rows"]) for row in records),
@@ -14864,6 +17477,35 @@ def run_walk_forward(rows, feature_names, args, kind, model_name):
         hybrid_runtime_args=args,
     )
     finish_profile_stage(init_prediction_token, rows_processed=0, extra_info=args.walk_predictions_out)
+    walk_candidate_writer = None
+    if getattr(args, "walk_candidate_artifact_out", ""):
+        walk_candidate_writer = candidate_artifacts.CandidateArtifactWriter(
+            args.walk_candidate_artifact_out,
+            candidate_artifact_metadata(
+                args,
+                feature_names,
+                "walkforward",
+                artifact_run_id(args, "walkforward"),
+                model_name,
+            ),
+            args.candidate_artifact_format,
+            args.candidate_artifact_max_rows,
+        )
+        walk_candidate_writer.__enter__()
+    walk_ledger_writer = None
+    if getattr(args, "walk_portfolio_ledger_out", "") and getattr(args, "portfolio_timeline_mode", "none") != "none":
+        walk_ledger_writer = portfolio_ledger.PortfolioLedgerWriter(
+            args.walk_portfolio_ledger_out,
+            {
+                "source": "walkforward",
+                "fold_id": "all",
+                "timeline_mode": getattr(args, "portfolio_timeline_mode", "events"),
+                "drawdown_definition": "realized_equity_by_fold",
+                "mark_to_market_drawdown_available": False,
+                "source_run_id": artifact_run_id(args, "walkforward:portfolio_ledger"),
+            },
+        )
+        walk_ledger_writer.__enter__()
     max_fold_start = max_month - args.walk_train_months - args.walk_validation_months - args.walk_test_months + 2
     for fold_start in range(start_fold_index, max(0, max_fold_start)):
         if max_completed_folds and len(fold_records) >= max_completed_folds:
@@ -14990,6 +17632,18 @@ def run_walk_forward(rows, feature_names, args, kind, model_name):
                 finish_profile_stage(fold_rank_fit, rows_processed=len(final_rank_rows))
                 final_selected["ranker_relevance_context"] = dict(final_ranker_context)
                 final_selected["ranker_group_info"] = {"final_train": dict(final_rank_info)}
+                if float(getattr(args, "ranker_utility_regression_blend", 0.0)) > 0.0:
+                    y_rank_utility_final = clip_ranker_utility_values(
+                        ranker_net_utility_values(fit_final_train_rows, args, getattr(args, "validation_slippage_multiplier", 1.0)),
+                        args,
+                    )
+                    final_selected["ranker_utility_model"] = make_model(kind, selected["params"], positive_weight, "return_regression")
+                    fold_utility_fit = start_profile_stage("walkforward_fold_{}_ranker_utility_regression_fit".format(fold_index))
+                    final_selected["ranker_utility_model"].fit(x_final, y_rank_utility_final, feature_names)
+                    finish_profile_stage(fold_utility_fit, rows_processed=len(fit_final_train_rows))
+                    del y_rank_utility_final
+                else:
+                    final_selected["ranker_utility_model"] = None
                 del x_rank_final
                 del y_rank_final
                 del final_rank_rows
@@ -15052,6 +17706,37 @@ def run_walk_forward(rows, feature_names, args, kind, model_name):
         )
         metrics["calibration_info"] = final_selected.get("calibration_info") or {}
         accumulate_baseline_context(args, test_rows, metrics)
+        if walk_candidate_writer is not None:
+            write_candidate_artifact_for_split(
+                "",
+                test_rows,
+                bundle,
+                final_selected["threshold"],
+                args,
+                "walkforward",
+                "fold_{}".format(fold_index),
+                model_name,
+                feature_names,
+                writer=walk_candidate_writer,
+                runtime_args=selected_runtime_args,
+                trade_score_name=final_selected.get("trade_score_name", score_name_for_args(args)),
+                symbol_filter_info=final_selected.get("symbol_filter_info"),
+                threshold_selection_status=(final_selected.get("validation_metrics") or {}).get("threshold_selection_status"),
+            )
+        if walk_ledger_writer is not None:
+            metrics.update(write_portfolio_ledger_for_split(
+                "",
+                test_rows,
+                bundle,
+                final_selected["threshold"],
+                args,
+                "walkforward",
+                "fold_{}".format(fold_index),
+                runtime_args=selected_runtime_args,
+                trade_score_name=final_selected.get("trade_score_name", score_name_for_args(args)),
+                symbol_filter_info=final_selected.get("symbol_filter_info"),
+                writer=walk_ledger_writer,
+            ))
         fold_output_token = start_profile_stage("walkforward_fold_{}_prediction_output".format(fold_index), args.walk_predictions_out)
         write_predictions(
             args.walk_predictions_out,
@@ -15152,6 +17837,38 @@ def run_walk_forward(rows, feature_names, args, kind, model_name):
         finish_profile_stage(fold_cleanup_token, extra_info="cleanup complete")
         memory_checkpoint("Walk-forward fold {} cleanup complete".format(fold_index), args)
 
+    if walk_candidate_writer is not None:
+        walk_candidate_manifest = walk_candidate_writer.close()
+        if fold_records:
+            fold_records[-1].update({
+                "candidate_artifact_path": args.walk_candidate_artifact_out,
+                "candidate_artifact_rows": walk_candidate_manifest.get("row_count", 0),
+                "candidate_artifact_file_size": walk_candidate_manifest.get("file_size", 0),
+                "candidate_artifact_complete": int(bool(walk_candidate_manifest.get("complete"))),
+                "candidate_artifact_full_coverage": int(bool(walk_candidate_manifest.get("full_candidate_coverage"))),
+            })
+    if walk_ledger_writer is not None:
+        walk_ledger_manifest = walk_ledger_writer.close()
+        if fold_records:
+            walk_ledger_summary = portfolio_ledger.reconcile_ledger_file_by_fold(
+                args.walk_portfolio_ledger_out,
+                starting_capital=args.initial_capital,
+            )
+            fold_records[-1].update({
+                "portfolio_ledger_path": args.walk_portfolio_ledger_out,
+                "portfolio_event_count": walk_ledger_manifest.get("event_count", walk_ledger_summary.get("portfolio_event_count", 0)),
+                "portfolio_reconciliation_status": walk_ledger_summary.get("portfolio_reconciliation_status", ""),
+                "portfolio_reconciliation_passed": walk_ledger_summary.get("portfolio_reconciliation_passed", 0),
+                "portfolio_reconciliation_failed": walk_ledger_summary.get("portfolio_reconciliation_failed", 0),
+                "drawdown_precision": walk_ledger_summary.get("drawdown_precision", "exact_realized"),
+                "exact_realized_drawdown": walk_ledger_summary.get("exact_realized_drawdown", 0.0),
+                "mark_to_market_drawdown_available": walk_ledger_summary.get("mark_to_market_drawdown_available", 0),
+                "maximum_capital_utilization": walk_ledger_summary.get("maximum_capital_utilization", 0.0),
+                "maximum_open_exposure": walk_ledger_summary.get("maximum_open_exposure", 0.0),
+                "maximum_per_symbol_exposure": walk_ledger_summary.get("maximum_per_symbol_exposure", 0.0),
+                "longest_underwater_duration_minutes": walk_ledger_summary.get("longest_underwater_duration_minutes", 0.0),
+                "time_to_recovery_minutes": walk_ledger_summary.get("time_to_recovery_minutes", 0.0),
+            })
     if fold_records:
         aggregate = aggregate_fold_records(fold_records, model_name, args.threshold_objective)
         if aggregate:
@@ -15169,10 +17886,13 @@ def run_walk_forward(rows, feature_names, args, kind, model_name):
 def read_logistic_metric(path):
     if not os.path.exists(path):
         return None
-    with open(path, newline="") as handle:
-        reader = csv.DictReader(handle)
-        for row in reader:
-            return row
+    try:
+        with open(path, newline="") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                return row
+    except (OSError, UnicodeError, csv.Error):
+        return None
     return None
 
 
@@ -15224,10 +17944,35 @@ THRESHOLD_DIAGNOSTIC_COLUMNS = [
     "threshold",
     "predicted_trades",
     "raw_signal_trades",
+    "raw_signal_trades_before_regime_filter",
+    "raw_signal_regime_filter_blocked",
     "raw_signal_share",
+    "trade_regime_filter",
     "precision",
     "portfolio_profit",
     "average_net_return_after_costs",
+    "candidate_utility_count",
+    "candidate_utility_diagnostic_rows",
+    "candidate_utility_diagnostics_skipped",
+    "candidate_avg_net_utility",
+    "candidate_positive_utility_count",
+    "candidate_positive_utility_share",
+    "candidate_ranked_positive_utility_count",
+    "candidate_executed_positive_utility_count",
+    "candidate_ranking_positive_utility_recall",
+    "candidate_positive_utility_recall",
+    "candidate_missed_positive_utility_count",
+    "candidate_rank_rejected_positive_utility_count",
+    "candidate_execution_rejected_positive_utility_count",
+    "candidate_missed_best_net_utility",
+    "candidate_missed_avg_net_utility",
+    "candidate_top_1pct_net_utility",
+    "candidate_top_decile_net_utility",
+    "candidate_high_score_loss_count",
+    "candidate_high_score_loss_share",
+    "candidate_high_score_loss_avg_net_utility",
+    "candidate_high_score_loss_total_net_utility",
+    "candidate_score_positive_utility_gap",
     "executed_score_top_1pct_rows",
     "executed_score_top_1pct_avg_net_return",
     "executed_score_top_decile_rows",
@@ -15245,6 +17990,7 @@ THRESHOLD_DIAGNOSTIC_COLUMNS = [
     "top_blocked_bucket_reason",
     "top_blocked_bucket_count",
     "threshold_concentration_cap_mode",
+    "threshold_profit_concentration_cap_mode",
     "over_top1_concentration",
     "over_top3_concentration",
     "over_trade_top1_concentration",
@@ -15346,10 +18092,35 @@ def threshold_diagnostic_records_from_metrics(source_split, fold_index, metrics)
             "threshold": safe_float(item.get("threshold", 0.0), 0.0),
             "predicted_trades": int(safe_float(item.get("predicted_trades", 0), 0.0)),
             "raw_signal_trades": int(safe_float(item.get("raw_signal_trades", 0), 0.0)),
+            "raw_signal_trades_before_regime_filter": int(safe_float(item.get("raw_signal_trades_before_regime_filter", item.get("raw_signal_trades", 0)), 0.0)),
+            "raw_signal_regime_filter_blocked": int(safe_float(item.get("raw_signal_regime_filter_blocked", 0), 0.0)),
             "raw_signal_share": safe_float(item.get("raw_signal_share", 0.0), 0.0),
+            "trade_regime_filter": item.get("trade_regime_filter", ""),
             "precision": safe_float(item.get("precision", 0.0), 0.0),
             "portfolio_profit": safe_float(item.get("portfolio_profit", 0.0), 0.0),
             "average_net_return_after_costs": safe_float(item.get("average_net_return_after_costs", 0.0), 0.0),
+            "candidate_utility_count": int(safe_float(item.get("candidate_utility_count", 0), 0.0)),
+            "candidate_utility_diagnostic_rows": int(safe_float(item.get("candidate_utility_diagnostic_rows", 0), 0.0)),
+            "candidate_utility_diagnostics_skipped": int(safe_float(item.get("candidate_utility_diagnostics_skipped", 0), 0.0)),
+            "candidate_avg_net_utility": safe_float(item.get("candidate_avg_net_utility", 0.0), 0.0),
+            "candidate_positive_utility_count": int(safe_float(item.get("candidate_positive_utility_count", 0), 0.0)),
+            "candidate_positive_utility_share": safe_float(item.get("candidate_positive_utility_share", 0.0), 0.0),
+            "candidate_ranked_positive_utility_count": int(safe_float(item.get("candidate_ranked_positive_utility_count", 0), 0.0)),
+            "candidate_executed_positive_utility_count": int(safe_float(item.get("candidate_executed_positive_utility_count", 0), 0.0)),
+            "candidate_ranking_positive_utility_recall": safe_float(item.get("candidate_ranking_positive_utility_recall", 0.0), 0.0),
+            "candidate_positive_utility_recall": safe_float(item.get("candidate_positive_utility_recall", 0.0), 0.0),
+            "candidate_missed_positive_utility_count": int(safe_float(item.get("candidate_missed_positive_utility_count", 0), 0.0)),
+            "candidate_rank_rejected_positive_utility_count": int(safe_float(item.get("candidate_rank_rejected_positive_utility_count", 0), 0.0)),
+            "candidate_execution_rejected_positive_utility_count": int(safe_float(item.get("candidate_execution_rejected_positive_utility_count", 0), 0.0)),
+            "candidate_missed_best_net_utility": safe_float(item.get("candidate_missed_best_net_utility", 0.0), 0.0),
+            "candidate_missed_avg_net_utility": safe_float(item.get("candidate_missed_avg_net_utility", 0.0), 0.0),
+            "candidate_top_1pct_net_utility": safe_float(item.get("candidate_top_1pct_net_utility", 0.0), 0.0),
+            "candidate_top_decile_net_utility": safe_float(item.get("candidate_top_decile_net_utility", 0.0), 0.0),
+            "candidate_high_score_loss_count": int(safe_float(item.get("candidate_high_score_loss_count", 0), 0.0)),
+            "candidate_high_score_loss_share": safe_float(item.get("candidate_high_score_loss_share", 0.0), 0.0),
+            "candidate_high_score_loss_avg_net_utility": safe_float(item.get("candidate_high_score_loss_avg_net_utility", 0.0), 0.0),
+            "candidate_high_score_loss_total_net_utility": safe_float(item.get("candidate_high_score_loss_total_net_utility", 0.0), 0.0),
+            "candidate_score_positive_utility_gap": safe_float(item.get("candidate_score_positive_utility_gap", 0.0), 0.0),
             "executed_score_top_1pct_rows": int(safe_float(item.get("executed_score_top_1pct_rows", 0), 0.0)),
             "executed_score_top_1pct_avg_net_return": safe_float(item.get("executed_score_top_1pct_avg_net_return", 0.0), 0.0),
             "executed_score_top_decile_rows": int(safe_float(item.get("executed_score_top_decile_rows", 0), 0.0)),
@@ -15367,6 +18138,7 @@ def threshold_diagnostic_records_from_metrics(source_split, fold_index, metrics)
             "top_blocked_bucket_reason": item.get("top_blocked_bucket_reason", ""),
             "top_blocked_bucket_count": int(safe_float(item.get("top_blocked_bucket_count", 0), 0.0)),
             "threshold_concentration_cap_mode": item.get("threshold_concentration_cap_mode", ""),
+            "threshold_profit_concentration_cap_mode": item.get("threshold_profit_concentration_cap_mode", ""),
             "over_top1_concentration": int(safe_float(item.get("over_top1_concentration", 0), 0.0)),
             "over_top3_concentration": int(safe_float(item.get("over_top3_concentration", 0), 0.0)),
             "over_trade_top1_concentration": int(safe_float(item.get("over_trade_top1_concentration", 0), 0.0)),
@@ -15406,6 +18178,15 @@ def threshold_diagnostics_report_from_records(fixed_record, walk_records):
             "threshold_diagnostics_best_avg_net_return_trades": 0,
             "threshold_diagnostics_best_top_decile_net_return": 0.0,
             "threshold_diagnostics_best_top_decile_threshold": 0.0,
+            "threshold_diagnostics_best_candidate_positive_utility_recall": 0.0,
+            "threshold_diagnostics_best_candidate_positive_utility_recall_threshold": 0.0,
+            "threshold_diagnostics_max_candidate_missed_best_net_utility": 0.0,
+            "threshold_diagnostics_max_candidate_missed_best_threshold": 0.0,
+            "threshold_diagnostics_max_candidate_high_score_loss_share": 0.0,
+            "threshold_diagnostics_max_candidate_high_score_loss_threshold": 0.0,
+            "threshold_diagnostics_best_candidate_top_decile_net_utility": 0.0,
+            "threshold_diagnostics_best_candidate_top_decile_threshold": 0.0,
+            "threshold_diagnostics_candidate_utility_skipped_count": 0,
         }
         summary.update(threshold_near_miss_summary_defaults())
         return [skipped_report_row("threshold_diagnostics_unavailable", source_split="", fold_index=0, candidate_index=0)], summary
@@ -15422,6 +18203,36 @@ def threshold_diagnostics_report_from_records(fixed_record, walk_records):
     best_avg = max(trade_rows, key=lambda row: float(row.get("average_net_return_after_costs", 0.0))) if trade_rows else {}
     top_decile_rows = [row for row in trade_rows if int(row.get("executed_score_top_decile_rows", 0) or 0) > 0]
     best_top_decile = max(top_decile_rows, key=lambda row: float(row.get("executed_score_top_decile_avg_net_return", 0.0))) if top_decile_rows else {}
+    candidate_utility_rows = [
+        row for row in rows
+        if int(row.get("candidate_utility_diagnostic_rows", 0) or 0) > 0
+    ]
+    best_candidate_recall = max(
+        candidate_utility_rows,
+        key=lambda row: (
+            float(row.get("candidate_positive_utility_recall", 0.0) or 0.0),
+            int(row.get("candidate_positive_utility_count", 0) or 0),
+        ),
+        default={},
+    )
+    max_missed_utility = max(
+        candidate_utility_rows,
+        key=lambda row: float(row.get("candidate_missed_best_net_utility", 0.0) or 0.0),
+        default={},
+    )
+    max_high_score_loss_share = max(
+        candidate_utility_rows,
+        key=lambda row: (
+            float(row.get("candidate_high_score_loss_share", 0.0) or 0.0),
+            int(row.get("candidate_high_score_loss_count", 0) or 0),
+        ),
+        default={},
+    )
+    best_candidate_top_decile = max(
+        candidate_utility_rows,
+        key=lambda row: float(row.get("candidate_top_decile_net_utility", 0.0) or 0.0),
+        default={},
+    )
     summary = {
         "threshold_diagnostics_rows_available": len(rows),
         "threshold_diagnostics_primary_rejection": primary_rejection,
@@ -15431,6 +18242,17 @@ def threshold_diagnostics_report_from_records(fixed_record, walk_records):
         "threshold_diagnostics_best_avg_net_return_trades": int(best_avg.get("predicted_trades", 0) or 0),
         "threshold_diagnostics_best_top_decile_net_return": float(best_top_decile.get("executed_score_top_decile_avg_net_return", 0.0) or 0.0),
         "threshold_diagnostics_best_top_decile_threshold": float(best_top_decile.get("threshold", 0.0) or 0.0),
+        "threshold_diagnostics_best_candidate_positive_utility_recall": float(best_candidate_recall.get("candidate_positive_utility_recall", 0.0) or 0.0),
+        "threshold_diagnostics_best_candidate_positive_utility_recall_threshold": float(best_candidate_recall.get("threshold", 0.0) or 0.0),
+        "threshold_diagnostics_max_candidate_missed_best_net_utility": float(max_missed_utility.get("candidate_missed_best_net_utility", 0.0) or 0.0),
+        "threshold_diagnostics_max_candidate_missed_best_threshold": float(max_missed_utility.get("threshold", 0.0) or 0.0),
+        "threshold_diagnostics_max_candidate_high_score_loss_share": float(max_high_score_loss_share.get("candidate_high_score_loss_share", 0.0) or 0.0),
+        "threshold_diagnostics_max_candidate_high_score_loss_threshold": float(max_high_score_loss_share.get("threshold", 0.0) or 0.0),
+        "threshold_diagnostics_best_candidate_top_decile_net_utility": float(best_candidate_top_decile.get("candidate_top_decile_net_utility", 0.0) or 0.0),
+        "threshold_diagnostics_best_candidate_top_decile_threshold": float(best_candidate_top_decile.get("threshold", 0.0) or 0.0),
+        "threshold_diagnostics_candidate_utility_skipped_count": sum(
+            int(row.get("candidate_utility_diagnostics_skipped", 0) or 0) for row in rows
+        ),
     }
     summary.update(threshold_near_miss_summary_from_rows(rows))
     for flag, count in flag_counts.items():
@@ -15488,6 +18310,8 @@ def prediction_row_realized_trade_return(row):
 
 RANKING_SCORE_SOURCES = [
     ("ranker_score", "ranker_score"),
+    ("ranker_selection_score", "ranker_selection_score"),
+    ("ranker_utility_score", "ranker_utility_score"),
     ("trade_score", "trade_score"),
     ("hybrid_score", "hybrid_score"),
     ("expected_value", "expected_value"),
@@ -15785,7 +18609,12 @@ def calibration_report_from_predictions(path):
         "skipped_reason",
     ]
     if not path:
-        return [skipped_report_row("prediction_output_missing")], {"brier_score": 0.0, "expected_calibration_error": 0.0, "max_calibration_error": 0.0}
+        return [skipped_report_row("prediction_output_missing")], {
+            "brier_score": 0.0,
+            "expected_calibration_error": 0.0,
+            "max_calibration_error": 0.0,
+            "calibration_report_skipped_reason": "prediction_output_missing",
+        }
     bucket_state = {}
     summary_by_source = {}
     for row in iter_prediction_report_rows(path):
@@ -15821,9 +18650,19 @@ def calibration_report_from_predictions(path):
             source_summary["rows"] += 1
             source_summary["brier_sum"] += (probability - label) ** 2
     if not bucket_state:
-        return [skipped_report_row("prediction_output_empty")], {"brier_score": 0.0, "expected_calibration_error": 0.0, "max_calibration_error": 0.0}
+        return [skipped_report_row("prediction_output_empty")], {
+            "brier_score": 0.0,
+            "expected_calibration_error": 0.0,
+            "max_calibration_error": 0.0,
+            "calibration_report_skipped_reason": "prediction_output_empty",
+        }
     rows = []
-    summary = {"brier_score": 0.0, "expected_calibration_error": 0.0, "max_calibration_error": 0.0}
+    summary = {
+        "brier_score": 0.0,
+        "expected_calibration_error": 0.0,
+        "max_calibration_error": 0.0,
+        "calibration_report_skipped_reason": "",
+    }
     preferred_source = "calibrated_probability" if "calibrated_probability" in summary_by_source else "raw_probability"
     ece_by_source = {}
     max_error_by_source = {}
@@ -16430,8 +19269,28 @@ def write_experiment_report(path, summary):
         "- Slippage: `{:.6f}`".format(summary.get("slippage", 0.0)),
         "- Latency penalty bps: `{:.2f}`".format(summary.get("latency_penalty_bps", 0.0)),
         "- Max open positions: `{}`".format(summary.get("max_open_positions", 0)),
+        "- Trade regime filter: `{}`".format(summary.get("trade_regime_filter", "none")),
+        "- Trade regime breadth threshold: `{:.4f}`".format(summary.get("trade_regime_breadth_threshold", 0.5)),
+        "",
+        "## Chronological Execution Audit",
+        "- Audit status: `{}`".format(execution_summary.get("execution_chronological_audit_status", "")),
+        "- Candidate input rows: `{}`".format(execution_summary.get("execution_input_candidate_count", 0)),
+        "- Candidate input time decreases: `{}`".format(execution_summary.get("execution_input_time_decrease_count", 0)),
+        "- Max backward jump minutes: `{}`".format(execution_summary.get("execution_input_max_backward_minutes", 0)),
+        "- Execution buckets: `{}`".format(execution_summary.get("execution_bucket_count", 0)),
+        "- Max bucket candidates: `{}`".format(execution_summary.get("max_execution_bucket_size", 0)),
+        "- Max same-timestamp executed trades: `{}`".format(execution_summary.get("max_same_timestamp_executed_trades", 0)),
+        "- Max top-k bucket selected count: `{}`".format(execution_summary.get("max_topk_bucket_selected_count", 0)),
+        "- Top-k bucket limit violations: `{}`".format(execution_summary.get("topk_bucket_limit_violation_count", 0)),
+        "- Max concurrent positions: `{}`".format(execution_summary.get("max_concurrent_positions", 0)),
+        "- Max simultaneous capital: `{:.4f}`".format(execution_summary.get("max_simultaneous_capital", 0.0)),
+        "- Max capital usage vs equity: `{:.4f}`".format(execution_summary.get("max_capital_usage_fraction", 0.0)),
+        "- Capital over-allocation checks: `{}`".format(execution_summary.get("capital_overallocated_count", 0)),
         "",
         "## Cost / Score Diagnostics",
+        "- Raw signals before regime filter: `{}`".format(summary.get("raw_signal_trades_before_regime_filter", execution_summary.get("raw_signal_trades_before_regime_filter", 0))),
+        "- Raw signals blocked by regime filter: `{}`".format(summary.get("raw_signal_regime_filter_blocked", execution_summary.get("raw_signal_regime_filter_blocked", 0))),
+        "- Executable candidates blocked by regime filter: `{}`".format(summary.get("regime_filter_blocked", execution_summary.get("regime_filter_blocked", 0))),
         "- Fold-mean gross return before costs: `{:.6f}`".format(execution_summary.get("average_gross_return_before_costs", 0.0)),
         "- Fold-mean net return after costs: `{:.6f}`".format(execution_summary.get("average_net_return_after_costs", 0.0)),
         "- Trade-weighted gross return before costs: `{:.6f}`".format(execution_summary.get("trade_weighted_average_gross_return_before_costs", 0.0)),
@@ -16442,6 +19301,19 @@ def write_experiment_report(path, summary):
         "- Executed winner score avg: `{:.6f}`".format(execution_summary.get("executed_winner_score_avg", 0.0)),
         "- Executed loser score avg: `{:.6f}`".format(execution_summary.get("executed_loser_score_avg", 0.0)),
         "- Winner-minus-loser score gap: `{:.6f}`".format(execution_summary.get("executed_score_win_loss_gap", 0.0)),
+        "",
+        "## Artifact Coverage",
+        "- Candidate artifact: `{}`".format(summary.get("candidate_artifact_path", "")),
+        "- Candidate artifact rows: `{}`".format(summary.get("candidate_artifact_rows", 0)),
+        "- Candidate artifact full coverage: `{}`".format(summary.get("candidate_artifact_full_coverage", 0)),
+        "- Portfolio ledger: `{}`".format(summary.get("portfolio_ledger_path", "")),
+        "- Portfolio events: `{}`".format(summary.get("portfolio_event_count", 0)),
+        "- Reconciliation status: `{}`".format(summary.get("portfolio_reconciliation_status", "")),
+        "- Drawdown precision: `{}`".format(summary.get("drawdown_precision", "legacy_approximate")),
+        "- Exact realized drawdown: `{:.6f}`".format(summary.get("exact_realized_drawdown", 0.0)),
+        "- Mark-to-market drawdown available: `{}`".format(summary.get("mark_to_market_drawdown_available", 0)),
+        "- Maximum capital utilization: `{:.6f}`".format(summary.get("maximum_capital_utilization", 0.0)),
+        "- Maximum per-symbol exposure: `{:.6f}`".format(summary.get("maximum_per_symbol_exposure", 0.0)),
         "",
         "## Walk-Forward Summary",
         "- Folds total: `{}`".format(summary.get("walkforward_folds_total", 0)),
@@ -16454,6 +19326,7 @@ def write_experiment_report(path, summary):
         "- Brier score: `{:.6f}`".format(summary.get("brier_score", 0.0)),
         "- Expected calibration error: `{:.6f}`".format(summary.get("expected_calibration_error", 0.0)),
         "- Max calibration error: `{:.6f}`".format(summary.get("max_calibration_error", 0.0)),
+        "- Calibration skipped reason: `{}`".format(summary.get("calibration_report_skipped_reason", "")),
         "",
         "## Ranking / Tail Diagnostics",
         "- Ranking rows available: `{}`".format(summary.get("ranking_report_rows_available", 0)),
@@ -16479,6 +19352,11 @@ def write_experiment_report(path, summary):
         "- Best candidate threshold: `{:.6f}`".format(summary.get("threshold_diagnostics_best_avg_net_return_threshold", 0.0)),
         "- Best candidate trades: `{}`".format(summary.get("threshold_diagnostics_best_avg_net_return_trades", 0)),
         "- Best top-decile net return: `{:.6f}`".format(summary.get("threshold_diagnostics_best_top_decile_net_return", 0.0)),
+        "- Best candidate positive-utility recall: `{:.4f}`".format(summary.get("threshold_diagnostics_best_candidate_positive_utility_recall", 0.0)),
+        "- Max missed positive utility: `{:.6f}`".format(summary.get("threshold_diagnostics_max_candidate_missed_best_net_utility", 0.0)),
+        "- Max high-score loser share: `{:.4f}`".format(summary.get("threshold_diagnostics_max_candidate_high_score_loss_share", 0.0)),
+        "- Best raw-candidate top-decile utility: `{:.6f}`".format(summary.get("threshold_diagnostics_best_candidate_top_decile_net_utility", 0.0)),
+        "- Candidate utility diagnostics skipped: `{}`".format(summary.get("threshold_diagnostics_candidate_utility_skipped_count", 0)),
         "- Near-miss candidates blocked only by avg-net floor: `{}`".format(summary.get("threshold_diagnostics_near_miss_count", 0)),
         "- Best near-miss split/fold: `{}` / `{}`".format(summary.get("threshold_diagnostics_best_near_miss_source_split", ""), summary.get("threshold_diagnostics_best_near_miss_fold_index", 0)),
         "- Best near-miss threshold: `{:.6f}`".format(summary.get("threshold_diagnostics_best_near_miss_threshold", 0.0)),
@@ -16898,10 +19776,16 @@ def print_comparison(gbdt_record, walk_records, args):
             print("Logistic: metrics file not found at {}".format(args.logistic_metrics_in))
         else:
             print("Logistic: baseline unavailable for this run")
+    threshold_status = str(gbdt_record.get("threshold_selection_status", THRESHOLD_STATUS_VALID) or THRESHOLD_STATUS_VALID)
+    threshold_text = (
+        "{:.4g}".format(float(gbdt_record["selected_threshold"]))
+        if threshold_status == THRESHOLD_STATUS_VALID and int(float(gbdt_record.get("threshold_is_valid", 1) or 0))
+        else "unavailable ({})".format(threshold_status)
+    )
     print(
-        "GBDT: model={} threshold={:.4g} precision={:.4f} recall={:.4f} portfolio_profit={:.2f} portfolio_return={:.4%} safety={}".format(
+        "GBDT: model={} threshold={} precision={:.4f} recall={:.4f} portfolio_profit={:.2f} portfolio_return={:.4%} safety={}".format(
             gbdt_record["model"],
-            float(gbdt_record["selected_threshold"]),
+            threshold_text,
             float(gbdt_record["precision"]),
             float(gbdt_record["recall"]),
             float(gbdt_record["portfolio_profit"]),
@@ -16959,6 +19843,52 @@ def git_commit():
         ).strip()
     except (OSError, subprocess.CalledProcessError):
         return ""
+
+
+def apply_machine_readable_run_status(summary, args):
+    """Annotate successful execution separately from strategy acceptance."""
+    summary["pipeline_execution_status"] = "completed"
+    artifact_requested = bool(summary.get("candidate_artifact_path") or summary.get("walk_candidate_artifact_out") or getattr(args, "candidate_artifact_out", ""))
+    artifact_complete = int(float(summary.get("candidate_artifact_complete", 0) or 0))
+    if artifact_requested:
+        summary["artifact_status"] = "complete" if artifact_complete else "incomplete"
+    else:
+        summary["artifact_status"] = "not_requested"
+    stability_failures = []
+    if int(float(summary.get("capital_overallocated_count", 0) or 0)) > 0:
+        stability_failures.append("capital_overallocated")
+    if str(summary.get("portfolio_reconciliation_status", "") or "") == "failed":
+        stability_failures.append("portfolio_reconciliation_failed")
+    summary["execution_stability_status"] = "failed" if stability_failures else "passed"
+    summary["execution_stability_failures"] = "; ".join(stability_failures)
+    summary["robustness_status"] = summary.get("robustness_gate_status", "not_checked")
+    summary["offline_research_eligible"] = 1 if (
+        summary["pipeline_execution_status"] == "completed"
+        and summary["execution_stability_status"] == "passed"
+        and summary["artifact_status"] in ("complete", "not_requested")
+    ) else 0
+    acceptance_tier = getattr(args, "acceptance_tier", "none")
+    if acceptance_tier != "none" and int(float(summary.get("robustness_gate_failed", 0) or 0)):
+        robust_reason = summary.get("robustness_failed_checks", "robustness_gate_failed")
+        summary["accepted"] = 0
+        summary["failed_acceptance_checks"] = combine_acceptance_failures(
+            summary.get("failed_acceptance_checks", ""),
+            [robust_reason],
+        )
+        summary["rejection_reason"] = combine_acceptance_failures(
+            summary.get("rejection_reason", ""),
+            [robust_reason],
+        )
+        summary["strategy_strength"] = "robustness_rejected"
+    accepted = int(float(summary.get("accepted", 1) or 0))
+    if acceptance_tier == "none" and summary.get("walkforward_gate_status") == "not_applicable":
+        status = "not_checked"
+    else:
+        status = "accepted" if accepted else "rejected"
+    summary["strategy_acceptance_status"] = status
+    summary["strategy_rejected"] = 1 if status == "rejected" else 0
+    summary["rejection_reasons"] = summary.get("rejection_reason", "")
+    return summary
 
 
 def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_record, walk_records):
@@ -17133,6 +20063,7 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
         summary["failed_acceptance_checks"] = robust_summary["robustness_failed_checks"]
         summary["rejection_reason"] = robust_summary["robustness_failed_checks"]
         summary["strategy_strength"] = "robustness_rejected"
+    apply_machine_readable_run_status(summary, args)
     def write_one(output_path):
         with open(output_path, "w", encoding="utf-8") as handle:
             json.dump(summary, handle, indent=2, sort_keys=True)
@@ -17156,6 +20087,7 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
         "ranker_score_upper_cap",
         "ranker_score_upper_cap_blocked",
         "ranker_threshold_search",
+        "ranker_threshold_score",
         "ranker_group_minutes",
         "ranker_min_group_size",
         "ranker_relevance_q1",
@@ -17165,16 +20097,43 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
         "ranker_relevance_mode",
         "ranker_utility_rows",
         "ranker_positive_utility_rows",
+        "ranker_utility_target_margin",
         "ranker_weak_positive_threshold",
         "ranker_useful_positive_threshold",
         "ranker_strong_positive_threshold",
-        "ranker_train_group_count",
-        "ranker_validation_group_count",
-        "ranker_train_average_group_size",
-        "ranker_validation_average_group_size",
+        "ranker_label_0_rows",
+        "ranker_label_1_rows",
+        "ranker_label_2_rows",
+        "ranker_label_3_rows",
+        "ranker_label_4_rows",
+        "ranker_relevant_rows",
+        "ranker_relevant_row_share",
+        "ranker_utility_regression_blend",
+        "ranker_utility_regression_enabled",
+    "ranker_train_group_count",
+    "ranker_validation_group_count",
+    "ranker_train_average_group_size",
+    "ranker_validation_average_group_size",
+    "ranker_selection_calibration",
+    "ranker_selection_calibration_enabled",
+    "ranker_selection_calibration_rows",
+    "ranker_selection_calibration_bins",
+    "ranker_selection_calibration_global_avg_utility",
+    "ranker_selection_calibration_positive_utility_rate",
+    "ranker_selection_calibration_top_bin_avg_utility",
+    "ranker_selection_calibration_top_bin_score",
+    "ranker_selection_calibration_bottom_bin_avg_utility",
+    "ranker_selection_calibration_disabled_reason",
+    "ranker_selection_calibration_top_bin_rejected",
+    "ranker_selection_calibration_top_bin_rejection_floor",
+        "ranker_selection_calibration_top_bin_rejection_reason",
         "selected_score_name",
         "selected_score_threshold",
         "selected_threshold",
+        "threshold_selection_status",
+        "threshold_is_valid",
+        "threshold_fallback_reason",
+        "execution_threshold",
         "exit_policy",
         "trailing_activation_return",
         "trailing_drawdown",
@@ -17199,14 +20158,27 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
         "hybrid_score_mode",
         "hybrid_uncertainty_method",
         "dynamic_hybrid_thresholds",
+        "trade_regime_filter",
+        "trade_regime_breadth_threshold",
+        "regime_filter_blocked",
+        "raw_signal_trades_before_regime_filter",
+        "raw_signal_regime_filter_blocked",
         "meta_filter",
         "symbol_filter_stage",
         "threshold_tiebreaker",
+        "threshold_cost_stress_multiplier",
+        "threshold_cost_stress_weight",
         "threshold_require_positive_top_1pct",
         "threshold_max_raw_signal_share",
         "threshold_min_avg_net_return",
         "threshold_min_top_decile_net_return",
         "threshold_min_score_win_loss_gap",
+        "threshold_score_edge_gate",
+        "threshold_max_top1_concentration",
+        "threshold_max_top3_concentration",
+        "threshold_max_trade_top1_concentration",
+        "threshold_concentration_cap_mode",
+        "threshold_profit_concentration_cap_mode",
         "ensemble_windows",
         "top_k_per_symbol_minute",
         "prefer_unique_symbols",
@@ -17215,6 +20187,24 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
         "max_same_symbol_streak",
         "max_symbol_fold_trade_share",
         "max_symbol_fold_trade_share_min_trades",
+        "candidate_artifact_path",
+        "candidate_artifact_rows",
+        "candidate_artifact_file_size",
+        "candidate_artifact_complete",
+        "candidate_artifact_full_coverage",
+        "portfolio_ledger_path",
+        "portfolio_event_count",
+        "portfolio_reconciliation_status",
+        "portfolio_reconciliation_passed",
+        "mark_to_market_drawdown_available",
+        "drawdown_precision",
+        "exact_realized_drawdown",
+        "exact_mark_to_market_drawdown",
+        "maximum_capital_utilization",
+        "maximum_open_exposure",
+        "maximum_per_symbol_exposure",
+        "longest_underwater_duration_minutes",
+        "time_to_recovery_minutes",
         "portfolio_profit",
         "portfolio_return",
         "precision",
@@ -17242,6 +20232,7 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
         "executed_winner_score_avg",
         "executed_loser_score_avg",
         "executed_score_win_loss_gap",
+        *EXECUTION_AUDIT_METRIC_KEYS,
         "walk_forward_folds",
         "walk_forward_portfolio_profit",
         "walk_forward_portfolio_return",
@@ -17267,6 +20258,15 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
         "failed_acceptance_checks",
         "rejection_reason",
         "strategy_strength",
+        "pipeline_execution_status",
+        "artifact_status",
+        "execution_stability_status",
+        "execution_stability_failures",
+        "strategy_acceptance_status",
+        "strategy_rejected",
+        "rejection_reasons",
+        "robustness_status",
+        "offline_research_eligible",
         "robustness_gates",
         "robustness_gate_action",
         "robustness_gate_status",
@@ -17281,6 +20281,7 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
         "brier_score",
         "expected_calibration_error",
         "max_calibration_error",
+        "calibration_report_skipped_reason",
         "ranking_report_rows_available",
         "ranking_report_score_sources",
         "ranking_trade_score_top_decile_avg_net_return",
@@ -17310,6 +20311,15 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
         "ranking_ranker_score_executed_top_symbol_share",
         "ranking_ranker_score_executed_top_month_share",
         "ranking_ranker_score_tail_warning",
+        "threshold_diagnostics_best_candidate_positive_utility_recall",
+        "threshold_diagnostics_best_candidate_positive_utility_recall_threshold",
+        "threshold_diagnostics_max_candidate_missed_best_net_utility",
+        "threshold_diagnostics_max_candidate_missed_best_threshold",
+        "threshold_diagnostics_max_candidate_high_score_loss_share",
+        "threshold_diagnostics_max_candidate_high_score_loss_threshold",
+        "threshold_diagnostics_best_candidate_top_decile_net_utility",
+        "threshold_diagnostics_best_candidate_top_decile_threshold",
+        "threshold_diagnostics_candidate_utility_skipped_count",
         "threshold_diagnostics_near_miss_count",
         "threshold_diagnostics_near_miss_ignored_flags",
         "threshold_diagnostics_best_near_miss_source_split",
@@ -17380,6 +20390,7 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
         "ranker_score_upper_cap": fixed_record.get("ranker_score_upper_cap", 0.0),
         "ranker_score_upper_cap_blocked": fixed_record.get("ranker_score_upper_cap_blocked", 0),
         "ranker_threshold_search": fixed_record.get("ranker_threshold_search", int(bool(getattr(args, "ranker_threshold_search", False)))),
+        "ranker_threshold_score": fixed_record.get("ranker_threshold_score", ranker_threshold_score_mode(args)),
         "ranker_group_minutes": fixed_record.get("ranker_group_minutes", getattr(args, "ranker_group_minutes", 1)),
         "ranker_min_group_size": fixed_record.get("ranker_min_group_size", getattr(args, "ranker_min_group_size", 2)),
         "ranker_relevance_q1": fixed_record.get("ranker_relevance_q1", getattr(args, "ranker_relevance_q1", 0.50)),
@@ -17389,16 +20400,43 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
         "ranker_relevance_mode": fixed_record.get("ranker_relevance_mode", "none"),
         "ranker_utility_rows": fixed_record.get("ranker_utility_rows", 0),
         "ranker_positive_utility_rows": fixed_record.get("ranker_positive_utility_rows", 0),
+        "ranker_utility_target_margin": fixed_record.get("ranker_utility_target_margin", getattr(args, "ranker_utility_target_margin", 0.0)),
         "ranker_weak_positive_threshold": fixed_record.get("ranker_weak_positive_threshold", 0.0),
         "ranker_useful_positive_threshold": fixed_record.get("ranker_useful_positive_threshold", 0.0),
         "ranker_strong_positive_threshold": fixed_record.get("ranker_strong_positive_threshold", 0.0),
+        "ranker_label_0_rows": fixed_record.get("ranker_label_0_rows", 0),
+        "ranker_label_1_rows": fixed_record.get("ranker_label_1_rows", 0),
+        "ranker_label_2_rows": fixed_record.get("ranker_label_2_rows", 0),
+        "ranker_label_3_rows": fixed_record.get("ranker_label_3_rows", 0),
+        "ranker_label_4_rows": fixed_record.get("ranker_label_4_rows", 0),
+        "ranker_relevant_rows": fixed_record.get("ranker_relevant_rows", 0),
+        "ranker_relevant_row_share": fixed_record.get("ranker_relevant_row_share", 0.0),
+        "ranker_utility_regression_blend": fixed_record.get("ranker_utility_regression_blend", getattr(args, "ranker_utility_regression_blend", 0.0)),
+        "ranker_utility_regression_enabled": fixed_record.get("ranker_utility_regression_enabled", 0),
         "ranker_train_group_count": fixed_record.get("ranker_train_group_count", 0),
         "ranker_validation_group_count": fixed_record.get("ranker_validation_group_count", 0),
         "ranker_train_average_group_size": fixed_record.get("ranker_train_average_group_size", 0.0),
         "ranker_validation_average_group_size": fixed_record.get("ranker_validation_average_group_size", 0.0),
+        "ranker_selection_calibration": fixed_record.get("ranker_selection_calibration", "none"),
+        "ranker_selection_calibration_enabled": fixed_record.get("ranker_selection_calibration_enabled", 0),
+        "ranker_selection_calibration_rows": fixed_record.get("ranker_selection_calibration_rows", 0),
+        "ranker_selection_calibration_bins": fixed_record.get("ranker_selection_calibration_bins", 0),
+        "ranker_selection_calibration_global_avg_utility": fixed_record.get("ranker_selection_calibration_global_avg_utility", 0.0),
+        "ranker_selection_calibration_positive_utility_rate": fixed_record.get("ranker_selection_calibration_positive_utility_rate", 0.0),
+        "ranker_selection_calibration_top_bin_avg_utility": fixed_record.get("ranker_selection_calibration_top_bin_avg_utility", 0.0),
+        "ranker_selection_calibration_top_bin_score": fixed_record.get("ranker_selection_calibration_top_bin_score", 0.0),
+        "ranker_selection_calibration_bottom_bin_avg_utility": fixed_record.get("ranker_selection_calibration_bottom_bin_avg_utility", 0.0),
+        "ranker_selection_calibration_disabled_reason": fixed_record.get("ranker_selection_calibration_disabled_reason", ""),
+        "ranker_selection_calibration_top_bin_rejected": fixed_record.get("ranker_selection_calibration_top_bin_rejected", 0),
+        "ranker_selection_calibration_top_bin_rejection_floor": fixed_record.get("ranker_selection_calibration_top_bin_rejection_floor", 0.0),
+        "ranker_selection_calibration_top_bin_rejection_reason": fixed_record.get("ranker_selection_calibration_top_bin_rejection_reason", ""),
         "selected_score_name": fixed_record.get("selected_score_name", selected_score_name_for_mode(args)),
         "selected_score_threshold": fixed_record.get("selected_score_threshold", fixed_record.get("selected_threshold", 0.0)),
         "selected_threshold": fixed_record.get("selected_threshold", 0.0),
+        "threshold_selection_status": fixed_record.get("threshold_selection_status", THRESHOLD_STATUS_VALID),
+        "threshold_is_valid": fixed_record.get("threshold_is_valid", 1),
+        "threshold_fallback_reason": fixed_record.get("threshold_fallback_reason", ""),
+        "execution_threshold": fixed_record.get("execution_threshold", fixed_record.get("selected_threshold", 0.0)),
         "exit_policy": fixed_record.get("exit_policy", getattr(args, "exit_policy", "fixed_horizon")),
         "trailing_activation_return": fixed_record.get("trailing_activation_return", getattr(args, "trailing_activation_return", 0.01)),
         "trailing_drawdown": fixed_record.get("trailing_drawdown", getattr(args, "trailing_drawdown", 0.003)),
@@ -17423,14 +20461,27 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
         "hybrid_score_mode": fixed_record.get("hybrid_score_mode", getattr(args, "hybrid_score_mode", "basic")),
         "hybrid_uncertainty_method": fixed_record.get("hybrid_uncertainty_method", getattr(args, "hybrid_uncertainty_method", "none")),
         "dynamic_hybrid_thresholds": fixed_record.get("dynamic_hybrid_thresholds", getattr(args, "dynamic_hybrid_thresholds", "none")),
+        "trade_regime_filter": fixed_record.get("trade_regime_filter", getattr(args, "trade_regime_filter", "none")),
+        "trade_regime_breadth_threshold": fixed_record.get("trade_regime_breadth_threshold", getattr(args, "trade_regime_breadth_threshold", 0.5)),
+        "regime_filter_blocked": fixed_record.get("regime_filter_blocked", 0),
+        "raw_signal_trades_before_regime_filter": fixed_record.get("raw_signal_trades_before_regime_filter", 0),
+        "raw_signal_regime_filter_blocked": fixed_record.get("raw_signal_regime_filter_blocked", 0),
         "meta_filter": fixed_record.get("meta_filter", getattr(args, "meta_filter", "none")),
         "symbol_filter_stage": fixed_record.get("symbol_filter_stage", getattr(args, "symbol_filter_stage", "executed")),
         "threshold_tiebreaker": fixed_record.get("threshold_tiebreaker", getattr(args, "threshold_tiebreaker", "fewer_trades")),
+        "threshold_cost_stress_multiplier": fixed_record.get("threshold_cost_stress_multiplier", getattr(args, "threshold_cost_stress_multiplier", 1.0)),
+        "threshold_cost_stress_weight": fixed_record.get("threshold_cost_stress_weight", getattr(args, "threshold_cost_stress_weight", 0.0)),
         "threshold_require_positive_top_1pct": fixed_record.get("threshold_require_positive_top_1pct", int(bool(getattr(args, "threshold_require_positive_top_1pct", False)))),
         "threshold_max_raw_signal_share": fixed_record.get("threshold_max_raw_signal_share", getattr(args, "threshold_max_raw_signal_share", 0.0)),
         "threshold_min_avg_net_return": fixed_record.get("threshold_min_avg_net_return", getattr(args, "threshold_min_avg_net_return", -999.0)),
         "threshold_min_top_decile_net_return": fixed_record.get("threshold_min_top_decile_net_return", getattr(args, "threshold_min_top_decile_net_return", -999.0)),
         "threshold_min_score_win_loss_gap": fixed_record.get("threshold_min_score_win_loss_gap", getattr(args, "threshold_min_score_win_loss_gap", -999.0)),
+        "threshold_score_edge_gate": fixed_record.get("threshold_score_edge_gate", int(bool(getattr(args, "threshold_score_edge_gate", False)))),
+        "threshold_max_top1_concentration": fixed_record.get("threshold_max_top1_concentration", getattr(args, "threshold_max_top1_concentration", 0.0)),
+        "threshold_max_top3_concentration": fixed_record.get("threshold_max_top3_concentration", getattr(args, "threshold_max_top3_concentration", 0.0)),
+        "threshold_max_trade_top1_concentration": fixed_record.get("threshold_max_trade_top1_concentration", getattr(args, "threshold_max_trade_top1_concentration", 0.0)),
+        "threshold_concentration_cap_mode": fixed_record.get("threshold_concentration_cap_mode", getattr(args, "threshold_concentration_cap_mode", "soft")),
+        "threshold_profit_concentration_cap_mode": fixed_record.get("threshold_profit_concentration_cap_mode", getattr(args, "threshold_profit_concentration_cap_mode", "hard")),
         "ensemble_windows": fixed_record.get("ensemble_windows", ",".join(str(value) for value in getattr(args, "ensemble_window_list", []))),
         "top_k_per_symbol_minute": fixed_record.get("top_k_per_symbol_minute", getattr(args, "top_k_per_symbol_minute", 0)),
         "prefer_unique_symbols": fixed_record.get("prefer_unique_symbols", int(bool(getattr(args, "prefer_unique_symbols", False)))),
@@ -17439,6 +20490,24 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
         "max_same_symbol_streak": fixed_record.get("max_same_symbol_streak", getattr(args, "max_same_symbol_streak", 0)),
         "max_symbol_fold_trade_share": fixed_record.get("max_symbol_fold_trade_share", getattr(args, "max_symbol_fold_trade_share", 0.0)),
         "max_symbol_fold_trade_share_min_trades": fixed_record.get("max_symbol_fold_trade_share_min_trades", getattr(args, "max_symbol_fold_trade_share_min_trades", 0)),
+        "candidate_artifact_path": fixed_record.get("candidate_artifact_path", ""),
+        "candidate_artifact_rows": fixed_record.get("candidate_artifact_rows", 0),
+        "candidate_artifact_file_size": fixed_record.get("candidate_artifact_file_size", 0),
+        "candidate_artifact_complete": fixed_record.get("candidate_artifact_complete", 0),
+        "candidate_artifact_full_coverage": fixed_record.get("candidate_artifact_full_coverage", 0),
+        "portfolio_ledger_path": fixed_record.get("portfolio_ledger_path", ""),
+        "portfolio_event_count": fixed_record.get("portfolio_event_count", 0),
+        "portfolio_reconciliation_status": fixed_record.get("portfolio_reconciliation_status", ""),
+        "portfolio_reconciliation_passed": fixed_record.get("portfolio_reconciliation_passed", 0),
+        "mark_to_market_drawdown_available": fixed_record.get("mark_to_market_drawdown_available", 0),
+        "drawdown_precision": fixed_record.get("drawdown_precision", "legacy_approximate"),
+        "exact_realized_drawdown": fixed_record.get("exact_realized_drawdown", 0.0),
+        "exact_mark_to_market_drawdown": fixed_record.get("exact_mark_to_market_drawdown", 0.0),
+        "maximum_capital_utilization": fixed_record.get("maximum_capital_utilization", 0.0),
+        "maximum_open_exposure": fixed_record.get("maximum_open_exposure", 0.0),
+        "maximum_per_symbol_exposure": fixed_record.get("maximum_per_symbol_exposure", 0.0),
+        "longest_underwater_duration_minutes": fixed_record.get("longest_underwater_duration_minutes", 0.0),
+        "time_to_recovery_minutes": fixed_record.get("time_to_recovery_minutes", 0.0),
         "portfolio_profit": fixed_record.get("portfolio_profit", 0.0),
         "portfolio_return": fixed_record.get("portfolio_return", 0.0),
         "precision": fixed_record.get("precision", 0.0),
@@ -17466,6 +20535,10 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
         "executed_winner_score_avg": fixed_record.get("executed_winner_score_avg", 0.0),
         "executed_loser_score_avg": fixed_record.get("executed_loser_score_avg", 0.0),
         "executed_score_win_loss_gap": fixed_record.get("executed_score_win_loss_gap", 0.0),
+        **{
+            key: fixed_record.get(key, "" if key == "execution_chronological_audit_status" else 0.0)
+            for key in EXECUTION_AUDIT_METRIC_KEYS
+        },
         "walk_forward_folds": len(walk_records) - 1 if aggregate else 0,
         "walk_forward_portfolio_profit": aggregate.get("portfolio_profit", 0.0) if aggregate else 0.0,
         "walk_forward_portfolio_return": aggregate.get("portfolio_return", 0.0) if aggregate else 0.0,
@@ -17491,6 +20564,15 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
         "failed_acceptance_checks": summary.get("failed_acceptance_checks", ""),
         "rejection_reason": summary.get("rejection_reason", ""),
         "strategy_strength": summary.get("strategy_strength", "not_checked"),
+        "pipeline_execution_status": summary.get("pipeline_execution_status", ""),
+        "artifact_status": summary.get("artifact_status", ""),
+        "execution_stability_status": summary.get("execution_stability_status", ""),
+        "execution_stability_failures": summary.get("execution_stability_failures", ""),
+        "strategy_acceptance_status": summary.get("strategy_acceptance_status", ""),
+        "strategy_rejected": summary.get("strategy_rejected", 0),
+        "rejection_reasons": summary.get("rejection_reasons", ""),
+        "robustness_status": summary.get("robustness_status", ""),
+        "offline_research_eligible": summary.get("offline_research_eligible", 0),
         "robustness_gates": summary.get("robustness_gates", "warn"),
         "robustness_gate_action": summary.get("robustness_gate_action", "warn"),
         "robustness_gate_status": summary.get("robustness_gate_status", ""),
@@ -17505,6 +20587,7 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
         "brier_score": calibration_summary.get("brier_score", 0.0),
         "expected_calibration_error": calibration_summary.get("expected_calibration_error", 0.0),
         "max_calibration_error": calibration_summary.get("max_calibration_error", 0.0),
+        "calibration_report_skipped_reason": calibration_summary.get("calibration_report_skipped_reason", ""),
         "ranking_report_rows_available": ranking_summary.get("ranking_report_rows_available", 0),
         "ranking_report_score_sources": ranking_summary.get("ranking_report_score_sources", ""),
         "ranking_trade_score_top_decile_avg_net_return": ranking_summary.get("ranking_trade_score_top_decile_avg_net_return", 0.0),
@@ -17534,6 +20617,15 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
         "ranking_ranker_score_executed_top_symbol_share": ranking_summary.get("ranking_ranker_score_executed_top_symbol_share", 0.0),
         "ranking_ranker_score_executed_top_month_share": ranking_summary.get("ranking_ranker_score_executed_top_month_share", 0.0),
         "ranking_ranker_score_tail_warning": ranking_summary.get("ranking_ranker_score_tail_warning", ""),
+        "threshold_diagnostics_best_candidate_positive_utility_recall": threshold_diagnostic_summary.get("threshold_diagnostics_best_candidate_positive_utility_recall", 0.0),
+        "threshold_diagnostics_best_candidate_positive_utility_recall_threshold": threshold_diagnostic_summary.get("threshold_diagnostics_best_candidate_positive_utility_recall_threshold", 0.0),
+        "threshold_diagnostics_max_candidate_missed_best_net_utility": threshold_diagnostic_summary.get("threshold_diagnostics_max_candidate_missed_best_net_utility", 0.0),
+        "threshold_diagnostics_max_candidate_missed_best_threshold": threshold_diagnostic_summary.get("threshold_diagnostics_max_candidate_missed_best_threshold", 0.0),
+        "threshold_diagnostics_max_candidate_high_score_loss_share": threshold_diagnostic_summary.get("threshold_diagnostics_max_candidate_high_score_loss_share", 0.0),
+        "threshold_diagnostics_max_candidate_high_score_loss_threshold": threshold_diagnostic_summary.get("threshold_diagnostics_max_candidate_high_score_loss_threshold", 0.0),
+        "threshold_diagnostics_best_candidate_top_decile_net_utility": threshold_diagnostic_summary.get("threshold_diagnostics_best_candidate_top_decile_net_utility", 0.0),
+        "threshold_diagnostics_best_candidate_top_decile_threshold": threshold_diagnostic_summary.get("threshold_diagnostics_best_candidate_top_decile_threshold", 0.0),
+        "threshold_diagnostics_candidate_utility_skipped_count": threshold_diagnostic_summary.get("threshold_diagnostics_candidate_utility_skipped_count", 0),
         "threshold_diagnostics_near_miss_count": threshold_diagnostic_summary.get("threshold_diagnostics_near_miss_count", 0),
         "threshold_diagnostics_near_miss_ignored_flags": threshold_diagnostic_summary.get("threshold_diagnostics_near_miss_ignored_flags", ""),
         "threshold_diagnostics_best_near_miss_source_split": threshold_diagnostic_summary.get("threshold_diagnostics_best_near_miss_source_split", ""),
@@ -17607,6 +20699,11 @@ def write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_r
         "slippage": getattr(args, "slippage", 0.0) * getattr(args, "test_slippage_multiplier", 1.0),
         "latency_penalty_bps": getattr(args, "latency_penalty_bps", 0.0),
         "max_open_positions": getattr(args, "max_open_positions", 0),
+        "trade_regime_filter": experiment.get("trade_regime_filter", getattr(args, "trade_regime_filter", "none")),
+        "trade_regime_breadth_threshold": experiment.get("trade_regime_breadth_threshold", getattr(args, "trade_regime_breadth_threshold", 0.5)),
+        "regime_filter_blocked": experiment.get("regime_filter_blocked", 0),
+        "raw_signal_trades_before_regime_filter": experiment.get("raw_signal_trades_before_regime_filter", 0),
+        "raw_signal_regime_filter_blocked": experiment.get("raw_signal_regime_filter_blocked", 0),
     })
     if not fast_diagnostics:
         write_experiment_report(args.experiment_report_out, report_summary)
@@ -17691,12 +20788,24 @@ def build_parser():
     parser.add_argument("--ranker-min-score", type=float, default=-1000000000.0)
     parser.add_argument("--ranker-score-upper-quantile", type=float, default=1.0)
     parser.add_argument("--ranker-threshold-search", action="store_true")
+    parser.add_argument("--ranker-threshold-score", choices=["raw", "selection"], default="raw")
     parser.add_argument("--ranker-group-minutes", type=int, default=1)
     parser.add_argument("--ranker-min-group-size", type=int, default=2)
+    parser.add_argument("--ranker-relevance-mode", choices=["train_quantiles", "utility_tail"], default="train_quantiles")
     parser.add_argument("--ranker-relevance-q1", type=float, default=0.50)
     parser.add_argument("--ranker-relevance-q2", type=float, default=0.75)
     parser.add_argument("--ranker-relevance-q3", type=float, default=0.90)
     parser.add_argument("--ranker-adverse-penalty", type=float, default=0.0)
+    parser.add_argument("--ranker-utility-target-margin", type=float, default=0.0)
+    parser.add_argument("--ranker-utility-regression-blend", type=float, default=0.0)
+    parser.add_argument("--ranker-utility-regression-clip-min", type=float, default=-0.03)
+    parser.add_argument("--ranker-utility-regression-clip-max", type=float, default=0.05)
+    parser.add_argument("--ranker-selection-calibration", choices=["none", "score_bucket"], default="none")
+    parser.add_argument("--ranker-selection-calibration-bins", type=int, default=20)
+    parser.add_argument("--ranker-selection-calibration-min-rows", type=int, default=200)
+    parser.add_argument("--ranker-selection-calibration-shrinkage", type=float, default=50.0)
+    parser.add_argument("--ranker-reject-negative-calibration-top-bin", action="store_true")
+    parser.add_argument("--ranker-min-calibration-top-bin-utility", type=float, default=0.0)
     parser.add_argument("--hybrid-min-score", type=float, default=0.0)
     parser.add_argument("--hybrid-min-score-calibration-aware", action="store_true")
     parser.add_argument("--hybrid-min-score-calibration-reference-scale", type=float, default=0.20)
@@ -17709,6 +20818,8 @@ def build_parser():
     parser.add_argument("--conditional-payoff-min-negative-rows", type=int, default=25)
     parser.add_argument("--conditional-payoff-max-rows", type=int, default=500000)
     parser.add_argument("--dynamic-hybrid-thresholds", choices=["none", "btc_regime", "volatility_regime", "btc_volatility_regime"], default="none")
+    parser.add_argument("--trade-regime-filter", choices=TRADE_REGIME_FILTER_CHOICES, default="none")
+    parser.add_argument("--trade-regime-breadth-threshold", type=float, default=0.5)
     parser.add_argument("--btc-bullish-threshold", type=float, default=0.01)
     parser.add_argument("--btc-bearish-threshold", type=float, default=-0.01)
     parser.add_argument("--hybrid-min-score-bullish", type=float, default=0.001)
@@ -17725,6 +20836,7 @@ def build_parser():
     parser.add_argument("--meta-filter", choices=["none", "logistic", "lightgbm"], default="none")
     parser.add_argument("--meta-filter-min-probability", type=float, default=0.5)
     parser.add_argument("--meta-filter-max-rows", type=int, default=500000)
+    parser.add_argument("--enable-symbol-filter-activation-defaults", action="store_true")
     parser.add_argument("--symbol-validation-filter", choices=["none", "positive_avg_profit", "positive_total_profit"], default="none")
     parser.add_argument("--symbol-filter-stage", choices=["executed", "eligible", "candidate_blend"], default="executed")
     parser.add_argument("--symbol-filter-min-candidates", type=int, default=25)
@@ -17751,6 +20863,8 @@ def build_parser():
     parser.add_argument("--threshold-drawdown-penalty", type=float, default=0.0)
     parser.add_argument("--threshold-trade-count-penalty", type=float, default=0.0)
     parser.add_argument("--threshold-diversity-penalty-weight", type=float, default=0.0)
+    parser.add_argument("--threshold-cost-stress-multiplier", type=float, default=1.0)
+    parser.add_argument("--threshold-cost-stress-weight", type=float, default=0.0)
     parser.add_argument("--threshold-burst-trades-per-day-penalty", type=float, default=0.0)
     parser.add_argument("--threshold-burst-max-trades-in-day-penalty", type=float, default=0.0)
     parser.add_argument("--threshold-target-trades-per-day", type=float, default=0.0)
@@ -17767,11 +20881,13 @@ def build_parser():
     parser.add_argument("--threshold-max-top3-concentration", type=float, default=0.0)
     parser.add_argument("--threshold-max-trade-top1-concentration", type=float, default=0.0)
     parser.add_argument("--threshold-concentration-cap-mode", choices=["soft", "hard"], default="soft")
+    parser.add_argument("--threshold-profit-concentration-cap-mode", choices=["soft", "hard"], default="hard")
     parser.add_argument("--threshold-require-positive-top-1pct", action="store_true")
     parser.add_argument("--threshold-max-raw-signal-share", type=float, default=0.0)
     parser.add_argument("--threshold-min-avg-net-return", type=float, default=-999.0)
     parser.add_argument("--threshold-min-top-decile-net-return", type=float, default=-999.0)
     parser.add_argument("--threshold-min-score-win-loss-gap", type=float, default=-999.0)
+    parser.add_argument("--threshold-score-edge-gate", action="store_true")
     parser.add_argument("--target-validation-trades", type=int, default=0)
     parser.add_argument("--threshold-tiebreaker", choices=["fewer_trades", "target_trades", "active_days", "balanced", "diversified"], default="fewer_trades")
     parser.add_argument("--threshold-diversity-profit-tolerance-ratio", type=float, default=0.0)
@@ -17849,6 +20965,9 @@ def build_parser():
     parser.add_argument("--min-mean-fold-return", type=float, default=0.0)
     parser.add_argument("--max-worst-fold-drawdown", type=float, default=1.0)
     parser.add_argument("--acceptance-tier", choices=["none", "exploration", "research", "strong"], default="none")
+    parser.add_argument("--min-active-profitable-fold-rate", type=float, default=0.50)
+    parser.add_argument("--min-walkforward-total-trades", type=int, default=0)
+    parser.add_argument("--min-fixed-test-trades", type=int, default=1)
     parser.add_argument("--robustness-gates", choices=["none", "warn"], default="warn")
     parser.add_argument("--robustness-gate-action", choices=["warn", "reject"], default="warn")
     parser.add_argument("--robust-min-trades", type=int, default=10)
@@ -17864,7 +20983,21 @@ def build_parser():
     parser.add_argument("--robust-require-positive-top-decile", action="store_true")
     parser.add_argument("--robust-min-executed-score-gap", type=float, default=-999.0)
     parser.add_argument("--robust-require-positive-total-profit", action="store_true")
-    parser.add_argument("--prediction-output-mode", choices=["all", "trades", "none"], default="trades")
+    parser.add_argument("--prediction-output-mode", choices=["all", "trades", "candidates", "candidate_only", "none"], default="trades")
+    parser.add_argument("--candidate-artifact-out", default="")
+    parser.add_argument("--walk-candidate-artifact-out", default="")
+    parser.add_argument("--candidate-artifact-format", choices=["csv", "csv_gzip"], default="csv_gzip")
+    parser.add_argument("--candidate-artifact-compression", choices=["none", "gzip"], default="gzip")
+    parser.add_argument("--candidate-artifact-batch-rows", type=int, default=50000)
+    parser.add_argument("--candidate-artifact-max-rows", type=int, default=0)
+    parser.add_argument(
+        "--candidate-serialization-stage",
+        choices=[CANDIDATE_SERIALIZATION_POST_SELECTION, CANDIDATE_SERIALIZATION_PRE_FILTER],
+        default=CANDIDATE_SERIALIZATION_POST_SELECTION,
+    )
+    parser.add_argument("--portfolio-ledger-out", default="")
+    parser.add_argument("--walk-portfolio-ledger-out", default="")
+    parser.add_argument("--portfolio-timeline-mode", choices=["none", "events", "realized", "minute_mark"], default="none")
     parser.add_argument("--predictions-out", default="kline_growth_predictions_gbdt.csv")
     parser.add_argument("--metrics-out", default="kline_growth_metrics_gbdt.csv")
     parser.add_argument("--walkforward-metrics-out", default="kline_growth_walkforward_metrics.csv")
@@ -17903,11 +21036,29 @@ def main(argv):
     args._explicit_flags = explicit_flags
     configure_output_paths(args)
     budget_applied = apply_memory_budget_defaults(args, explicit_flags)
+    score_edge_gate_applied = apply_threshold_score_edge_gate(args, explicit_flags)
     diversity_defaults_applied = apply_diversity_selection_defaults(args, explicit_flags)
+    symbol_filter_activation_applied = apply_symbol_filter_activation_defaults(args, explicit_flags)
+    if score_edge_gate_applied:
+        print(
+            "Threshold score-edge gate enabled: min_top_decile_net_return={} min_score_win_loss_gap={}".format(
+                args.threshold_min_top_decile_net_return,
+                args.threshold_min_score_win_loss_gap,
+            ),
+            flush=True,
+        )
     if diversity_defaults_applied:
         print(
             "Diversity selection defaults enabled: tie-breaker={} symbol_filter={} stage={}".format(
                 args.threshold_tiebreaker,
+                args.symbol_validation_filter,
+                args.symbol_filter_stage,
+            ),
+            flush=True,
+        )
+    if symbol_filter_activation_applied:
+        print(
+            "Symbol filter activation default enabled: symbol_validation_filter={} stage={}".format(
                 args.symbol_validation_filter,
                 args.symbol_filter_stage,
             ),
@@ -18035,6 +21186,10 @@ def main(argv):
         raise ValueError("--threshold-trade-count-penalty cannot be negative")
     if args.threshold_diversity_penalty_weight < 0.0:
         raise ValueError("--threshold-diversity-penalty-weight cannot be negative")
+    if args.threshold_cost_stress_multiplier < 1.0:
+        raise ValueError("--threshold-cost-stress-multiplier must be at least 1")
+    if args.threshold_cost_stress_weight < 0.0:
+        raise ValueError("--threshold-cost-stress-weight cannot be negative")
     if args.threshold_burst_trades_per_day_penalty < 0.0:
         raise ValueError("--threshold-burst-trades-per-day-penalty cannot be negative")
     if args.threshold_burst_max_trades_in_day_penalty < 0.0:
@@ -18109,8 +21264,22 @@ def main(argv):
         raise ValueError("--ranker-relevance quantiles must be nondecreasing")
     if args.ranker_adverse_penalty < 0.0:
         raise ValueError("--ranker-adverse-penalty cannot be negative")
+    if args.ranker_utility_target_margin < 0.0:
+        raise ValueError("--ranker-utility-target-margin cannot be negative")
+    if not 0.0 <= args.ranker_utility_regression_blend <= 1.0:
+        raise ValueError("--ranker-utility-regression-blend must be between 0 and 1")
+    if args.ranker_utility_regression_clip_min > args.ranker_utility_regression_clip_max:
+        raise ValueError("--ranker-utility-regression-clip-min cannot exceed --ranker-utility-regression-clip-max")
     if not 0.0 < args.ranker_score_upper_quantile <= 1.0:
         raise ValueError("--ranker-score-upper-quantile must be greater than 0 and at most 1")
+    if args.ranker_selection_calibration_bins < 2:
+        raise ValueError("--ranker-selection-calibration-bins must be at least 2")
+    if args.ranker_selection_calibration_min_rows < 1:
+        raise ValueError("--ranker-selection-calibration-min-rows must be at least 1")
+    if args.ranker_selection_calibration_shrinkage < 0.0:
+        raise ValueError("--ranker-selection-calibration-shrinkage cannot be negative")
+    if not math.isfinite(args.ranker_min_calibration_top_bin_utility):
+        raise ValueError("--ranker-min-calibration-top-bin-utility must be finite")
     if args.max_bin < 2:
         raise ValueError("--max-bin must be at least 2")
     if args.subsample_for_bin <= 0:
@@ -18157,6 +21326,12 @@ def main(argv):
         raise ValueError("--walk-forward-start-fold cannot be negative")
     if args.walk_forward_max_folds < 0:
         raise ValueError("--walk-forward-max-folds cannot be negative")
+    if not 0.0 <= args.min_active_profitable_fold_rate <= 1.0:
+        raise ValueError("--min-active-profitable-fold-rate must be between 0 and 1")
+    if args.min_walkforward_total_trades < 0:
+        raise ValueError("--min-walkforward-total-trades cannot be negative")
+    if args.min_fixed_test_trades < 0:
+        raise ValueError("--min-fixed-test-trades cannot be negative")
     if args.robust_min_trades < 0:
         raise ValueError("--robust-min-trades cannot be negative")
     if args.robust_min_active_days < 0:
@@ -18230,6 +21405,20 @@ def main(argv):
     if args.execution_delay_minutes:
         print("Warning: --execution-delay-minutes requires delayed-entry price data that is not available in this pipeline; continuing with delay disabled.", file=sys.stderr, flush=True)
         args.execution_delay_minutes = 0
+    if args.prediction_output_mode == "candidate_only":
+        args.prediction_output_mode = "candidates"
+    if args.candidate_artifact_batch_rows <= 0:
+        raise ValueError("--candidate-artifact-batch-rows must be positive")
+    if args.candidate_artifact_max_rows < 0:
+        raise ValueError("--candidate-artifact-max-rows cannot be negative")
+    if args.candidate_artifact_compression == "gzip" and args.candidate_artifact_format == "csv":
+        args.candidate_artifact_format = "csv_gzip"
+    if args.portfolio_timeline_mode != "none":
+        if not args.portfolio_ledger_out:
+            args.portfolio_ledger_out = "kline_growth_portfolio_events.csv.gz"
+        if args.walk_forward and not args.walk_portfolio_ledger_out:
+            args.walk_portfolio_ledger_out = "kline_growth_portfolio_events_walkforward.csv.gz"
+        configure_output_paths(args)
     if args.prediction_output_mode == "all":
         print("Warning: --prediction-output-mode all can create very large CSV files.", file=sys.stderr, flush=True)
     if args.acceptance_tier != "none" and args.require_positive_walkforward:
@@ -18313,6 +21502,8 @@ def main(argv):
     fixed_record = {}
     walk_records = []
     symbol_filter_records = []
+    exit_artifacts_started = False
+    run_completed = False
     try:
         training_manifest_path_for_args = training_manifest_path(args.input)
         check_free_disk(args.input, args, "startup")
@@ -18339,6 +21530,7 @@ def main(argv):
             training_manifest_path_for_args,
             args.cache_only,
         )
+        exit_artifacts_started = True
         rows, feature_names = maybe_augment_market_breadth_rows(
             rows,
             feature_names,
@@ -18381,6 +21573,7 @@ def main(argv):
         write_run_summaries(args, rows, feature_names, kind, fixed_selected, fixed_record, walk_records)
         finish_profile_stage(summary_write_token, rows_processed=1, extra_info=args.run_summary_out)
         print_comparison(fixed_record, walk_records, args)
+        run_completed = True
         del fixed_selected
         gc.collect()
     except MemoryLimitExceeded as error:
@@ -18406,9 +21599,12 @@ def main(argv):
                 pass
             TEMP_PREDICTION_PATHS.discard(path)
         gc.collect()
-        write_pipeline_profile(args.profile_out)
-        postprocess_output_files(args)
+        if exit_artifacts_started or rows is not None:
+            write_pipeline_profile(args.profile_out)
+            postprocess_output_files(args)
         log_memory("Cleanup complete")
+        if run_completed:
+            write_candidate_artifact_created_files_inventory(args)
     return 0
 
 

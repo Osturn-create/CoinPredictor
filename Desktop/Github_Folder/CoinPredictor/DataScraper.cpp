@@ -2074,6 +2074,8 @@ const Sample *sampleAtTime(const std::vector<Sample> &samples, long long timeOrd
     return NULL;
 }
 
+void runPortfolioSelfTests();
+
 void runSelfTests() {
     std::vector<Candle> base(70);
     for (size_t i = 0; i < base.size(); ++i) {
@@ -2261,6 +2263,8 @@ void runSelfTests() {
                     - futureChangedBreadth.pointsByOpenTime.find(testedOpenTime)->second.averageReturn5m) > 1e-12) {
         throw std::runtime_error("self-test failed: market breadth used future candles");
     }
+
+    runPortfolioSelfTests();
 
     std::cout << "C++ offline self-tests passed.\n";
 }
@@ -2848,7 +2852,41 @@ PortfolioExecution simulatePortfolio(
     result.worstTrade = positionProfits.empty()
         ? 0.0
         : *std::min_element(positionProfits.begin(), positionProfits.end());
+    result.maxCapitalDrawdown = options.initialCapital > 0.0
+        ? result.maxCapitalDrawdown / options.initialCapital
+        : 0.0;
     return result;
+}
+
+void runPortfolioSelfTests() {
+    ScraperOptions options;
+    options.initialCapital = 10000.0;
+    options.maxPositionFraction = 0.10;
+    options.maxVolumeFraction = 1.0;
+    options.maxTradesPerPeriod = 0;
+    options.holdingPeriodMinutes = 1;
+    options.fee = 0.0;
+    options.slippage = 0.0;
+
+    Sample sample;
+    sample.symbol = "TEST";
+    sample.month = "2020-01";
+    sample.monthIndex = 0;
+    sample.timeOrder = 0;
+    sample.label = 0;
+    sample.forwardReturn = -0.10;
+    sample.tradeReturn = -0.10;
+    sample.maxFutureHighReturn = 0.0;
+    sample.maxFutureLowReturn = -0.10;
+    sample.quoteVolume = 1000000000.0;
+
+    const std::vector<Sample> samples(1, sample);
+    const std::vector<double> probabilities(1, 1.0);
+    const PortfolioExecution execution = simulatePortfolio(samples, probabilities, 0.5, options);
+    if (std::fabs(execution.portfolioProfit + 100.0) > 1e-9
+            || std::fabs(execution.maxCapitalDrawdown - 0.01) > 1e-12) {
+        throw std::runtime_error("self-test failed: portfolio drawdown fraction");
+    }
 }
 
 EvaluationMetrics evaluatePredictions(
@@ -3350,16 +3388,16 @@ void writeModel(
 
 } // namespace
 
-void scrapeHistoricalCoinData(const std::vector<std::string> &symbolOverrides) {
+int scrapeHistoricalCoinDataStatus(const std::vector<std::string> &symbolOverrides) {
     try {
         ScraperOptions options;
         std::vector<std::string> symbolArgs;
         if (!parseArguments(symbolOverrides, options, symbolArgs)) {
-            return;
+            return 0;
         }
         if (options.selfTest) {
             runSelfTests();
-            return;
+            return 0;
         }
         const std::vector<std::string> symbols = readRequestedSymbols(symbolArgs);
         std::vector<Sample> trainingSamples;
@@ -3482,7 +3520,7 @@ void scrapeHistoricalCoinData(const std::vector<std::string> &symbolOverrides) {
                 std::cout << "no training outputs";
             }
             std::cout << ". Skipped C++ logistic baseline because --generate-only was set.\n";
-            return;
+            return 0;
         }
 
         EvaluationMetrics validationMetrics;
@@ -3506,9 +3544,15 @@ void scrapeHistoricalCoinData(const std::vector<std::string> &symbolOverrides) {
                   << " | Recall: " << (testMetrics.recall * 100.0) << "%"
                   << " | Portfolio profit: " << testMetrics.portfolioProfit
                   << " | Portfolio return: " << (testMetrics.portfolioReturn * 100.0) << "%\n";
+        return 0;
     } catch (const std::exception &error) {
         std::cerr << "Data scraper failed: " << error.what() << '\n';
+        return 1;
     }
+}
+
+void scrapeHistoricalCoinData(const std::vector<std::string> &symbolOverrides) {
+    (void)scrapeHistoricalCoinDataStatus(symbolOverrides);
 }
 
 void scrapeHistoricalCoinData() {
@@ -3522,7 +3566,6 @@ int main(int argc, char **argv) {
         symbols.push_back(argv[i]);
     }
 
-    scrapeHistoricalCoinData(symbols);
-    return 0;
+    return scrapeHistoricalCoinDataStatus(symbols);
 }
 #endif

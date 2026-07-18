@@ -5,6 +5,9 @@ import io
 import json
 import math
 import os
+from pathlib import Path
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -17,8 +20,14 @@ if TEST_DIR not in sys.path:
     sys.path.insert(0, TEST_DIR)
 
 import gbdt_pipeline as pipeline
+import candidate_artifacts
+import created_file_inventory
 import merge_shard_dataset_cache as merge_shard_dataset_cache
+import offline_candidate_research
+import portfolio_ledger
+import research_diagnostics
 import run_experiments
+from tools import verify_cpp_build
 
 
 HEADER = [
@@ -789,6 +798,44 @@ class PipelineTests(unittest.TestCase):
                 [dataset_a, dataset_b],
             )
 
+    def test_merge_shard_dataset_cache_failed_manifest_update_keeps_original_manifest(self):
+        destination_dir = os.path.join(self.temp.name, "destination_dataset")
+        source_dir = os.path.join(self.temp.name, "source_dataset")
+        write_sharded_dataset(destination_dir, [
+            {
+                "symbol": "AAAUSDT",
+                "month": "2020-01",
+                "rows": [
+                    self.shard_row("AAAUSDT", "2020-01", 0, 1600000000000, 1, 0.02, 100000.0),
+                ],
+            },
+        ])
+        write_sharded_dataset(source_dir, [
+            {
+                "symbol": "BBBUSDT",
+                "month": "2020-01",
+                "rows": [
+                    self.shard_row("BBBUSDT", "2020-01", 0, 1600000000000, 1, 0.02, 100000.0),
+                ],
+            },
+        ])
+        manifest_path = os.path.join(destination_dir, "kline_growth_dataset.meta.json")
+        with open(manifest_path, encoding="utf-8") as handle:
+            original_manifest = json.load(handle)
+
+        def write_partial_then_fail(payload, handle, *args, **kwargs):
+            del payload, args, kwargs
+            handle.write('{"partial":')
+            raise RuntimeError("simulated manifest write failure")
+
+        with mock.patch.object(merge_shard_dataset_cache.json, "dump", side_effect=write_partial_then_fail):
+            with self.assertRaisesRegex(RuntimeError, "simulated manifest write failure"):
+                merge_shard_dataset_cache.update_destination_manifest(destination_dir, [source_dir])
+
+        with open(manifest_path, encoding="utf-8") as handle:
+            preserved_manifest = json.load(handle)
+        self.assertEqual(preserved_manifest, original_manifest)
+
     @unittest.skipUnless(pipeline.np is not None, "requires numpy-backed compact cache")
     def test_market_breadth_sidecar_augmentation_uses_existing_sharded_cache(self):
         dataset_dir = os.path.join(self.temp.name, "dataset")
@@ -1028,6 +1075,37 @@ class PipelineTests(unittest.TestCase):
             writer.writerow(["TESTUSDT", "2020-01", 0, 1600000000000, 0, 0.0])
         with self.assertRaisesRegex(ValueError, "quote_volume or log_quote_volume"):
             pipeline.load_rows(path, "float32", disable_cache=True)
+
+    def test_invalid_open_time_fails_in_object_row_loader(self):
+        path = os.path.join(self.temp.name, "invalid-open-time.csv")
+        with open(path, "w", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(HEADER)
+            writer.writerow([
+                "TESTUSDT", "2020-01", 0, "not-a-time", 0,
+                -0.005, -0.005, 0.01, -0.01, 100000.0, pipeline.math.log1p(100000.0), 0.0,
+            ])
+        write_training_manifest(path)
+        with self.assertRaisesRegex(ValueError, "open_time must be numeric"):
+            pipeline.load_rows(path, "float32", disable_cache=True)
+
+    @unittest.skipUnless(pipeline.np is not None, "requires numpy-backed compact cache")
+    def test_invalid_open_time_fails_in_compact_loader(self):
+        path = os.path.join(self.temp.name, "invalid-open-time-compact.csv")
+        with open(path, "w", newline="") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(HEADER)
+            writer.writerow([
+                "TESTUSDT", "2020-01", 0, "not-a-time", 0,
+                -0.005, -0.005, 0.01, -0.01, 100000.0, pipeline.math.log1p(100000.0), 0.0,
+            ])
+        write_training_manifest(path)
+        with self.assertRaisesRegex(ValueError, "open_time must be numeric"):
+            pipeline.load_rows(
+                path,
+                "memmap32",
+                cache_dir=os.path.join(self.temp.name, "invalid-open-time-cache"),
+            )
 
     def test_canonical_training_csv_requires_manifest(self):
         path = os.path.join(self.temp.name, "kline_growth_training.csv")
@@ -1536,6 +1614,123 @@ class PipelineTests(unittest.TestCase):
             "rejected_under_min_avg_net_return",
         )
 
+    def test_trade_regime_filter_reduces_raw_signals_and_execution_candidates(self):
+        feature_lookup = {
+            "btc_return_240m": 0,
+            "market_average_return_60m": 1,
+            "market_breadth_up_60m": 2,
+        }
+
+        def regime_row(open_time, btc_return, market_return, trade_return):
+            return pipeline.DataRow(
+                "TESTUSDT",
+                "2020-01",
+                0,
+                open_time,
+                1 if trade_return > 0.0 else 0,
+                trade_return,
+                trade_return,
+                max(0.0, trade_return),
+                min(0.0, trade_return),
+                1000000.0,
+                [btc_return, market_return, 0.6],
+                feature_lookup,
+            )
+
+        rows = [
+            regime_row(1600000000000, 0.01, 0.01, 0.01),
+            regime_row(1600000060000, -0.01, -0.01, -0.01),
+            regime_row(1600000120000, -0.01, 0.02, 0.02),
+        ]
+        runtime_args = SimpleNamespace(
+            trade_regime_filter="market_positive",
+            trade_regime_breadth_threshold=0.5,
+        )
+        raw_metrics = pipeline.raw_classification_metrics(
+            rows,
+            [0.9, 0.9, 0.9],
+            0.5,
+            hybrid_runtime_args=runtime_args,
+        )
+        self.assertEqual(raw_metrics["raw_signal_trades_before_regime_filter"], 3)
+        self.assertEqual(raw_metrics["raw_signal_regime_filter_blocked"], 1)
+        self.assertEqual(raw_metrics["raw_signal_trades"], 2)
+        metrics = pipeline.evaluate(
+            rows,
+            [0.9, 0.9, 0.9],
+            0.5,
+            0.0,
+            0.0,
+            compute_auc=False,
+            trade_selection="threshold",
+            top_k_per_minute=3,
+            hybrid_runtime_args=runtime_args,
+        )
+        self.assertEqual(metrics["predicted_trades"], 2)
+        self.assertEqual(metrics["regime_filter_blocked"], 1)
+        self.assertEqual(metrics["raw_signal_trades_before_regime_filter"], 3)
+        self.assertEqual(metrics["raw_signal_regime_filter_blocked"], 1)
+        self.assertEqual(metrics["raw_signal_trades"], 2)
+
+    def test_threshold_diagnostics_carry_regime_filter_counts(self):
+        fixed_record = {
+            "threshold_rejection_diagnostics": [
+                {
+                    "threshold": 0.42,
+                    "predicted_trades": 2,
+                    "raw_signal_trades": 2,
+                    "raw_signal_trades_before_regime_filter": 5,
+                    "raw_signal_regime_filter_blocked": 3,
+                    "raw_signal_share": 0.02,
+                    "trade_regime_filter": "market_positive",
+                },
+            ],
+        }
+        rows, _ = pipeline.threshold_diagnostics_report_from_records(fixed_record, [])
+        self.assertEqual(rows[0]["raw_signal_trades"], 2)
+        self.assertEqual(rows[0]["raw_signal_trades_before_regime_filter"], 5)
+        self.assertEqual(rows[0]["raw_signal_regime_filter_blocked"], 3)
+        self.assertEqual(rows[0]["trade_regime_filter"], "market_positive")
+
+    def test_threshold_diagnostics_carry_candidate_utility_fields(self):
+        fixed_record = {
+            "threshold_rejection_diagnostics": [
+                {
+                    "threshold": 0.30,
+                    "predicted_trades": 1,
+                    "candidate_utility_count": 4,
+                    "candidate_utility_diagnostic_rows": 4,
+                    "candidate_positive_utility_count": 2,
+                    "candidate_positive_utility_recall": 0.5,
+                    "candidate_missed_best_net_utility": 0.021,
+                    "candidate_high_score_loss_share": 0.25,
+                    "candidate_top_decile_net_utility": 0.003,
+                    "candidate_score_positive_utility_gap": -0.12,
+                },
+                {
+                    "threshold": 0.40,
+                    "predicted_trades": 1,
+                    "candidate_utility_count": 3,
+                    "candidate_utility_diagnostic_rows": 3,
+                    "candidate_positive_utility_count": 1,
+                    "candidate_positive_utility_recall": 1.0,
+                    "candidate_missed_best_net_utility": 0.0,
+                    "candidate_high_score_loss_share": 1.0,
+                    "candidate_top_decile_net_utility": -0.010,
+                    "candidate_utility_diagnostics_skipped": 1,
+                },
+            ],
+        }
+        rows, summary = pipeline.threshold_diagnostics_report_from_records(fixed_record, [])
+        self.assertEqual(rows[0]["candidate_utility_count"], 4)
+        self.assertAlmostEqual(rows[0]["candidate_positive_utility_recall"], 0.5)
+        self.assertAlmostEqual(rows[0]["candidate_score_positive_utility_gap"], -0.12)
+        self.assertAlmostEqual(summary["threshold_diagnostics_best_candidate_positive_utility_recall"], 1.0)
+        self.assertAlmostEqual(summary["threshold_diagnostics_max_candidate_missed_best_net_utility"], 0.021)
+        self.assertAlmostEqual(summary["threshold_diagnostics_max_candidate_high_score_loss_share"], 1.0)
+        self.assertAlmostEqual(summary["threshold_diagnostics_best_candidate_top_decile_net_utility"], 0.003)
+        self.assertEqual(summary["threshold_diagnostics_candidate_utility_skipped_count"], 1)
+
     def test_threshold_selection_matches_simple_reference(self):
         base = 1600000000000
         rows = [row(base + index * 60000, label=1 if index < 2 else 0, trade_return=0.01 if index < 2 else -0.01) for index in range(4)]
@@ -1661,6 +1856,13 @@ class PipelineTests(unittest.TestCase):
         )
         metrics = selection["validation_metrics"]
         self.assertEqual(selection["threshold"], 1.01)
+        self.assertEqual(selection["threshold_selection_status"], "no_valid_threshold")
+        self.assertEqual(selection["threshold_is_valid"], 0)
+        self.assertEqual(selection["threshold_fallback_reason"], "no_valid_threshold")
+        self.assertEqual(metrics["threshold_selection_status"], "no_valid_threshold")
+        self.assertEqual(metrics["threshold_is_valid"], 0)
+        self.assertEqual(metrics["threshold_fallback_reason"], "no_valid_threshold")
+        self.assertEqual(metrics["execution_threshold"], 1.01)
         self.assertEqual(metrics["selected_validation_trade_count"], 0)
         self.assertEqual(metrics["predicted_trades"], 0)
         self.assertFalse(pipeline.math.isfinite(metrics["selected_objective_score"]))
@@ -1955,6 +2157,67 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(pipeline.normalize_open_time_ms(1600000000000), 1600000000000)
         self.assertEqual(pipeline.normalize_open_time_ms(1600000000000000), 1600000000000)
 
+    def test_cpp_train_help_succeeds_and_invalid_option_fails(self):
+        compiler = shutil.which("g++") or shutil.which("clang++")
+        if not compiler:
+            self.skipTest("C++ compiler not available")
+        output_name = "coin_predictor_test.exe" if os.name == "nt" else "coin_predictor_test"
+        output_path = os.path.join(self.temp.name, output_name)
+        compile_command = [
+            compiler,
+            "-std=c++11",
+            os.path.join(TEST_DIR, "main.cpp"),
+            os.path.join(TEST_DIR, "DataScraper.cpp"),
+            "-o",
+            output_path,
+            "-lz",
+        ]
+        subprocess.run(compile_command, cwd=TEST_DIR, check=True, capture_output=True, text=True)
+
+        help_result = subprocess.run(
+            [output_path, "train", "--help"],
+            cwd=self.temp.name,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(help_result.returncode, 0, help_result.stderr)
+        self.assertIn("Usage: coin_predictor train", help_result.stdout)
+
+        invalid_result = subprocess.run(
+            [output_path, "train", "--definitely-invalid-option"],
+            cwd=self.temp.name,
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(invalid_result.returncode, 0)
+        self.assertIn("Unknown option", invalid_result.stderr)
+
+    def test_cpp_self_test_validates_labels_and_portfolio_drawdown(self):
+        compiler = shutil.which("g++") or shutil.which("clang++")
+        if not compiler:
+            self.skipTest("C++ compiler not available")
+        output_name = "coin_predictor_self_test.exe" if os.name == "nt" else "coin_predictor_self_test"
+        output_path = os.path.join(self.temp.name, output_name)
+        compile_command = [
+            compiler,
+            "-std=c++11",
+            os.path.join(TEST_DIR, "main.cpp"),
+            os.path.join(TEST_DIR, "DataScraper.cpp"),
+            "-o",
+            output_path,
+            "-lz",
+        ]
+        subprocess.run(compile_command, cwd=TEST_DIR, check=True, capture_output=True, text=True)
+
+        result = subprocess.run(
+            [output_path, "train", "--self-test"],
+            cwd=self.temp.name,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("C++ offline self-tests passed", result.stdout)
+
     def test_portfolio_cash_locking_and_volume_cap(self):
         base = 1600000000000
         rows = [
@@ -2020,6 +2283,29 @@ class PipelineTests(unittest.TestCase):
         self.assertAlmostEqual(metrics["average_net_return_after_costs"], 0.0010)
         self.assertAlmostEqual(metrics["executed_score_win_loss_gap"], 0.10)
 
+    def test_execution_reports_trade_weighted_edge_when_position_sizes_differ(self):
+        base = 1600000000000
+        rows = [
+            row(base, label=1, quote_volume=10000.0, trade_return=0.10),
+            row(base + 60000, label=0, quote_volume=1000000000.0, trade_return=-0.02),
+        ]
+        execution = pipeline.portfolio_execution(
+            rows,
+            [0.90, 0.80],
+            0.5,
+            0.0,
+            0.0,
+            10000.0,
+            0.10,
+            0.01,
+            0,
+            60,
+            5,
+        )
+        self.assertAlmostEqual(execution["average_gross_return_before_costs"], 0.04)
+        self.assertAlmostEqual(execution["trade_weighted_average_gross_return_before_costs"], -10.0 / 1100.0)
+        self.assertAlmostEqual(execution["trade_weighted_average_net_return_after_costs"], -10.0 / 1100.0)
+
     def test_zero_trade_cap_disables_period_limit(self):
         base = 1600000000000
         rows = [
@@ -2068,6 +2354,24 @@ class PipelineTests(unittest.TestCase):
         with open(all_path, newline="") as handle:
             self.assertEqual(len(list(csv.reader(handle))), 4)
 
+        candidates_path = os.path.join(self.temp.name, "candidates.csv")
+        pipeline.write_predictions(candidates_path, output_mode="candidates", **common)
+        with open(candidates_path, newline="") as handle:
+            candidate_rows = list(csv.DictReader(handle))
+        self.assertEqual(len(candidate_rows), 1)
+        self.assertEqual(candidate_rows[0]["raw_signal"], "1")
+        self.assertEqual(candidate_rows[0]["predicted"], "1")
+
+    def test_candidate_prediction_indices_exclude_non_candidates(self):
+        indices = pipeline.prediction_output_indices(
+            "candidates",
+            5,
+            raw_selected={1: 1, 3: 1},
+            executed={3: 100.0},
+            executed_selected_by_topk={2: 1, 4: 0},
+        )
+        self.assertEqual(indices, [1, 2, 3])
+
     def test_expected_value_calculation(self):
         value = pipeline.expected_value_from_probability(0.75, 0.05, 0.02, 0.001, 0.0005)
         self.assertAlmostEqual(value, 0.75 * 0.05 - 0.25 * 0.02 - 0.0015)
@@ -2098,6 +2402,25 @@ class PipelineTests(unittest.TestCase):
         calibration = pipeline.fit_calibration(probabilities, rows, args)
         self.assertEqual(calibration["rows"], 3)
         self.assertEqual(calibration["window_mode"], "recent")
+
+    def test_recent_calibration_subset_uses_latest_timestamps_not_row_order(self):
+        base = 1600000000000
+        rows = [
+            row(base + 10 * 60000),
+            row(base + 40 * 60000),
+            row(base + 20 * 60000),
+            row(base + 30 * 60000),
+        ]
+        probabilities = [0.10, 0.40, 0.20, 0.30]
+        args = SimpleNamespace(
+            calibration_window_mode="recent",
+            calibration_recent_ratio=0.5,
+            calibration_recent_rows=0,
+        )
+        subset_probabilities, subset_rows = pipeline.recent_calibration_subset(probabilities, rows, args)
+
+        self.assertEqual(subset_probabilities, [0.40, 0.30])
+        self.assertEqual([item.open_time for item in subset_rows], [base + 40 * 60000, base + 30 * 60000])
 
     def test_topk_ev_selection_one_minute(self):
         base = 1600000000000
@@ -2825,6 +3148,27 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(list(execution["executed"]), [0])
         self.assertEqual(execution["daily_drawdown_limit_blocked"], 2)
 
+    def test_portfolio_drawdown_is_reported_as_fraction_of_initial_capital(self):
+        rows = [
+            row(1600000000000, trade_return=-0.10, quote_volume=1000000000.0),
+        ]
+        execution = pipeline.portfolio_execution(
+            rows,
+            [1.0],
+            0.5,
+            0.0,
+            0.0,
+            10000.0,
+            0.10,
+            1.0,
+            0,
+            60,
+            1,
+        )
+        self.assertAlmostEqual(execution["portfolio_profit"], -100.0)
+        self.assertAlmostEqual(execution["max_capital_drawdown"], 0.01)
+        self.assertAlmostEqual(execution["max_capital_drawdown_amount"], 100.0)
+
     def test_threshold_penalized_score(self):
         metrics = {"predicted_trades": 120, "portfolio_profit": 12.0, "max_capital_drawdown": 0.10, "precision": 0.4}
         base_score, penalized_score = pipeline.threshold_penalized_score(
@@ -2884,6 +3228,91 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertAlmostEqual(base_score, 5.0)
         self.assertLess(penalized_score, base_score)
+
+    def test_threshold_penalized_score_can_blend_double_cost_objective(self):
+        metrics = {
+            "predicted_trades": 10,
+            "portfolio_profit": 100.0,
+            "precision": 0.4,
+            "total_cost_drag": 120.0,
+        }
+        base_score, penalized_score = pipeline.threshold_penalized_score(
+            metrics,
+            "profit",
+            threshold_cost_stress_multiplier=2.0,
+            threshold_cost_stress_weight=0.5,
+        )
+        self.assertAlmostEqual(base_score, 100.0)
+        self.assertAlmostEqual(penalized_score, 40.0)
+
+    def test_cost_stressed_threshold_selection_prefers_cost_tolerant_candidate(self):
+        fragile = pipeline.build_selected_threshold_result(
+            0.001,
+            {
+                "predicted_trades": 20,
+                "portfolio_profit": 100.0,
+                "max_capital_drawdown": 0.05,
+                "precision": 0.5,
+                "raw_signal_trades": 20,
+                "portfolio_return": 0.01,
+                "recall": 0.3,
+                "average_profit_after_fee_and_slippage": 5.0,
+                "total_profit_after_fee_and_slippage": 100.0,
+                "total_cost_drag": 150.0,
+                "active_days": 2,
+            },
+            "profit",
+            -float("inf"),
+            0.0,
+            0.0,
+            20,
+            "hybrid",
+            threshold_cost_stress_multiplier=2.0,
+            threshold_cost_stress_weight=1.0,
+        )
+        tolerant = pipeline.build_selected_threshold_result(
+            0.002,
+            {
+                "predicted_trades": 20,
+                "portfolio_profit": 70.0,
+                "max_capital_drawdown": 0.05,
+                "precision": 0.5,
+                "raw_signal_trades": 20,
+                "portfolio_return": 0.007,
+                "recall": 0.3,
+                "average_profit_after_fee_and_slippage": 3.5,
+                "total_profit_after_fee_and_slippage": 70.0,
+                "total_cost_drag": 10.0,
+                "active_days": 2,
+            },
+            "profit",
+            -float("inf"),
+            0.0,
+            0.0,
+            20,
+            "hybrid",
+            threshold_cost_stress_multiplier=2.0,
+            threshold_cost_stress_weight=1.0,
+        )
+        better, reason = pipeline.compare_threshold_results(
+            tolerant,
+            fragile,
+            SimpleNamespace(
+                threshold_tiebreaker="fewer_trades",
+                threshold_tie_epsilon=1e-9,
+                threshold_target_trades=20,
+                threshold_target_active_days=0,
+                target_validation_trades=20,
+                threshold_objective="profit",
+            ),
+            5,
+            100,
+        )
+        self.assertTrue(better)
+        self.assertEqual(reason, "higher_objective_score")
+        self.assertLess(fragile["penalized_objective_score"], tolerant["penalized_objective_score"])
+        self.assertLess(fragile["validation_metrics"]["selected_validation_cost_stress_portfolio_profit"], 0.0)
+        self.assertGreater(tolerant["validation_metrics"]["selected_validation_cost_stress_portfolio_profit"], 0.0)
 
     def test_threshold_score_ev_uses_expected_value(self):
         metrics = {
@@ -4042,6 +4471,44 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("--hybrid-min-score-calibration-min-ratio", command)
         self.assertIn("--hybrid-min-score-calibration-floor-min", command)
 
+    def test_experiment_runner_summary_record_exposes_calibration_report_status(self):
+        experiment = run_experiments.build_experiment_grid_for_profile("hybrid-late-recent", False, 1)[0]
+        summary = {
+            "fixed_metrics": {"predicted_trades": 0},
+            "brier_score": 0.21,
+            "expected_calibration_error": 0.08,
+            "max_calibration_error": 0.17,
+            "calibration_report_skipped_reason": "prediction_output_missing",
+        }
+        record = run_experiments.summary_record(experiment, summary, 0)
+        self.assertIn("calibration_report_skipped_reason", run_experiments.RESULT_COLUMNS)
+        self.assertAlmostEqual(record["brier_score"], 0.21)
+        self.assertAlmostEqual(record["expected_calibration_error"], 0.08)
+        self.assertAlmostEqual(record["max_calibration_error"], 0.17)
+        self.assertEqual(record["calibration_report_skipped_reason"], "prediction_output_missing")
+
+    def test_experiment_runner_summary_record_carries_execution_audit_metrics(self):
+        experiment = run_experiments.build_experiment_grid_for_profile("hybrid-late-recent", False, 1)[0]
+        audit_metrics = {
+            key: index + 1
+            for index, key in enumerate(pipeline.EXECUTION_AUDIT_METRIC_KEYS)
+        }
+        audit_metrics["execution_chronological_audit_status"] = "sorted_nonmonotonic_input"
+        audit_metrics["portfolio_profit"] = 12.5
+        audit_metrics["portfolio_return"] = 0.0125
+        audit_metrics["average_profit_per_trade"] = 1.25
+        summary = {
+            "walk_forward_aggregate_metrics": audit_metrics,
+            "walk_forward_summary": {
+                "walkforward_total_predicted_trades": 10,
+            },
+        }
+        record = run_experiments.summary_record(experiment, summary, 0)
+        for key in pipeline.EXECUTION_AUDIT_METRIC_KEYS:
+            self.assertIn(key, run_experiments.RESULT_COLUMNS)
+            self.assertIn(key, record)
+            self.assertEqual(record[key], audit_metrics[key])
+
     def test_experiment_runner_hybrid_late_recent_tuned_uses_start_fold_88_and_walk_months(self):
         args = run_experiments.parse_args(["--profile", "hybrid-late-recent-tuned"])
         experiment = run_experiments.build_experiment_grid_for_profile("hybrid-late-recent-tuned", False, 1)[0]
@@ -4055,7 +4522,14 @@ class PipelineTests(unittest.TestCase):
 
     def test_experiment_runner_economic_ranker_profile_emits_ranking_flags(self):
         args = run_experiments.parse_args(["--profile", "economic-ranker"])
-        experiment = run_experiments.build_experiment_grid_for_profile("economic-ranker", False, 1)[0]
+        experiments = run_experiments.build_experiment_grid_for_profile("economic-ranker", False, 3)
+        self.assertEqual([item["trade_regime_filter"] for item in experiments], [
+            "none",
+            "market_positive",
+            "btc_or_market_positive",
+        ])
+        self.assertEqual(len(set(run_experiments.experiment_name(item) for item in experiments)), 3)
+        experiment = experiments[0]
         command = run_experiments.build_command(args, experiment)
         self.assertIn("--objective-mode", command)
         self.assertIn("economic_ranking", command)
@@ -4076,7 +4550,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(effective_flag_value("--auc-sample-rows"), "250000")
         self.assertEqual(effective_flag_value("--adaptive-threshold-sample-rows"), "250000")
         self.assertEqual(effective_flag_value("--n-estimators"), "120")
-        self.assertEqual(effective_flag_value("--model-candidate-count"), "2")
+        self.assertEqual(effective_flag_value("--model-candidate-count"), "1")
         self.assertEqual(effective_flag_value("--walk-validation-months"), "2")
         self.assertEqual(effective_flag_value("--threshold-objective"), "avg_profit")
         self.assertEqual(effective_flag_value("--top-k-per-minute"), "1")
@@ -4091,14 +4565,29 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(effective_flag_value("--ranker-score-upper-quantile"), "0.9")
         self.assertEqual(effective_flag_value("--ranker-group-minutes"), "5")
         self.assertEqual(effective_flag_value("--ranker-adverse-penalty"), "0.1")
+        self.assertEqual(effective_flag_value("--ranker-relevance-mode"), "utility_tail")
+        self.assertEqual(effective_flag_value("--ranker-relevance-q1"), "0.5")
+        self.assertEqual(effective_flag_value("--ranker-relevance-q2"), "0.8")
+        self.assertEqual(effective_flag_value("--ranker-relevance-q3"), "0.93")
+        self.assertEqual(effective_flag_value("--ranker-utility-regression-blend"), "0.65")
+        self.assertEqual(effective_flag_value("--ranker-utility-regression-clip-min"), "-0.03")
+        self.assertEqual(effective_flag_value("--ranker-utility-regression-clip-max"), "0.05")
+        self.assertEqual(effective_flag_value("--ranker-selection-calibration"), "score_bucket")
+        self.assertEqual(effective_flag_value("--ranker-selection-calibration-bins"), "20")
+        self.assertEqual(effective_flag_value("--ranker-selection-calibration-min-rows"), "200")
+        self.assertEqual(effective_flag_value("--ranker-selection-calibration-shrinkage"), "50.0")
+        self.assertEqual(effective_flag_value("--ranker-threshold-score"), "selection")
+        self.assertEqual(effective_flag_value("--trade-regime-filter"), "none")
+        self.assertEqual(effective_flag_value("--trade-regime-breadth-threshold"), "0.5")
         self.assertEqual(effective_flag_value("--threshold-max-raw-signal-share"), "0.01")
-        self.assertEqual(effective_flag_value("--threshold-min-avg-net-return"), "0.0004")
+        self.assertEqual(effective_flag_value("--threshold-min-avg-net-return"), "0.0")
         self.assertEqual(effective_flag_value("--threshold-min-top-decile-net-return"), "0.0")
         self.assertEqual(effective_flag_value("--threshold-min-score-win-loss-gap"), "0.0")
         self.assertEqual(effective_flag_value("--threshold-max-top1-concentration"), "0.7")
         self.assertEqual(effective_flag_value("--threshold-max-top3-concentration"), "0.9")
         self.assertEqual(effective_flag_value("--threshold-max-trade-top1-concentration"), "0.35")
         self.assertEqual(effective_flag_value("--threshold-concentration-cap-mode"), "hard")
+        self.assertEqual(effective_flag_value("--threshold-profit-concentration-cap-mode"), "soft")
         self.assertEqual(effective_flag_value("--target-validation-trades"), "40")
         self.assertEqual(effective_flag_value("--min-profitable-fold-rate"), "0.5")
         self.assertEqual(effective_flag_value("--min-median-fold-return"), "0.0")
@@ -4111,6 +4600,21 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("--skip-full-validation-retune", command)
         self.assertIn(".gbdt_cache_full30_volatile", command)
 
+    def test_experiment_runner_cost_aware_ranker_profile_emits_utility_target_flags(self):
+        args = run_experiments.parse_args(["--profile", "economic-ranker-cost-aware"])
+        experiments = run_experiments.build_experiment_grid_for_profile("economic-ranker-cost-aware", False, 3)
+        self.assertEqual(len(experiments), 3)
+        self.assertEqual({item["profile"] for item in experiments}, {"economic-ranker-cost-aware"})
+        command = run_experiments.build_command(args, experiments[0])
+        def effective_flag_value(flag):
+            positions = [index for index, value in enumerate(command) if value == flag]
+            return command[positions[-1] + 1]
+        self.assertEqual(effective_flag_value("--ranker-utility-target-margin"), "0.001")
+        self.assertEqual(effective_flag_value("--ranker-min-calibration-top-bin-utility"), "0.0")
+        self.assertEqual(effective_flag_value("--trade-selection"), "top_utility")
+        self.assertIn("--ranker-reject-negative-calibration-top-bin", command)
+        self.assertIn("cost", run_experiments.experiment_name(experiments[0]))
+
     def test_experiment_runner_summary_record_carries_near_miss_diagnostics(self):
         experiment = {
             "profile": "economic-ranker",
@@ -4118,8 +4622,15 @@ class PipelineTests(unittest.TestCase):
             "trade_score": "ranker_score",
             "trade_selection": "topk_score",
             "top_k_per_minute": 1,
+            "trade_regime_filter": "market_positive",
+            "trade_regime_breadth_threshold": 0.5,
         }
         summary = {
+            "walk_forward_aggregate_metrics": {
+                "regime_filter_blocked": 11,
+                "raw_signal_trades_before_regime_filter": 30,
+                "raw_signal_regime_filter_blocked": 19,
+            },
             "threshold_diagnostics_near_miss_count": 2,
             "threshold_diagnostics_near_miss_ignored_flags": "rejected_under_min_avg_net_return",
             "threshold_diagnostics_best_near_miss_source_split": "walkforward_fold_8_test_months_106_106",
@@ -4135,6 +4646,11 @@ class PipelineTests(unittest.TestCase):
             "threshold_diagnostics_best_near_miss_rejection_flags": "rejected_under_min_avg_net_return",
         }
         record = run_experiments.summary_record(experiment, summary, 0)
+        self.assertEqual(record["trade_regime_filter"], "market_positive")
+        self.assertAlmostEqual(record["trade_regime_breadth_threshold"], 0.5)
+        self.assertEqual(record["regime_filter_blocked"], 11)
+        self.assertEqual(record["raw_signal_trades_before_regime_filter"], 30)
+        self.assertEqual(record["raw_signal_regime_filter_blocked"], 19)
         self.assertEqual(record["threshold_diagnostics_near_miss_count"], 2)
         self.assertEqual(record["threshold_diagnostics_near_miss_ignored_flags"], "rejected_under_min_avg_net_return")
         self.assertEqual(record["threshold_diagnostics_best_near_miss_fold_index"], 8)
@@ -4257,7 +4773,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(args.prediction_bundle_cache, "disk")
         self.assertTrue(args.fast_diagnostics)
 
-    def test_apply_diversity_selection_defaults_enables_symbol_filter_and_tiebreaker(self):
+    def test_apply_diversity_selection_defaults_keeps_symbol_filter_explicit(self):
         parser = pipeline.build_parser()
         args = parser.parse_args([
             "--threshold-max-top1-concentration", "0.8",
@@ -4265,10 +4781,10 @@ class PipelineTests(unittest.TestCase):
         changed = pipeline.apply_diversity_selection_defaults(args, set())
         self.assertTrue(changed)
         self.assertEqual(args.threshold_tiebreaker, "diversified")
-        self.assertEqual(args.symbol_validation_filter, "positive_avg_profit")
-        self.assertEqual(args.symbol_filter_stage, "candidate_blend")
-        self.assertEqual(args.symbol_filter_min_active_days, 3)
-        self.assertAlmostEqual(args.symbol_filter_max_executed_trade_share, 0.55)
+        self.assertEqual(args.symbol_validation_filter, "none")
+        self.assertEqual(args.symbol_filter_stage, "executed")
+        self.assertEqual(args.symbol_filter_min_active_days, 0)
+        self.assertAlmostEqual(args.symbol_filter_max_executed_trade_share, 0.0)
         self.assertEqual(args.threshold_concentration_cap_mode, "soft")
         self.assertAlmostEqual(args.threshold_diversity_penalty_weight, 0.01)
         self.assertAlmostEqual(args.threshold_diversity_profit_tolerance_ratio, 0.25)
@@ -4277,6 +4793,68 @@ class PipelineTests(unittest.TestCase):
         self.assertAlmostEqual(args.symbol_dominance_penalty_grace, 0.35)
         self.assertTrue(args.prefer_unique_symbols)
         self.assertEqual(args.symbol_reentry_cooldown_minutes, 15)
+
+    def test_symbol_filter_stage_does_not_activate_validation_filter_without_opt_in(self):
+        parser = pipeline.build_parser()
+        argv = ["--symbol-filter-stage", "candidate_blend"]
+        args = parser.parse_args(argv)
+        explicit_flags = pipeline.parse_explicit_flags(argv)
+        changed = pipeline.apply_symbol_filter_activation_defaults(args, explicit_flags)
+        self.assertFalse(changed)
+        self.assertEqual(args.symbol_validation_filter, "none")
+        self.assertEqual(args.symbol_filter_stage, "candidate_blend")
+
+    def test_symbol_filter_activation_defaults_require_explicit_enable_flag(self):
+        parser = pipeline.build_parser()
+        argv = [
+            "--enable-symbol-filter-activation-defaults",
+            "--symbol-filter-stage", "candidate_blend",
+        ]
+        args = parser.parse_args(argv)
+        explicit_flags = pipeline.parse_explicit_flags(argv)
+        changed = pipeline.apply_symbol_filter_activation_defaults(args, explicit_flags)
+        self.assertTrue(changed)
+        self.assertEqual(args.symbol_validation_filter, "positive_avg_profit")
+        self.assertEqual(args.symbol_filter_stage, "candidate_blend")
+
+    def test_explicit_symbol_validation_none_keeps_symbol_filter_disabled(self):
+        parser = pipeline.build_parser()
+        argv = [
+            "--symbol-filter-stage", "candidate_blend",
+            "--symbol-validation-filter", "none",
+        ]
+        args = parser.parse_args(argv)
+        explicit_flags = pipeline.parse_explicit_flags(argv)
+        changed = pipeline.apply_symbol_filter_activation_defaults(args, explicit_flags)
+        self.assertFalse(changed)
+        self.assertEqual(args.symbol_validation_filter, "none")
+
+    def test_threshold_score_edge_gate_enables_validation_health_floors(self):
+        parser = pipeline.build_parser()
+        args = parser.parse_args(["--threshold-score-edge-gate"])
+        changed = pipeline.apply_threshold_score_edge_gate(args, {"threshold_score_edge_gate"})
+        self.assertTrue(changed)
+        self.assertAlmostEqual(args.threshold_min_top_decile_net_return, 0.0)
+        self.assertAlmostEqual(args.threshold_min_score_win_loss_gap, 0.0)
+
+    def test_threshold_score_edge_gate_respects_explicit_floor_overrides(self):
+        parser = pipeline.build_parser()
+        args = parser.parse_args([
+            "--threshold-score-edge-gate",
+            "--threshold-min-top-decile-net-return", "0.002",
+            "--threshold-min-score-win-loss-gap", "0.0001",
+        ])
+        changed = pipeline.apply_threshold_score_edge_gate(
+            args,
+            {
+                "threshold_score_edge_gate",
+                "threshold_min_top_decile_net_return",
+                "threshold_min_score_win_loss_gap",
+            },
+        )
+        self.assertFalse(changed)
+        self.assertAlmostEqual(args.threshold_min_top_decile_net_return, 0.002)
+        self.assertAlmostEqual(args.threshold_min_score_win_loss_gap, 0.0001)
 
     def test_tune_threshold_soft_concentration_cap_keeps_near_cap_candidate(self):
         rows = [row(1600000000000)]
@@ -4489,6 +5067,89 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(diagnostics[0]["rejected_over_top1_concentration"], 1)
         self.assertEqual(diagnostics[0]["rejected_over_top3_concentration"], 1)
 
+    def test_tune_threshold_soft_profit_concentration_cap_keeps_trade_diversified_candidate(self):
+        rows = [row(1600000000000)]
+        candidate_metrics = {
+            "predicted_trades": 23,
+            "portfolio_profit": 14.0,
+            "portfolio_return": 0.0014,
+            "precision": 0.0,
+            "recall": 0.0,
+            "active_days": 8,
+            "raw_signal_trades": 30,
+            "max_capital_drawdown": 0.04,
+            "average_profit_after_fee_and_slippage": 0.00061,
+            "total_profit_after_fee_and_slippage": 0.0140,
+            "executed_score_top_1pct_rows": 1,
+            "executed_score_top_1pct_avg_net_return": 0.003,
+            "executed_score_top_decile_rows": 3,
+            "executed_score_top_decile_avg_net_return": 0.002,
+            "executed_winning_trade_count": 12,
+            "executed_losing_trade_count": 11,
+            "executed_score_win_loss_gap": 0.01,
+            "symbol_trade_concentration_top1": 0.18,
+            "symbol_profit_concentration_top1": 0.46,
+            "symbol_profit_concentration_top3": 0.994,
+        }
+        fallback_metrics = {
+            "predicted_trades": 0,
+            "portfolio_profit": 0.0,
+            "portfolio_return": 0.0,
+            "precision": 0.0,
+            "recall": 0.0,
+            "active_days": 0,
+            "raw_signal_trades": 0,
+            "max_capital_drawdown": 0.0,
+            "average_profit_after_fee_and_slippage": 0.0,
+            "total_profit_after_fee_and_slippage": 0.0,
+            "symbol_trade_concentration_top1": 0.0,
+            "symbol_profit_concentration_top1": 0.0,
+            "symbol_profit_concentration_top3": 0.0,
+        }
+        runtime_args = SimpleNamespace(
+            threshold_max_trade_top1_concentration=0.35,
+            threshold_trade_top1_concentration_penalty=0.0,
+            threshold_max_top1_concentration=0.70,
+            threshold_max_top3_concentration=0.90,
+            threshold_top1_concentration_penalty=0.0,
+            threshold_top3_concentration_penalty=0.0,
+            threshold_concentration_cap_mode="hard",
+            threshold_profit_concentration_cap_mode="soft",
+            threshold_require_positive_top_1pct=True,
+            threshold_max_raw_signal_share=0.0,
+            threshold_min_avg_net_return=0.0,
+            threshold_min_top_decile_net_return=0.0,
+            threshold_min_score_win_loss_gap=0.0,
+            threshold_tiebreaker="fewer_trades",
+            threshold_tie_epsilon=1e-9,
+            threshold_target_trades=0,
+            threshold_target_active_days=0,
+            target_validation_trades=0,
+            threshold_objective="profit",
+        )
+        with mock.patch.object(pipeline, "evaluate", side_effect=[dict(candidate_metrics), dict(fallback_metrics)]):
+            selection = pipeline.tune_threshold(
+                rows,
+                [0.8],
+                [0.77],
+                "profit",
+                0.0,
+                0.0,
+                20,
+                120,
+                0.0,
+                "explore",
+                10000.0,
+                0.10,
+                0.01,
+                10,
+                60,
+                5,
+                hybrid_runtime_args=runtime_args,
+            )
+        self.assertEqual(selection["threshold"], 0.77)
+        self.assertEqual(selection["validation_metrics"]["rejected_over_top3_concentration_count"], 0)
+
     def test_metrics_record_captures_diversity_runtime_settings(self):
         parser = pipeline.build_parser()
         args = parser.parse_args([
@@ -4515,6 +5176,39 @@ class PipelineTests(unittest.TestCase):
         self.assertAlmostEqual(record["symbol_dominance_penalty_recent_weight"], 0.9)
         self.assertAlmostEqual(record["symbol_dominance_penalty_grace"], 0.2)
         self.assertEqual(record["threshold_concentration_cap_mode"], "soft")
+
+    def test_metrics_record_hides_no_valid_threshold_sentinel(self):
+        parser = pipeline.build_parser()
+        args = parser.parse_args([])
+        record = pipeline.metrics_record(
+            "gbdt",
+            "fixed",
+            "profit_balanced",
+            1.01,
+            [],
+            [],
+            [],
+            {},
+            args,
+            {
+                "threshold_selection_status": pipeline.THRESHOLD_STATUS_NO_VALID,
+                "threshold_is_valid": 0,
+                "threshold_fallback_reason": pipeline.THRESHOLD_STATUS_NO_VALID,
+                "execution_threshold": 1.01,
+                "selected_score_threshold": 1.01,
+                "predicted_trades": 0,
+                "precision": 0.0,
+                "recall": 0.0,
+                "average_profit_after_fee_and_slippage": 0.0,
+                "total_profit_after_fee_and_slippage": 0.0,
+                "portfolio_profit": 0.0,
+                "portfolio_return": 0.0,
+            },
+        )
+        self.assertIsNone(record["selected_threshold"])
+        self.assertIsNone(record["selected_score_threshold"])
+        self.assertEqual(record["execution_threshold"], 1.01)
+        self.assertEqual(record["threshold_selection_status"], pipeline.THRESHOLD_STATUS_NO_VALID)
 
     def test_compare_threshold_results_diversified_prefers_lower_concentration_within_tolerance(self):
         args = SimpleNamespace(
@@ -4744,6 +5438,242 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(execution["raw_candidate_score_count"], 3)
         self.assertEqual(execution["executed_trade_score_count"], 1)
         self.assertEqual(execution["rejected_trade_score_count"], 2)
+        self.assertEqual(execution["candidate_positive_utility_count"], 2)
+        self.assertEqual(execution["candidate_executed_positive_utility_count"], 1)
+        self.assertAlmostEqual(execution["candidate_positive_utility_recall"], 0.5)
+        self.assertEqual(execution["candidate_rank_rejected_positive_utility_count"], 1)
+        self.assertAlmostEqual(execution["candidate_missed_best_net_utility"], 0.02)
+        self.assertAlmostEqual(execution["candidate_top_decile_net_utility"], 0.01)
+        self.assertEqual(execution["candidate_high_score_loss_count"], 0)
+        self.assertAlmostEqual(execution["candidate_score_positive_utility_gap"], 0.075)
+
+    def test_portfolio_execution_candidate_diagnostics_detect_high_score_losers(self):
+        base = 1600000000000
+        rows = [
+            row(base, quote_volume=1000000000.0, trade_return=-0.02),
+            row(base, quote_volume=1000000000.0, trade_return=0.02),
+            row(base, quote_volume=1000000000.0, trade_return=0.01),
+        ]
+        execution = pipeline.portfolio_execution(
+            rows,
+            [0.99, 0.20, 0.10],
+            0.05,
+            0.0,
+            0.0,
+            10000.0,
+            0.10,
+            0.01,
+            10,
+            60,
+            5,
+            trade_selection="topk_score",
+            top_k_per_minute=1,
+            objective_mode="classification",
+            trade_score_name="probability",
+        )
+        self.assertEqual(list(execution["executed"].keys()), [0])
+        self.assertEqual(execution["candidate_positive_utility_count"], 2)
+        self.assertEqual(execution["candidate_executed_positive_utility_count"], 0)
+        self.assertAlmostEqual(execution["candidate_positive_utility_recall"], 0.0)
+        self.assertEqual(execution["candidate_missed_positive_utility_count"], 2)
+        self.assertAlmostEqual(execution["candidate_missed_best_net_utility"], 0.02)
+        self.assertAlmostEqual(execution["candidate_high_score_loss_share"], 1.0)
+        self.assertAlmostEqual(execution["candidate_high_score_loss_avg_net_utility"], -0.02)
+        self.assertLess(execution["candidate_score_positive_utility_gap"], 0.0)
+
+    def test_portfolio_execution_uses_ranker_selection_score_for_topk_ordering(self):
+        base = 1600000000000
+        rows = [
+            row(base, quote_volume=1000000000.0, trade_return=-0.02),
+            row(base, quote_volume=1000000000.0, trade_return=0.02),
+            row(base, quote_volume=1000000000.0, trade_return=0.01),
+        ]
+        bundle = pipeline.build_prediction_bundle(
+            ranker_score=[0.99, 0.20, 0.10],
+            ranker_selection_score=[-0.020, 0.020, 0.010],
+        )
+        execution = pipeline.portfolio_execution(
+            rows,
+            bundle,
+            0.05,
+            0.0,
+            0.0,
+            10000.0,
+            0.10,
+            0.01,
+            10,
+            60,
+            5,
+            trade_selection="topk_score",
+            top_k_per_minute=1,
+            objective_mode="economic_ranking",
+            trade_score_name="ranker_score",
+        )
+        self.assertEqual(list(execution["executed"].keys()), [1])
+        self.assertEqual(execution["candidate_positive_utility_count"], 2)
+        self.assertEqual(execution["candidate_executed_positive_utility_count"], 1)
+        self.assertAlmostEqual(execution["candidate_positive_utility_recall"], 0.5)
+        self.assertAlmostEqual(execution["candidate_high_score_loss_share"], 1.0)
+
+    def test_portfolio_execution_groups_topk_candidates_by_clock_minute(self):
+        base = 1600000000000
+        rows = [
+            symbol_row("AAAUSDT", base, quote_volume=1000000000.0, trade_return=0.01),
+            symbol_row("BBBUSDT", base + 60000, quote_volume=1000000000.0, trade_return=0.01),
+            symbol_row("CCCUSDT", base, quote_volume=1000000000.0, trade_return=0.02),
+        ]
+        execution = pipeline.portfolio_execution(
+            rows,
+            [0.90, 0.10, 0.95],
+            0.0,
+            0.0,
+            0.0,
+            10000.0,
+            0.10,
+            0.01,
+            0,
+            60,
+            5,
+            trade_selection="topk_score",
+            top_k_per_minute=1,
+            objective_mode="classification",
+            trade_score_name="probability",
+        )
+        self.assertEqual(set(execution["executed"].keys()), {1, 2})
+        self.assertNotIn(0, execution["executed"])
+
+    def test_portfolio_execution_reports_chronological_audit_diagnostics(self):
+        base = 1600000000000
+        rows = [
+            symbol_row("AAAUSDT", base, quote_volume=1000000000.0, trade_return=0.01),
+            symbol_row("BBBUSDT", base + 60000, quote_volume=1000000000.0, trade_return=0.01),
+            symbol_row("CCCUSDT", base, quote_volume=1000000000.0, trade_return=0.02),
+        ]
+        execution = pipeline.portfolio_execution(
+            rows,
+            [0.90, 0.10, 0.95],
+            0.0,
+            0.0,
+            0.0,
+            10000.0,
+            0.10,
+            0.01,
+            0,
+            60,
+            5,
+            trade_selection="topk_score",
+            top_k_per_minute=1,
+            objective_mode="classification",
+            trade_score_name="probability",
+        )
+        self.assertEqual(execution["execution_chronological_processing"], 1)
+        self.assertEqual(execution["execution_chronological_sort_applied"], 1)
+        self.assertEqual(execution["execution_chronological_audit_status"], "sorted_nonmonotonic_input")
+        self.assertEqual(execution["execution_input_candidate_count"], 3)
+        self.assertEqual(execution["execution_input_time_decrease_count"], 1)
+        self.assertEqual(execution["execution_input_max_backward_minutes"], 1)
+        self.assertEqual(execution["execution_bucket_count"], 2)
+        self.assertEqual(execution["max_topk_bucket_size"], 2)
+        self.assertEqual(execution["max_topk_bucket_ranked_count"], 2)
+        self.assertEqual(execution["max_topk_bucket_selected_count"], 1)
+        self.assertEqual(execution["topk_bucket_limit_violation_count"], 0)
+        self.assertEqual(execution["max_same_timestamp_executed_trades"], 1)
+        self.assertEqual(execution["max_concurrent_positions"], 2)
+        self.assertAlmostEqual(execution["max_simultaneous_capital"], 2000.0)
+        self.assertAlmostEqual(execution["max_capital_usage_fraction"], 0.2)
+        self.assertAlmostEqual(execution["max_capital_usage_pct_initial"], 0.2)
+        self.assertEqual(execution["capital_overallocated_count"], 0)
+
+    def test_execution_audit_metrics_are_exported(self):
+        for field in pipeline.EXECUTION_AUDIT_METRIC_KEYS:
+            self.assertIn(field, pipeline.METRIC_COLUMNS)
+            self.assertIn(field, pipeline.WALKFORWARD_DIAGNOSTIC_COLUMNS)
+
+    def test_top_utility_ranker_requires_positive_selection_utility(self):
+        base = 1600000000000
+        rows = [
+            row(base, quote_volume=1000000000.0, trade_return=-0.02),
+            row(base, quote_volume=1000000000.0, trade_return=0.02),
+            row(base, quote_volume=1000000000.0, trade_return=0.01),
+        ]
+        bundle = pipeline.build_prediction_bundle(
+            ranker_score=[0.99, 0.20, 0.10],
+            ranker_selection_score=[-0.020, 0.020, -0.001],
+        )
+        execution = pipeline.portfolio_execution(
+            rows,
+            bundle,
+            -1000000000.0,
+            0.0,
+            0.0,
+            10000.0,
+            0.10,
+            0.01,
+            10,
+            60,
+            5,
+            trade_selection="top_utility",
+            top_k_per_minute=3,
+            objective_mode="economic_ranking",
+            trade_score_name="ranker_score",
+            hybrid_runtime_args=SimpleNamespace(ranker_min_calibration_top_bin_utility=0.0),
+        )
+        self.assertEqual(list(execution["executed"].keys()), [1])
+        self.assertEqual(execution["ranking_candidate_count"], 3)
+        self.assertEqual(execution["ranking_selected_candidate_count"], 1)
+        self.assertEqual(execution["ranking_rejected_candidate_count"], 2)
+
+    def test_top_utility_ranker_abstains_without_selection_utility(self):
+        base = 1600000000000
+        rows = [
+            row(base, quote_volume=1000000000.0, trade_return=0.02),
+            row(base, quote_volume=1000000000.0, trade_return=0.01),
+        ]
+        execution = pipeline.portfolio_execution(
+            rows,
+            pipeline.build_prediction_bundle(ranker_score=[0.99, 0.20]),
+            -1000000000.0,
+            0.0,
+            0.0,
+            10000.0,
+            0.10,
+            0.01,
+            10,
+            60,
+            5,
+            trade_selection="top_utility",
+            top_k_per_minute=2,
+            objective_mode="economic_ranking",
+            trade_score_name="ranker_score",
+            hybrid_runtime_args=SimpleNamespace(ranker_min_calibration_top_bin_utility=0.0),
+        )
+        self.assertEqual(execution["ranking_candidate_count"], 2)
+        self.assertEqual(execution["ranking_selected_candidate_count"], 0)
+        self.assertEqual(len(execution["executed"]), 0)
+
+    def test_ranker_selection_calibration_demotes_negative_high_score_bucket(self):
+        parser = pipeline.build_parser()
+        args = parser.parse_args([
+            "--objective-mode", "economic_ranking",
+            "--ranker-selection-calibration", "score_bucket",
+            "--ranker-selection-calibration-bins", "2",
+            "--ranker-selection-calibration-min-rows", "4",
+            "--ranker-selection-calibration-shrinkage", "0",
+            "--fee", "0",
+            "--slippage", "0",
+        ])
+        base = 1600000000000
+        validation_rows = [
+            row(base, trade_return=0.020),
+            row(base + 60000, trade_return=0.015),
+            row(base + 120000, trade_return=-0.020),
+            row(base + 180000, trade_return=-0.030),
+        ]
+        bundle = pipeline.build_prediction_bundle(ranker_score=[0.10, 0.20, 0.90, 0.99])
+        calibration = pipeline.fit_ranker_selection_calibration(validation_rows, bundle, args)
+        self.assertTrue(calibration["enabled"])
+        calibrated = pipeline.apply_ranker_selection_calibration([0.95, 0.15], calibration)
+        self.assertLess(float(calibrated[0]), float(calibrated[1]))
 
     def test_ranker_relevance_context_uses_train_only_utility_quantiles(self):
         parser = pipeline.build_parser()
@@ -4774,6 +5704,119 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(list(validation_labels), [4, 0])
         self.assertAlmostEqual(context["strong_positive_threshold"], 0.004)
 
+    def test_ranker_utility_target_margin_requires_cost_plus_margin(self):
+        parser = pipeline.build_parser()
+        args = parser.parse_args([
+            "--objective-mode", "economic_ranking",
+            "--fee", "0.001",
+            "--slippage", "0.0005",
+            "--ranker-utility-target-margin", "0.001",
+        ])
+        rows_for_context = [
+            row(1600000000000, trade_return=0.0030),
+            row(1600000060000, trade_return=0.0020),
+        ]
+        utilities = pipeline.ranker_net_utility_values(rows_for_context, args)
+        self.assertAlmostEqual(float(utilities[0]), 0.0005, places=7)
+        self.assertAlmostEqual(float(utilities[1]), -0.0005, places=7)
+        context = pipeline.fit_ranker_relevance_context(rows_for_context, args)
+        self.assertEqual(context["positive_utility_rows"], 1)
+        self.assertAlmostEqual(context["ranker_utility_target_margin"], 0.001)
+
+    def test_ranker_utility_tail_relevance_ignores_tiny_positive_utility(self):
+        context = {
+            "mode": "utility_tail",
+            "weak_positive_threshold": 0.003,
+            "useful_positive_threshold": 0.006,
+            "strong_positive_threshold": 0.008,
+        }
+        labels = pipeline.ranker_relevance_labels_from_utilities(
+            [-0.010, 0.001, 0.004, 0.007, 0.009],
+            context,
+        )
+        self.assertEqual(list(labels), [0, 0, 1, 3, 4])
+
+    def test_ranker_relevance_context_reports_label_distribution(self):
+        parser = pipeline.build_parser()
+        args = parser.parse_args([
+            "--objective-mode", "economic_ranking",
+            "--ranker-relevance-mode", "utility_tail",
+            "--ranker-relevance-q1", "0.25",
+            "--ranker-relevance-q2", "0.5",
+            "--ranker-relevance-q3", "0.75",
+            "--fee", "0",
+            "--slippage", "0",
+        ])
+        rows_for_context = [
+            row(1600000000000, trade_return=-0.010),
+            row(1600000060000, trade_return=0.001),
+            row(1600000120000, trade_return=0.004),
+            row(1600000180000, trade_return=0.008),
+            row(1600000240000, trade_return=0.010),
+        ]
+        context = pipeline.fit_ranker_relevance_context(rows_for_context, args)
+        self.assertEqual(context["ranker_label_0_rows"], 2)
+        self.assertEqual(context["ranker_label_1_rows"], 1)
+        self.assertEqual(context["ranker_label_3_rows"], 1)
+        self.assertEqual(context["ranker_label_4_rows"], 1)
+        self.assertEqual(context["ranker_relevant_rows"], 3)
+        self.assertAlmostEqual(context["ranker_relevant_row_share"], 0.6)
+
+    def test_ranker_selection_score_blends_bucket_utility_and_regression_utility(self):
+        parser = pipeline.build_parser()
+        args = parser.parse_args([
+            "--objective-mode", "economic_ranking",
+            "--ranker-utility-regression-blend", "0.5",
+        ])
+        calibration = {
+            "enabled": True,
+            "global_avg_utility": 0.0,
+            "bins": [
+                {"upper_score": 0.5, "calibrated_utility": -0.002},
+                {"upper_score": 1.0, "calibrated_utility": 0.002},
+            ],
+        }
+        blended = pipeline.rank_selection_score_with_utility_blend(
+            [0.25, 0.75],
+            calibration,
+            [0.006, -0.006],
+            args,
+        )
+        self.assertGreater(float(blended[0]), float(blended[1]))
+
+    def test_negative_calibration_top_bin_rejects_ranker_selection_scores(self):
+        parser = pipeline.build_parser()
+        args = parser.parse_args([
+            "--objective-mode", "economic_ranking",
+            "--fee", "0",
+            "--slippage", "0",
+            "--ranker-selection-calibration", "score_bucket",
+            "--ranker-selection-calibration-bins", "2",
+            "--ranker-selection-calibration-min-rows", "4",
+            "--ranker-selection-calibration-shrinkage", "0",
+            "--ranker-reject-negative-calibration-top-bin",
+        ])
+        validation_rows = [
+            row(1600000000000, trade_return=0.010),
+            row(1600000060000, trade_return=0.008),
+            row(1600000120000, trade_return=-0.020),
+            row(1600000180000, trade_return=-0.030),
+        ]
+        raw_scores = [0.10, 0.20, 0.90, 0.99]
+        calibration = pipeline.fit_ranker_selection_calibration(
+            validation_rows,
+            pipeline.build_prediction_bundle(ranker_score=raw_scores),
+            args,
+        )
+        self.assertTrue(calibration["top_bin_rejected"])
+        selection_scores = pipeline.rank_selection_score_with_calibration_gate(
+            raw_scores,
+            calibration,
+            None,
+            args,
+        )
+        self.assertTrue(all(math.isinf(float(value)) and float(value) < 0.0 for value in selection_scores))
+
     def test_ranker_grouped_rows_drops_singleton_decision_groups(self):
         parser = pipeline.build_parser()
         args = parser.parse_args([
@@ -4800,6 +5843,97 @@ class PipelineTests(unittest.TestCase):
         values = list(pipeline.score_values_for_bundle([], bundle, args))
         self.assertAlmostEqual(float(values[0]), 0.1)
         self.assertAlmostEqual(float(values[1]), 0.25)
+
+    def test_ranker_threshold_search_can_use_selection_score(self):
+        parser = pipeline.build_parser()
+        args = parser.parse_args([
+            "--objective-mode", "economic_ranking",
+            "--ranker-threshold-score", "selection",
+        ])
+        bundle = pipeline.build_prediction_bundle(
+            ranker_score=[0.90, 0.10],
+            ranker_selection_score=[-0.02, 0.03],
+        )
+        values = list(pipeline.score_values_for_bundle([], bundle, args))
+        self.assertAlmostEqual(float(values[0]), -0.02)
+        self.assertAlmostEqual(float(values[1]), 0.03)
+
+    def test_ranker_selection_threshold_reports_selected_score_name(self):
+        base = 1600000000000
+        rows = [
+            symbol_row("AAAUSDT", base, quote_volume=1000000000.0, trade_return=0.02),
+            symbol_row("BBBUSDT", base + 60000, quote_volume=1000000000.0, trade_return=0.03),
+        ]
+        runtime_args = SimpleNamespace(
+            ranker_threshold_score="selection",
+            ranker_score_upper_quantile=1.0,
+        )
+        selection = pipeline.tune_threshold(
+            rows,
+            pipeline.build_prediction_bundle(
+                ranker_score=[0.90, 0.10],
+                ranker_selection_score=[-0.02, 0.03],
+            ),
+            [0.0],
+            "avg_profit",
+            0.0,
+            0.0,
+            1,
+            0,
+            0.0,
+            "explore",
+            10000.0,
+            0.10,
+            0.01,
+            10,
+            60,
+            5,
+            objective_mode="economic_ranking",
+            trade_score_name="ranker_score",
+            hybrid_runtime_args=runtime_args,
+        )
+        self.assertEqual(selection["selected_score_name"], "ranker_selection_score")
+        self.assertEqual(selection["validation_metrics"]["selected_score_name"], "ranker_selection_score")
+
+    def test_portfolio_execution_economic_threshold_can_use_selection_score(self):
+        base = 1600000000000
+        rows = [
+            symbol_row("AAAUSDT", base, quote_volume=1000000000.0, trade_return=0.02),
+            symbol_row("BBBUSDT", base + 60000, quote_volume=1000000000.0, trade_return=0.03),
+        ]
+        runtime_args = SimpleNamespace(
+            ranker_score_upper_quantile=1.0,
+            ranker_threshold_score="selection",
+            top_k_per_symbol_minute=0,
+            max_trades_per_symbol_period=0,
+            max_same_symbol_streak=0,
+            max_symbol_fold_trade_share=0.0,
+            max_symbol_fold_trade_share_min_trades=0,
+            prefer_unique_symbols=False,
+        )
+        execution = pipeline.portfolio_execution(
+            rows,
+            pipeline.build_prediction_bundle(
+                ranker_score=[0.90, 0.10],
+                ranker_selection_score=[-0.02, 0.03],
+            ),
+            0.0,
+            0.0,
+            0.0,
+            10000.0,
+            0.10,
+            0.01,
+            10,
+            60,
+            5,
+            trade_selection="topk_score",
+            top_k_per_minute=1,
+            objective_mode="economic_ranking",
+            trade_score_name="ranker_score",
+            hybrid_runtime_args=runtime_args,
+        )
+        self.assertEqual(list(execution["executed"].keys()), [1])
+        self.assertAlmostEqual(execution["executed_trade_scores"][1], 0.10)
 
     def test_ranker_threshold_search_uses_scores_below_upper_cap(self):
         args = SimpleNamespace(
@@ -5002,6 +6136,40 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(model.calls, 1)
         self.assertEqual(list(first["probability"]), list(second["probability"]))
 
+    def test_prediction_bundle_cache_key_changes_when_unsampled_row_changes(self):
+        args = SimpleNamespace(
+            prediction_batch_rows=100,
+            prediction_bundle_cache_dir=self.temp.name,
+            input=self.csv_path,
+            cache_dir=self.temp.name,
+        )
+        selected = {
+            "params": {},
+            "threshold": 0.5,
+            "classification_model": object(),
+            "regression_model": None,
+            "ranker_model": None,
+            "ranker_utility_model": None,
+        }
+        base = 1600000000000
+        left_rows = [
+            symbol_row("AAAUSDT", base),
+            symbol_row("BBBUSDT", base + 60000),
+            symbol_row("CCCUSDT", base + 120000),
+            symbol_row("DDDUSDT", base + 180000),
+        ]
+        right_rows = [
+            symbol_row("AAAUSDT", base),
+            symbol_row("ZZZUSDT", base + 60000),
+            symbol_row("CCCUSDT", base + 120000),
+            symbol_row("DDDUSDT", base + 180000),
+        ]
+
+        left_key = pipeline.prediction_bundle_cache_key(selected, left_rows, "internal", args, "unit test")
+        right_key = pipeline.prediction_bundle_cache_key(selected, right_rows, "internal", args, "unit test")
+
+        self.assertNotEqual(left_key, right_key)
+
     def test_memory_guard_without_psutil(self):
         args = SimpleNamespace(max_rss_gb=7.8, abort_on_memory_limit=True)
         previous_psutil = pipeline.psutil
@@ -5159,6 +6327,14 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("brier_score", summary)
         self.assertGreaterEqual(summary["expected_calibration_error"], 0.0)
         self.assertTrue(any(row["probability_source"] == "calibrated_probability" for row in rows))
+
+    def test_calibration_report_missing_predictions_marks_summary_unavailable(self):
+        rows, summary = pipeline.calibration_report_from_predictions("")
+        self.assertEqual(rows[0]["skipped_reason"], "prediction_output_missing")
+        self.assertEqual(summary["calibration_report_skipped_reason"], "prediction_output_missing")
+        resolved = pipeline.resolved_calibration_summary(rows, summary, {"brier_score": 0.25})
+        self.assertEqual(resolved["calibration_report_skipped_reason"], "prediction_output_missing")
+        self.assertAlmostEqual(resolved["brier_score"], 0.25)
 
     def test_ranking_report_from_predictions_scores_top_tail(self):
         path = os.path.join(self.temp.name, "rank_predictions.csv")
@@ -5521,6 +6697,36 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertEqual(before, sorted(os.listdir(cache_dir)))
 
+    def test_raw_kline_dynamic_exit_uses_decision_candle_close_as_entry_price(self):
+        raw_dir = os.path.join(self.temp.name, "raw_klines")
+        os.makedirs(raw_dir, exist_ok=True)
+        base_time = 1600000000000
+        raw_path = os.path.join(raw_dir, "BTCUSDT-1m-2020-09-13.csv")
+        with open(raw_path, "w", encoding="utf-8", newline="") as handle:
+            handle.write("{},100,116,99,110,10\n".format(base_time))
+            handle.write("{},110,117,109,115,10\n".format(base_time + 60000))
+            handle.write("{},115,118,114,116,10\n".format(base_time + 120000))
+
+        source = pipeline.RawKlineExecutionPriceSource(raw_dir)
+        path = source.return_path("BTCUSDT", base_time, 2)
+
+        self.assertAlmostEqual(path[0], 115.0 / 110.0 - 1.0)
+        self.assertAlmostEqual(path[1], 116.0 / 110.0 - 1.0)
+
+    def test_raw_kline_dynamic_exit_rejects_conflicting_duplicate_candles(self):
+        raw_dir = os.path.join(self.temp.name, "raw_klines_duplicate")
+        os.makedirs(raw_dir, exist_ok=True)
+        base_time = 1600000000000
+        raw_path = os.path.join(raw_dir, "BTCUSDT-1m-2020-09-13.csv")
+        with open(raw_path, "w", encoding="utf-8", newline="") as handle:
+            handle.write("{},100,111,99,110,10\n".format(base_time))
+            handle.write("{},100,112,99,111,10\n".format(base_time))
+            handle.write("{},111,114,110,113,10\n".format(base_time + 60000))
+
+        source = pipeline.RawKlineExecutionPriceSource(raw_dir)
+        with self.assertRaisesRegex(ValueError, "Conflicting duplicate raw kline candle"):
+            source.return_path("BTCUSDT", base_time, 1)
+
     def test_summary_output_includes_new_fields(self):
         args = SimpleNamespace(
             split_mode="ratio",
@@ -5643,6 +6849,11 @@ class PipelineTests(unittest.TestCase):
             "average_dynamic_trade_return": 0.012,
             "average_fixed_horizon_trade_return": 0.01,
             "dynamic_minus_fixed_avg_return": 0.002,
+            "trade_regime_filter": "market_positive",
+            "trade_regime_breadth_threshold": 0.5,
+            "regime_filter_blocked": 7,
+            "raw_signal_trades_before_regime_filter": 30,
+            "raw_signal_regime_filter_blocked": 6,
             "threshold_rejection_diagnostics": [
                 {"threshold": 0.04, "rejected_over_top1_concentration": 1},
                 {"threshold": 0.05, "rejected_over_top1_concentration": 1},
@@ -5691,6 +6902,10 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("ranking_report_rows_available", summary)
         self.assertIn("threshold_diagnostic_summary", summary)
         self.assertEqual(summary["threshold_diagnostics_rows_available"], 3)
+        self.assertEqual(summary["trade_regime_filter"], "market_positive")
+        self.assertEqual(summary["regime_filter_blocked"], 7)
+        self.assertEqual(summary["raw_signal_trades_before_regime_filter"], 30)
+        self.assertEqual(summary["raw_signal_regime_filter_blocked"], 6)
         self.assertEqual(summary["threshold_diagnostics_primary_rejection"], "rejected_over_top1_concentration")
         self.assertEqual(summary["threshold_diagnostics_near_miss_count"], 1)
         self.assertAlmostEqual(summary["threshold_diagnostics_best_near_miss_threshold"], 0.06)
@@ -5719,6 +6934,10 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("ranking_report_rows_available", rows[0])
         self.assertIn("ranking_trade_score_top_decile_avg_net_return", rows[0])
         self.assertIn("threshold_diagnostics_near_miss_count", rows[0])
+        self.assertEqual(rows[0]["trade_regime_filter"], "market_positive")
+        self.assertEqual(rows[0]["regime_filter_blocked"], "7")
+        self.assertEqual(rows[0]["raw_signal_trades_before_regime_filter"], "30")
+        self.assertEqual(rows[0]["raw_signal_regime_filter_blocked"], "6")
         self.assertEqual(rows[0]["threshold_diagnostics_best_near_miss_trades"], "24")
         self.assertIn("max_rss_stage", rows[0])
         self.assertIn("selected_score_name", rows[0])
@@ -5734,6 +6953,8 @@ class PipelineTests(unittest.TestCase):
             threshold_rows = list(csv.DictReader(handle))
         self.assertEqual(len(threshold_rows), 3)
         self.assertEqual(threshold_rows[0]["source_split"], "fixed")
+        self.assertIn("trade_regime_filter", threshold_rows[0])
+        self.assertIn("raw_signal_regime_filter_blocked", threshold_rows[0])
         self.assertEqual(threshold_rows[0]["rejected_over_top1_concentration"], "1")
         with open(args.experiment_report_out, encoding="utf-8") as handle:
             report = handle.read()
@@ -5823,11 +7044,16 @@ class PipelineTests(unittest.TestCase):
             _explicit_flags={"memory_budget_gb", "max_rss_gb"},
         )
         fixed_record = {
-            "selected_threshold": 1.01,
-            "portfolio_profit": 0.0,
-            "portfolio_return": 0.0,
-            "precision": 0.0,
-            "recall": 0.0,
+            "selected_threshold": 0.5,
+            "threshold_selection_status": "valid_threshold",
+            "threshold_is_valid": 1,
+            "selected_validation_trade_count": 5,
+            "validation_predicted_trades": 5,
+            "predicted_trades": 5,
+            "portfolio_profit": 1.0,
+            "portfolio_return": 0.0001,
+            "precision": 1.0,
+            "recall": 1.0,
             "raw_precision": 0.0,
             "raw_recall": 0.0,
             "accepted": 1,
@@ -5889,6 +7115,32 @@ class PipelineTests(unittest.TestCase):
         output = stdout.getvalue()
         self.assertIn("Logistic: baseline unavailable for this run", output)
         self.assertNotIn("metrics file not found", output)
+
+    def test_baseline_report_treats_unreadable_logistic_metrics_as_unavailable(self):
+        class UnreadableCsv:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                raise OSError(22, "Invalid argument")
+
+        args = SimpleNamespace(logistic_metrics_in="cloud_placeholder_logistic.csv")
+
+        with mock.patch("gbdt_pipeline.os.path.exists", return_value=True):
+            with mock.patch("builtins.open", return_value=UnreadableCsv()):
+                rows, summary = pipeline.baseline_report(args)
+
+        logistic_rows = [row for row in rows if row["baseline_name"] == "logistic_baseline"]
+        self.assertEqual(len(logistic_rows), 1)
+        self.assertEqual(logistic_rows[0]["available"], 0)
+        self.assertEqual(logistic_rows[0]["skipped_reason"], "logistic_metrics_unavailable")
+        self.assertIn("best_baseline_name", summary)
 
     def test_configure_output_paths_places_disk_prediction_bundle_cache_under_results_dir(self):
         args = SimpleNamespace(
@@ -6035,6 +7287,7 @@ class PipelineTests(unittest.TestCase):
 
     def test_output_column_schemas_are_unique(self):
         self.assertEqual(len(pipeline.METRIC_COLUMNS), len(set(pipeline.METRIC_COLUMNS)))
+        self.assertEqual(len(pipeline.THRESHOLD_DIAGNOSTIC_COLUMNS), len(set(pipeline.THRESHOLD_DIAGNOSTIC_COLUMNS)))
         self.assertEqual(len(pipeline.WALKFORWARD_DIAGNOSTIC_COLUMNS), len(set(pipeline.WALKFORWARD_DIAGNOSTIC_COLUMNS)))
         self.assertEqual(len(run_experiments.RESULT_COLUMNS), len(set(run_experiments.RESULT_COLUMNS)))
 
@@ -6054,6 +7307,1257 @@ class PipelineTests(unittest.TestCase):
             report = handle.read()
         self.assertIn("Profitable but fragile.", report)
         self.assertIn("Robustness Gates", report)
+
+
+class ResearchDiagnosticsTests(unittest.TestCase):
+    def trade_row(self, symbol, open_time, trade_return, score, position_size=1000.0, label=1, day="2026-01-01"):
+        return {
+            "symbol": symbol,
+            "open_time": str(open_time),
+            "trade_day": day,
+            "dynamic_trade_return": str(trade_return),
+            "trade_return": str(trade_return),
+            "position_size": str(position_size),
+            "trade_score": str(score),
+            "expected_value": str(score),
+            "predicted_net_return": str(score),
+            "probability": "0.6" if label else "0.4",
+            "calibrated_probability": "0.55" if label else "0.45",
+            "label": str(label),
+        }
+
+    def test_symbol_exposure_reports_trade_capital_profit_and_loss_shares(self):
+        rows = [
+            self.trade_row("AAA", 1, 0.0315, 0.9),
+            self.trade_row("AAA", 2, -0.0185, 0.8, label=0),
+            self.trade_row("BBB", 3, 0.0115, 0.7),
+        ]
+        exposure = research_diagnostics.symbol_exposure(rows)
+        by_symbol = {row["symbol"]: row for row in exposure}
+        self.assertAlmostEqual(by_symbol["AAA"]["trade_share"], 2 / 3)
+        self.assertAlmostEqual(by_symbol["AAA"]["capital_share"], 2 / 3)
+        self.assertAlmostEqual(by_symbol["AAA"]["net_profit"], 10.0)
+        self.assertAlmostEqual(by_symbol["BBB"]["net_profit"], 10.0)
+        self.assertGreater(by_symbol["AAA"]["loss_share"], 0.99)
+
+    def test_leave_one_symbol_out_recomputes_return_and_trade_count(self):
+        rows = [
+            self.trade_row("AAA", 1, 0.0315, 0.9),
+            self.trade_row("BBB", 2, 0.0115, 0.8),
+        ]
+        result = research_diagnostics.leave_one_symbol_out_rows(rows, ["AAA"], "fixed_test")
+        self.assertEqual(result[0]["removed_trade_count"], 1)
+        self.assertAlmostEqual(result[0]["portfolio_profit"], 10.0)
+        self.assertAlmostEqual(result[0]["portfolio_return"], 0.001)
+        self.assertAlmostEqual(result[0]["baseline_portfolio_return"], 0.004)
+
+    def test_leave_one_fold_out_uses_remaining_folds_only(self):
+        rows = [
+            {"split": "walkforward_fold_1", "portfolio_profit": "100", "portfolio_return": "0.01", "predicted_trades": "2"},
+            {"split": "walkforward_fold_2", "portfolio_profit": "-50", "portfolio_return": "-0.005", "predicted_trades": "1"},
+            {"split": "walkforward_fold_3", "portfolio_profit": "0", "portfolio_return": "0", "predicted_trades": "0"},
+        ]
+        result = {
+            row["removed_fold"]: row
+            for row in research_diagnostics.leave_one_fold_out_rows(rows)
+        }
+        self.assertAlmostEqual(result["walkforward_fold_1"]["remaining_mean_fold_return"], -0.0025)
+        self.assertEqual(result["walkforward_fold_2"]["remaining_active_folds"], 1)
+        self.assertEqual(result["walkforward_fold_2"]["remaining_profitable_folds"], 1)
+
+    def test_score_deciles_report_monotonicity_and_top_symbol_concentration(self):
+        rows = [
+            self.trade_row("AAA", i, -0.0185 if i < 5 else 0.0315, i / 10.0, label=int(i >= 5))
+            for i in range(10)
+        ]
+        deciles, monotonicity = research_diagnostics.score_decile_rows(rows, "walkforward", ["trade_score"])
+        self.assertEqual(len(deciles), 10)
+        self.assertAlmostEqual(monotonicity[("walkforward", "trade_score")], 1.0)
+        self.assertEqual(deciles[-1]["top_symbol"], "AAA")
+        self.assertAlmostEqual(deciles[-1]["symbol_concentration_top1"], 1.0)
+
+    def test_threshold_stability_uses_neighbor_performance_and_trade_variation(self):
+        rows = [
+            {
+                "available": "1",
+                "source_split": "fixed",
+                "fold_index": "0",
+                "candidate_index": str(index),
+                "threshold": str(0.1 * index),
+                "predicted_trades": str(10 + index),
+                "average_net_return_after_costs": str(0.01 - 0.001 * abs(index - 3)),
+                "symbol_trade_concentration_top1": str(0.2 + 0.01 * index),
+                "rejection_reason_flags": "",
+            }
+            for index in range(1, 6)
+        ]
+        result = research_diagnostics.threshold_stability_rows(rows, {("fixed", 0): 0.3})
+        self.assertEqual(len(result), 1)
+        self.assertAlmostEqual(result[0]["closest_candidate_threshold"], 0.3)
+        self.assertGreater(result[0]["threshold_stability_score"], 0.5)
+        self.assertEqual(result[0]["neighbor_min_trades"], 11)
+        self.assertEqual(result[0]["neighbor_max_trades"], 15)
+
+    def test_cost_stress_reduces_return_by_extra_round_trip_cost(self):
+        rows = [
+            self.trade_row("AAA", 1, 0.0315, 0.9),
+            self.trade_row("BBB", 2, 0.0315, 0.8),
+        ]
+        stress = {
+            row["cost_scenario"]: row
+            for row in research_diagnostics.cost_stress_rows(rows, "fixed_test")
+        }
+        self.assertAlmostEqual(stress["baseline_cost"]["portfolio_profit"], 60.0)
+        self.assertAlmostEqual(stress["double_cost"]["portfolio_profit"], 57.0)
+        self.assertLess(stress["double_cost"]["portfolio_return"], stress["baseline_cost"]["portfolio_return"])
+
+    def test_composite_score_penalizes_concentration_and_fragility(self):
+        summary = {
+            "profit_factor": 1.1,
+            "symbol_profit_concentration_top1": 0.8,
+            "ranking_trade_score_net_return_monotonicity": 0.25,
+        }
+        walk_metrics = [
+            {"split": "walkforward_fold_1", "portfolio_return": "0.02", "portfolio_profit": "200", "predicted_trades": "2"},
+            {"split": "walkforward_fold_2", "portfolio_return": "-0.08", "portfolio_profit": "-800", "predicted_trades": "3"},
+        ]
+        threshold = [{"threshold_stability_score": 0.4}]
+        leave_symbols = [{"source": "walkforward", "portfolio_return": "-0.01"}]
+        leave_folds = [{"remaining_mean_fold_return": "-0.08"}]
+        costs = [{"source": "walkforward", "cost_scenario": "double_cost", "portfolio_return": "-0.02"}]
+        components = research_diagnostics.composite_robustness_score(
+            summary,
+            walk_metrics,
+            threshold,
+            leave_symbols,
+            leave_folds,
+            costs,
+            {("walkforward", "trade_score"): 0.25},
+        )
+        score = components[-1]["component_score"]
+        self.assertGreaterEqual(score, 0.0)
+        self.assertLess(score, 0.6)
+
+    def test_candidate_rich_command_switches_output_mode_and_directory(self):
+        profile = {
+            "exact_command": (
+                r"python gbdt_pipeline.py --prediction-output-mode trades "
+                r"--results-dir results\chrono_fix_rerun_20260714_manual\hyb_late_tuned_6m_sf0p04_f88 "
+                r"--run-summary-out results\chrono_fix_rerun_20260714_manual\hyb_late_tuned_6m_sf0p04_f88\kline_growth_run_summary.json"
+            )
+        }
+        command = research_diagnostics.candidate_rich_command_from_profile(profile)
+        self.assertIn("--prediction-output-mode candidates", command)
+        self.assertIn(r"results\candidate_rich_20260714_baseline_candidates", command)
+        self.assertIn("--predictions-out kline_growth_predictions_gbdt_candidates.csv", command)
+        self.assertIn("--walk-predictions-out kline_growth_predictions_gbdt_walkforward_candidates.csv", command)
+        self.assertNotIn("--prediction-output-mode all", command)
+
+    def test_machine_readable_run_status_distinguishes_rejected_strategy(self):
+        summary = {"accepted": 0, "rejection_reason": "worst_fold_return -0.0877 < -0.0800"}
+        args = SimpleNamespace(acceptance_tier="exploration")
+        pipeline.apply_machine_readable_run_status(summary, args)
+        self.assertEqual(summary["pipeline_execution_status"], "completed")
+        self.assertEqual(summary["strategy_acceptance_status"], "rejected")
+        self.assertEqual(summary["strategy_rejected"], 1)
+        self.assertEqual(summary["rejection_reasons"], "worst_fold_return -0.0877 < -0.0800")
+
+    def test_machine_readable_run_status_rejects_failed_robustness_gate(self):
+        summary = {
+            "accepted": 1,
+            "walkforward_gate_status": "passed",
+            "robustness_gate_failed": 1,
+            "robustness_failed_checks": "tail_monotonicity 0.5556 < 0.6000",
+        }
+        args = SimpleNamespace(acceptance_tier="exploration")
+        pipeline.apply_machine_readable_run_status(summary, args)
+        self.assertEqual(summary["pipeline_execution_status"], "completed")
+        self.assertEqual(summary["strategy_acceptance_status"], "rejected")
+        self.assertEqual(summary["strategy_rejected"], 1)
+        self.assertIn("tail_monotonicity", summary["rejection_reasons"])
+
+    def test_machine_readable_run_status_can_mark_not_checked(self):
+        summary = {"accepted": 1, "walkforward_gate_status": "not_applicable"}
+        args = SimpleNamespace(acceptance_tier="none")
+        pipeline.apply_machine_readable_run_status(summary, args)
+        self.assertEqual(summary["strategy_acceptance_status"], "not_checked")
+        self.assertEqual(summary["strategy_rejected"], 0)
+
+    def test_exploration_acceptance_rejects_fragile_positive_mean_walkforward(self):
+        returns = [
+            -0.00205,
+            0.0,
+            -0.02046,
+            -0.01317,
+            -0.00022,
+            -0.00198,
+            0.0,
+            0.06309,
+            -0.00958,
+            0.01451,
+        ]
+        trades = [6, 0, 226, 249, 2, 2, 0, 154, 661, 38]
+        records = []
+        for index, (portfolio_return, trade_count) in enumerate(zip(returns, trades), 1):
+            records.append({
+                "split": "walkforward_fold_{}".format(index),
+                "portfolio_profit": portfolio_return * 10000.0,
+                "portfolio_return": portfolio_return,
+                "precision": 0.0,
+                "max_capital_drawdown": 0.01,
+                "predicted_trades": trade_count,
+                "meta_filter_enabled": 0,
+            })
+        args = SimpleNamespace(
+            overactive_trade_threshold=150,
+            acceptance_tier="exploration",
+            min_profitable_fold_rate=0.0,
+            min_median_fold_return=-999.0,
+            max_worst_fold_drawdown=1.0,
+            min_active_profitable_fold_rate=0.5,
+            min_walkforward_total_trades=10,
+        )
+
+        summary = pipeline.walkforward_acceptance_summary(records, args)
+
+        self.assertEqual(summary["accepted"], 0)
+        self.assertEqual(summary["strategy_strength"], "rejected")
+        self.assertIn("active_profitable_fold_rate", summary["failed_acceptance_checks"])
+        self.assertIn("median_portfolio_return", summary["failed_acceptance_checks"])
+
+    def test_resolved_run_acceptance_rejects_no_valid_fixed_threshold(self):
+        fixed_record = {
+            "threshold_selection_status": "no_valid_threshold",
+            "threshold_is_valid": 0,
+            "selected_validation_trade_count": 0,
+            "validation_predicted_trades": 0,
+            "predicted_trades": 0,
+        }
+        walkforward_summary = {
+            "accepted": 1,
+            "acceptance_tier": "exploration",
+            "failed_acceptance_checks": "",
+            "rejection_reason": "",
+            "strategy_strength": "exploration_pass",
+        }
+        args = SimpleNamespace(
+            walk_forward=True,
+            acceptance_tier="exploration",
+            min_fixed_test_trades=1,
+        )
+
+        acceptance = pipeline.resolved_run_acceptance(fixed_record, walkforward_summary, args)
+
+        self.assertEqual(acceptance["accepted"], 0)
+        self.assertEqual(acceptance["strategy_strength"], "rejected")
+        self.assertIn("no_valid_threshold", acceptance["failed_acceptance_checks"])
+        self.assertIn("zero_fixed_test_trades", acceptance["failed_acceptance_checks"])
+
+    def test_research_diagnostics_candidate_artifacts_use_selected_rows_for_accounting(self):
+        rows = [
+            self.trade_row("AAA", 1, 0.0315, 0.9),
+            self.trade_row("BBB", 2, -0.0185, 0.8, label=0),
+        ]
+        rows[0]["selected_by_topk"] = "1"
+        rows[0]["predicted"] = "1"
+        rows[1]["selected_by_topk"] = "0"
+        rows[1]["predicted"] = "1"
+        selected = research_diagnostics.selected_prediction_rows(rows)
+        metrics = research_diagnostics.portfolio_metrics(selected)
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0]["symbol"], "AAA")
+        self.assertAlmostEqual(metrics["portfolio_profit"], 30.0)
+
+    def test_offline_candidate_research_prefers_candidate_artifacts(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            candidate_path = root / "kline_growth_predictions_gbdt_candidates.csv"
+            all_path = root / "kline_growth_predictions_gbdt_all.csv"
+            all_path.write_text("all\n", encoding="utf-8")
+            self.assertEqual(
+                offline_candidate_research.first_existing_path([candidate_path, all_path]),
+                all_path,
+            )
+            candidate_path.write_text("candidates\n", encoding="utf-8")
+            self.assertEqual(
+                offline_candidate_research.first_existing_path([candidate_path, all_path]),
+                candidate_path,
+            )
+
+    def test_offline_candidate_research_preserves_artifact_fold_identity(self):
+        first = offline_candidate_research.compact_artifact_candidate(
+            {
+                "candidate_id": "candidate-fold-1",
+                "stable_row_id": "walkforward:fold_1:1173355",
+                "source": "walkforward",
+                "symbol": "AAA",
+                "month": "2025-07",
+                "fold_id": "fold_1",
+                "row_position": "1173355",
+                "selected_by_score_before_execution": "1",
+                "executed": "1",
+                "position_size": "100",
+                "trade_return": "0.01",
+            },
+            "walkforward",
+            {},
+        )
+        second = offline_candidate_research.compact_artifact_candidate(
+            {
+                "candidate_id": "candidate-fold-3",
+                "stable_row_id": "walkforward:fold_3:1173355",
+                "source": "walkforward",
+                "symbol": "BBB",
+                "month": "2025-09",
+                "fold_id": "fold_3",
+                "row_position": "1173355",
+                "selected_by_score_before_execution": "1",
+                "executed": "1",
+                "position_size": "100",
+                "trade_return": "0.02",
+            },
+            "walkforward",
+            {},
+        )
+
+        self.assertEqual(first["_fold_index"], "1")
+        self.assertEqual(first["_fold_split"], "walkforward_fold_1")
+        self.assertEqual(second["_fold_index"], "3")
+        self.assertEqual(second["_fold_split"], "walkforward_fold_3")
+        self.assertNotEqual(
+            offline_candidate_research.row_identity(first),
+            offline_candidate_research.row_identity(second),
+        )
+        overlap = offline_candidate_research.selection_overlap(
+            "walkforward",
+            "baseline_selected_by_topk",
+            [first, second],
+            [first, second],
+        )
+        self.assertEqual(overlap["selected_trades"], 2)
+        self.assertEqual(overlap["overlap_trades"], 2)
+        with tempfile.TemporaryDirectory() as temp:
+            snapshot = Path(temp) / "candidate_snapshot_walkforward.csv"
+            offline_candidate_research.write_csv(
+                snapshot,
+                [first, second],
+                offline_candidate_research.CANDIDATE_FIELDS,
+            )
+            reloaded = offline_candidate_research.read_csv_rows(snapshot)
+        self.assertEqual(reloaded[0]["_candidate_id"], "candidate-fold-1")
+        self.assertEqual(reloaded[1]["_stable_row_id"], "walkforward:fold_3:1173355")
+        self.assertNotEqual(
+            offline_candidate_research.row_identity(reloaded[0]),
+            offline_candidate_research.row_identity(reloaded[1]),
+        )
+
+    def test_offline_candidate_research_refreshes_stale_artifact_snapshot(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            artifact = root / "kline_growth_walkforward_candidates.csv.gz"
+            snapshot = root / "candidate_snapshot_walkforward.csv"
+            candidate_artifacts.write_candidate_artifact(
+                artifact,
+                [
+                    {
+                        "candidate_id": "candidate-fold-1",
+                        "stable_row_id": "walkforward:fold_1:1173355",
+                        "source": "walkforward",
+                        "symbol": "AAA",
+                        "month": "2025-07",
+                        "month_index": 1,
+                        "open_time": 1752247680000,
+                        "fold_id": "fold_1",
+                        "row_position": 1173355,
+                        "label": 1,
+                        "trade_return": 0.01,
+                        "final_preselection_score": 0.9,
+                        "selected_by_score_before_execution": 1,
+                        "executed": 1,
+                        "position_size": 100.0,
+                        "rank_within_decision_bucket": 1,
+                    }
+                ],
+                metadata={"source_run_id": "stale-snapshot-test"},
+            )
+            snapshot.write_text(
+                "_source,_row_index,_fold_index,_fold_split,symbol,selected_by_topk,predicted\n"
+                "walkforward,1173355,0,,AAA,1,1\n",
+                encoding="utf-8",
+            )
+
+            rows, stats = offline_candidate_research.extract_candidate_artifact(
+                artifact,
+                snapshot,
+                "walkforward",
+                force=False,
+            )
+
+            self.assertEqual(stats["loaded_from_snapshot"], 0)
+            self.assertEqual(rows[0]["_fold_index"], "1")
+            reloaded = offline_candidate_research.read_csv_rows(snapshot)
+            self.assertEqual(reloaded[0]["_candidate_id"], "candidate-fold-1")
+            self.assertEqual(reloaded[0]["_stable_row_id"], "walkforward:fold_1:1173355")
+
+    def test_offline_candidate_research_rejects_late_artifact_for_prefilter_ablation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            artifact = root / "late_candidates.csv.gz"
+            snapshot = root / "candidate_snapshot_fixed.csv"
+            candidate_artifacts.write_candidate_artifact(
+                artifact,
+                [
+                    {
+                        "candidate_id": "late-1",
+                        "source": "fixed",
+                        "symbol": "AAA",
+                        "month": "2025-07",
+                        "open_time": 1752247680000,
+                        "fold_id": "fixed",
+                        "row_position": 1,
+                        "selected_by_score_before_execution": 1,
+                        "executed": 1,
+                        "position_size": 100.0,
+                        "trade_return": 0.01,
+                    }
+                ],
+                metadata={
+                    "source_run_id": "late-stage-test",
+                    "candidate_serialization_stage": "post_selection",
+                },
+            )
+
+            with self.assertRaises(RuntimeError) as raised:
+                offline_candidate_research.extract_candidate_artifact(
+                    artifact,
+                    snapshot,
+                    "fixed",
+                    require_pre_filter=True,
+                )
+
+            self.assertIn("pre-filter", str(raised.exception))
+
+    def test_offline_candidate_pool_uses_threshold_qualified_prefilter_rows(self):
+        rows = [
+            {
+                "_candidate_id": "current",
+                "symbol": "AAA",
+                "open_time": "1600000000000",
+                "raw_signal": "0",
+                "selected_by_threshold": "1",
+                "selected_by_score_edge": "1",
+                "selected_by_symbol_filter": "1",
+                "candidate_serialization_stage": "pre_score_edge_pre_symbol_filter",
+                "trade_score": "0.9",
+            },
+            {
+                "_candidate_id": "threshold_blocked",
+                "symbol": "BBB",
+                "open_time": "1600000000000",
+                "raw_signal": "0",
+                "selected_by_threshold": "0",
+                "selected_by_score_edge": "1",
+                "selected_by_symbol_filter": "1",
+                "candidate_serialization_stage": "pre_score_edge_pre_symbol_filter",
+                "trade_score": "1.0",
+            },
+            {
+                "_candidate_id": "score_edge_blocked",
+                "symbol": "CCC",
+                "open_time": "1600000000000",
+                "raw_signal": "0",
+                "selected_by_threshold": "1",
+                "selected_by_score_edge": "0",
+                "selected_by_symbol_filter": "1",
+                "candidate_serialization_stage": "pre_score_edge_pre_symbol_filter",
+                "trade_score": "0.8",
+            },
+            {
+                "_candidate_id": "symbol_blocked",
+                "symbol": "DDD",
+                "open_time": "1600000000000",
+                "raw_signal": "0",
+                "selected_by_threshold": "1",
+                "selected_by_score_edge": "1",
+                "selected_by_symbol_filter": "0",
+                "candidate_serialization_stage": "pre_score_edge_pre_symbol_filter",
+                "trade_score": "0.7",
+            },
+        ]
+
+        current = offline_candidate_research.candidate_pool(rows)
+        no_score_edge = offline_candidate_research.candidate_pool(rows, score_edge_filter=False)
+        no_symbol_filter = offline_candidate_research.candidate_pool(rows, symbol_filter=False)
+        no_filters = offline_candidate_research.candidate_pool(
+            rows,
+            score_edge_filter=False,
+            symbol_filter=False,
+        )
+
+        self.assertEqual([row["_candidate_id"] for row in current], ["current"])
+        self.assertEqual(
+            {row["_candidate_id"] for row in no_score_edge},
+            {"current", "score_edge_blocked"},
+        )
+        self.assertEqual(
+            {row["_candidate_id"] for row in no_symbol_filter},
+            {"current", "symbol_blocked"},
+        )
+        self.assertEqual(
+            {row["_candidate_id"] for row in no_filters},
+            {"current", "score_edge_blocked", "symbol_blocked"},
+        )
+
+    def test_offline_candidate_artifact_research_scope_streams_relevant_rows(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            artifact = root / "kline_growth_walkforward_candidates.csv.gz"
+            snapshot = root / "candidate_snapshot_walkforward.csv"
+            candidate_artifacts.write_candidate_artifact(
+                artifact,
+                [
+                    {
+                        "candidate_id": "threshold-qualified",
+                        "stable_row_id": "walkforward:fold_1:1",
+                        "source": "walkforward",
+                        "symbol": "AAA",
+                        "month": "2025-07",
+                        "open_time": 1752247680000,
+                        "fold_id": "fold_1",
+                        "row_position": 1,
+                        "selected_by_threshold": 1,
+                        "selected_by_score_edge": 1,
+                        "selected_by_symbol_filter": 1,
+                        "raw_signal": 0,
+                        "selected_by_score_before_execution": 0,
+                        "executed": 0,
+                        "trade_return": 0.01,
+                        "final_preselection_score": 0.9,
+                    },
+                    {
+                        "candidate_id": "not-research-relevant",
+                        "stable_row_id": "walkforward:fold_1:2",
+                        "source": "walkforward",
+                        "symbol": "BBB",
+                        "month": "2025-07",
+                        "open_time": 1752247680000,
+                        "fold_id": "fold_1",
+                        "row_position": 2,
+                        "selected_by_threshold": 0,
+                        "selected_by_score_edge": 0,
+                        "selected_by_symbol_filter": 1,
+                        "raw_signal": 0,
+                        "selected_by_score_before_execution": 0,
+                        "executed": 0,
+                        "trade_return": 0.02,
+                        "final_preselection_score": 1.0,
+                    },
+                    {
+                        "candidate_id": "executed",
+                        "stable_row_id": "walkforward:fold_1:3",
+                        "source": "walkforward",
+                        "symbol": "CCC",
+                        "month": "2025-07",
+                        "open_time": 1752247680000,
+                        "fold_id": "fold_1",
+                        "row_position": 3,
+                        "selected_by_threshold": 0,
+                        "selected_by_score_edge": 0,
+                        "selected_by_symbol_filter": 1,
+                        "raw_signal": 1,
+                        "selected_by_score_before_execution": 1,
+                        "executed": 1,
+                        "position_size": 100.0,
+                        "trade_return": 0.03,
+                        "final_preselection_score": 0.8,
+                    },
+                ],
+                metadata={
+                    "source_run_id": "research-scope-test",
+                    "candidate_serialization_stage": "pre_score_edge_pre_symbol_filter",
+                    "full_candidate_coverage": True,
+                },
+            )
+
+            rows, stats = offline_candidate_research.extract_candidate_artifact(
+                artifact,
+                snapshot,
+                "walkforward",
+                force=False,
+                require_pre_filter=True,
+                row_scope="research_relevant",
+            )
+
+            self.assertEqual(stats["rows_scanned"], 3)
+            self.assertEqual(stats["candidate_rows"], 2)
+            self.assertEqual(stats["artifact_row_scope"], "research_relevant")
+            self.assertEqual(
+                {row["_candidate_id"] for row in rows},
+                {"threshold-qualified", "executed"},
+            )
+            reloaded = offline_candidate_research.read_csv_rows(snapshot)
+            self.assertEqual(len(reloaded), 2)
+            self.assertTrue(all(row["_artifact_row_scope"] == "research_relevant" for row in reloaded))
+
+    def test_offline_research_rejects_overlapping_confirmation_folds(self):
+        args = SimpleNamespace(discovery_folds="1-2", selection_folds="3-4", confirmation_folds="4-5")
+        with self.assertRaises(ValueError):
+            offline_candidate_research.build_research_fold_sets(args, 10)
+
+    def test_offline_research_split_matrix_keeps_confirmation_separate(self):
+        fold_rows = [
+            {"experiment": "baseline", "fold_index": "1", "portfolio_profit": "100", "portfolio_return": "0.01", "predicted_trades": "10"},
+            {"experiment": "baseline", "fold_index": "2", "portfolio_profit": "-50", "portfolio_return": "-0.005", "predicted_trades": "5"},
+            {"experiment": "baseline", "fold_index": "3", "portfolio_profit": "300", "portfolio_return": "0.03", "predicted_trades": "7"},
+        ]
+        split_rows = offline_candidate_research.research_split_matrix_rows(
+            fold_rows,
+            {"selection": {1, 2}, "confirmation": {3}},
+        )
+        by_phase = {row["phase"]: row for row in split_rows}
+        self.assertAlmostEqual(by_phase["selection"]["portfolio_return"], 0.0025)
+        self.assertAlmostEqual(by_phase["confirmation"]["portfolio_return"], 0.03)
+        self.assertEqual(by_phase["confirmation"]["folds"], "3")
+
+    def test_offline_research_decision_rejects_underpowered_tuning_split(self):
+        experiment_rows = [
+            {"source": "walkforward", "experiment": "baseline_executed_trades", "portfolio_return": "0.0087", "trade_count": "1755"},
+            {"source": "walkforward", "experiment": "score_replay_trade_score", "portfolio_return": "0.0081", "trade_count": "1755"},
+        ]
+        split_rows = [
+            {"experiment": "baseline_executed_trades", "phase": "selection", "trade_count": "4", "active_folds": "2"},
+            {"experiment": "score_replay_trade_score", "phase": "selection", "trade_count": "4", "active_folds": "2"},
+            {"experiment": "baseline_executed_trades", "phase": "confirmation", "trade_count": "853", "active_folds": "3"},
+            {"experiment": "score_replay_trade_score", "phase": "confirmation", "trade_count": "853", "active_folds": "3"},
+        ]
+        bucket_rows = [
+            {
+                "source": "walkforward",
+                "bucket_scope": "execution_open_time",
+                "selected_replaceable_share": "0.0547",
+            }
+        ]
+        cost_rows = [
+            {
+                "source": "walkforward",
+                "experiment": "baseline_executed_trades",
+                "cost_scenario": "double_cost",
+                "portfolio_return": "-0.0098",
+            }
+        ]
+
+        decision = offline_candidate_research.research_decision_rows(
+            experiment_rows,
+            split_rows,
+            bucket_rows,
+            cost_rows,
+        )[0]
+
+        self.assertEqual(decision["decision"], "do_not_promote_offline_tuning")
+        self.assertEqual(decision["best_walkforward_experiment"], "baseline_executed_trades")
+        self.assertIn("selection_underpowered", decision["reasons"])
+        self.assertIn("candidate_reselection_sparse", decision["reasons"])
+        self.assertIn("baseline_best", decision["reasons"])
+        self.assertIn("cost_stress_failed", decision["reasons"])
+
+    def test_offline_candidate_bucket_audit_separates_execution_and_artifact_buckets(self):
+        base_minute = 26666640
+        rows = [
+            {
+                "_candidate_id": "a",
+                "symbol": "AAA",
+                "open_time": str(base_minute * 60000),
+                "decision_bucket_id": str(base_minute),
+                "configured_top_k": "1",
+                "raw_signal": "1",
+                "selected_by_topk": "1",
+                "predicted": "1",
+                "trade_return": "0.01",
+                "trade_score": "0.90",
+            },
+            {
+                "_candidate_id": "b",
+                "symbol": "BBB",
+                "open_time": str((base_minute + 10) * 60000),
+                "decision_bucket_id": str(base_minute),
+                "configured_top_k": "1",
+                "raw_signal": "1",
+                "selected_by_topk": "1",
+                "predicted": "1",
+                "trade_return": "0.01",
+                "trade_score": "0.80",
+            },
+        ]
+        audit = {
+            row["bucket_scope"]: row
+            for row in offline_candidate_research.candidate_bucket_audit_rows("walkforward", rows)
+        }
+
+        self.assertEqual(audit["execution_open_time"]["bucket_count"], 2)
+        self.assertEqual(audit["execution_open_time"]["bucket_candidate_count_max"], 1)
+        self.assertAlmostEqual(audit["execution_open_time"]["selected_replaceable_share"], 0.0)
+        self.assertEqual(audit["artifact_decision_bucket"]["bucket_count"], 1)
+        self.assertEqual(audit["artifact_decision_bucket"]["bucket_candidate_count_max"], 2)
+        self.assertAlmostEqual(audit["artifact_decision_bucket"]["selected_replaceable_share"], 1.0)
+
+    def test_offline_candidate_research_keeps_executed_baseline_separate(self):
+        rows = [
+            {
+                "_candidate_id": "executed",
+                "symbol": "AAA",
+                "open_time": "1600000000000",
+                "raw_signal": "1",
+                "selected_by_topk": "1",
+                "predicted": "1",
+                "position_size": "100",
+                "trade_return": "0.01",
+                "trade_score": "0.9",
+            },
+            {
+                "_candidate_id": "ranked_not_executed",
+                "symbol": "BBB",
+                "open_time": "1600000060000",
+                "raw_signal": "1",
+                "selected_by_topk": "1",
+                "predicted": "0",
+                "position_size": "",
+                "trade_return": "0.02",
+                "trade_score": "0.8",
+            },
+        ]
+        experiments = offline_candidate_research.selected_sets(rows, {})
+
+        self.assertEqual(len(experiments["baseline_executed_trades"]), 1)
+        self.assertEqual(len(experiments["baseline_selected_by_topk"]), 2)
+        self.assertEqual(experiments["baseline_executed_trades"][0]["symbol"], "AAA")
+        self.assertEqual(experiments["baseline_selected_by_topk"][1]["_position_size_fallback"], "1")
+
+    def test_created_file_inventory_writes_absolute_paths_and_sizes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            output = root / "created_files.csv"
+            artifact = root / "artifact.csv"
+            artifact.write_text("abc\n", encoding="utf-8")
+            summary = created_file_inventory.write_inventory(
+                output,
+                [("artifact", artifact), ("missing", root / "missing.csv")],
+            )
+            self.assertEqual(summary["rows"], 1)
+            with output.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(rows[0]["label"], "artifact")
+            self.assertEqual(rows[0]["path"], str(artifact.resolve()))
+            self.assertEqual(int(rows[0]["size_bytes"]), artifact.stat().st_size)
+
+    def test_pipeline_candidate_artifact_inventory_prints_path(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            artifact = root / "candidates.csv.gz"
+            candidate_artifacts.write_candidate_artifact(
+                artifact,
+                [{"candidate_id": "abc", "executed": 1}],
+                metadata={"source_run_id": "test"},
+            )
+            args = SimpleNamespace(
+                candidate_artifact_out=str(artifact),
+                walk_candidate_artifact_out="",
+                results_dir="",
+            )
+            with mock.patch("builtins.print") as printed:
+                summary = pipeline.write_candidate_artifact_created_files_inventory(args)
+            output = root / "candidate_artifact_created_files.csv"
+            self.assertEqual(summary["path"], str(output.resolve()))
+            with output.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual({row["label"] for row in rows}, {"fixed_candidate_artifact", "fixed_candidate_artifact_manifest"})
+            printed.assert_called()
+            self.assertIn(str(output.resolve()), printed.call_args.args[0])
+
+    def test_offline_research_inventory_prints_path(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for name in (
+                "candidate_snapshot_fixed.csv",
+                "candidate_snapshot_walkforward.csv",
+                "candidate_snapshot_summary.csv",
+                "offline_experiment_matrix.csv",
+                "offline_cost_stress.csv",
+                "offline_leave_one_symbol_out.csv",
+                "offline_leave_one_fold_out.csv",
+                "offline_walkforward_fold_metrics.csv",
+                "offline_research_split_matrix.csv",
+                "offline_selection_overlap.csv",
+                "offline_candidate_bucket_audit.csv",
+                "offline_selected_trades.csv",
+                "position_size_fallbacks.json",
+                "research_report.md",
+            ):
+                (root / name).write_text("x\n", encoding="utf-8")
+            with mock.patch("builtins.print") as printed:
+                summary = offline_candidate_research.write_offline_research_created_files_inventory(root)
+            output = root / "offline_research_created_files.csv"
+            self.assertEqual(summary["rows"], 14)
+            self.assertEqual(summary["path"], str(output.resolve()))
+            with output.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertIn(str((root / "research_report.md").resolve()), {row["path"] for row in rows})
+            printed.assert_called()
+            self.assertIn(str(output.resolve()), printed.call_args.args[0])
+
+    def test_offline_research_accepts_fixed_only_candidate_artifact(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run_dir = root / "run"
+            out_dir = root / "offline"
+            run_dir.mkdir()
+            (run_dir / "kline_growth_metrics_gbdt.csv").write_text(
+                "portfolio_profit,portfolio_return,predicted_trades\n1.0,0.0001,1\n",
+                encoding="utf-8",
+            )
+            artifact = run_dir / "kline_growth_candidates.csv.gz"
+            candidate_artifacts.write_candidate_artifact(
+                artifact,
+                [
+                    {
+                        "candidate_id": "fixed-1",
+                        "source": "fixed",
+                        "stable_row_id": "fixed:0",
+                        "symbol": "AAA",
+                        "month": "2020-01",
+                        "month_index": 0,
+                        "open_time": 1600000000000,
+                        "fold_id": "fixed",
+                        "decision_bucket_id": 26666666,
+                        "row_position": 0,
+                        "label": 1,
+                        "trade_return": 0.01,
+                        "final_preselection_score": 0.9,
+                        "selected_by_score_before_execution": 1,
+                        "executed": 1,
+                        "position_size": 100.0,
+                        "rank_within_decision_bucket": 1,
+                        "candidate_count_within_decision_bucket": 1,
+                    }
+                ],
+                metadata={"source_run_id": "fixed-only-test"},
+            )
+            argv = [
+                "offline_candidate_research.py",
+                "--run-dir",
+                str(run_dir),
+                "--out-dir",
+                str(out_dir),
+                "--fixed-candidate-artifact",
+                str(artifact),
+            ]
+            with mock.patch.object(sys, "argv", argv):
+                with mock.patch("builtins.print"):
+                    self.assertEqual(offline_candidate_research.main(), 0)
+            self.assertTrue((out_dir / "offline_research_created_files.csv").exists())
+            self.assertFalse((out_dir / "candidate_snapshot_walkforward.csv").exists())
+
+    def test_candidate_artifact_round_trip_preserves_rejected_candidates(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "candidates.csv.gz"
+            records = [
+                {
+                    "candidate_id": candidate_artifacts.deterministic_candidate_id("run", 1),
+                    "source": "fixed",
+                    "stable_row_id": "fixed:0",
+                    "symbol": "AAA",
+                    "month": "2020-01",
+                    "month_index": 0,
+                    "open_time": 1600000000000,
+                    "fold_id": "fixed",
+                    "decision_bucket_id": 26666666,
+                    "row_position": 0,
+                    "label": 1,
+                    "trade_return": 0.02,
+                    "final_preselection_score": 0.9,
+                    "selected_by_score_before_execution": 1,
+                    "executed": 1,
+                    "position_size": 100.0,
+                    "rank_within_decision_bucket": 1,
+                    "candidate_count_within_decision_bucket": 2,
+                },
+                {
+                    "candidate_id": candidate_artifacts.deterministic_candidate_id("run", 2),
+                    "source": "fixed",
+                    "stable_row_id": "fixed:1",
+                    "symbol": "BBB",
+                    "month": "2020-01",
+                    "month_index": 0,
+                    "open_time": 1600000000000,
+                    "fold_id": "fixed",
+                    "decision_bucket_id": 26666666,
+                    "row_position": 1,
+                    "label": 0,
+                    "trade_return": -0.01,
+                    "final_preselection_score": 0.8,
+                    "selected_by_score_before_execution": 0,
+                    "executed": 0,
+                    "rejection_stage": "ranking",
+                    "rejection_reason": "rank_rejected",
+                    "rank_within_decision_bucket": 2,
+                    "candidate_count_within_decision_bucket": 2,
+                },
+            ]
+            manifest = candidate_artifacts.write_candidate_artifact(
+                path,
+                records,
+                metadata={"source_run_id": "test"},
+                artifact_format="csv_gzip",
+            )
+            self.assertTrue(manifest["complete"])
+            self.assertEqual(manifest["row_count"], 2)
+            rows = list(candidate_artifacts.read_candidate_rows(path))
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(sum(1 for item in rows if item["executed"] == "1"), 1)
+            self.assertEqual(rows[1]["rejection_reason"], "rank_rejected")
+
+    def test_candidate_artifact_rejects_incomplete_manifest(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "incomplete.csv"
+            path.write_text("candidate_id\nabc\n", encoding="utf-8")
+            manifest_path = Path(str(path) + ".manifest.json")
+            manifest_path.write_text(json.dumps({
+                "schema_version": 1,
+                "complete": False,
+                "checksum": "",
+            }), encoding="utf-8")
+            with self.assertRaises(candidate_artifacts.CandidateArtifactError):
+                candidate_artifacts.load_manifest(path)
+
+    def test_pipeline_candidate_artifact_includes_topk_rejected_candidate(self):
+        parser = pipeline.build_parser()
+        args = parser.parse_args([
+            "--trade-selection", "topk_score",
+            "--trade-score", "probability",
+            "--top-k-per-minute", "1",
+            "--max-trades-per-period", "0",
+        ])
+        rows = [
+            symbol_row("AAA", 1600000000000, label=1, trade_return=0.02),
+            symbol_row("BBB", 1600000000000, label=0, trade_return=-0.01),
+        ]
+        bundle = pipeline.build_prediction_bundle(probability=[0.9, 0.8], calibrated_probability=[0.9, 0.8])
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "pipeline_candidates.csv.gz"
+            manifest = pipeline.write_candidate_artifact_for_split(
+                str(path),
+                rows,
+                bundle,
+                0.5,
+                args,
+                "fixed",
+                "fixed",
+                "gbdt_internal",
+                ["ret_1m"],
+                runtime_args=args,
+                trade_score_name="probability",
+            )
+            self.assertEqual(manifest["row_count"], 2)
+            artifact_rows = list(candidate_artifacts.read_candidate_rows(path))
+            executed = [row for row in artifact_rows if row["executed"] == "1"]
+            rejected = [row for row in artifact_rows if row["executed"] != "1"]
+            self.assertEqual(len(executed), 1)
+            self.assertEqual(len(rejected), 1)
+            self.assertEqual(rejected[0]["rejection_stage"], "ranking")
+            self.assertEqual(rejected[0]["candidate_count_within_decision_bucket"], "2")
+
+    def test_pipeline_candidate_artifact_decision_bucket_matches_execution_minute(self):
+        parser = pipeline.build_parser()
+        args = parser.parse_args([
+            "--trade-selection", "topk_score",
+            "--trade-score", "probability",
+            "--top-k-per-minute", "1",
+            "--max-trades-per-period", "0",
+            "--trade-period-minutes", "60",
+        ])
+        base_minute = 26666640
+        rows = [
+            symbol_row("AAA", base_minute * 60000, label=1, trade_return=0.02),
+            symbol_row("BBB", (base_minute + 10) * 60000, label=1, trade_return=0.02),
+        ]
+        bundle = pipeline.build_prediction_bundle(probability=[0.9, 0.8], calibrated_probability=[0.9, 0.8])
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "pipeline_candidates.csv.gz"
+            manifest = pipeline.write_candidate_artifact_for_split(
+                str(path),
+                rows,
+                bundle,
+                0.5,
+                args,
+                "fixed",
+                "fixed",
+                "gbdt_internal",
+                ["ret_1m"],
+                runtime_args=args,
+                trade_score_name="probability",
+            )
+            self.assertEqual(manifest["row_count"], 2)
+            artifact_rows = list(candidate_artifacts.read_candidate_rows(path))
+
+        self.assertEqual([row["candidate_count_within_decision_bucket"] for row in artifact_rows], ["1", "1"])
+        self.assertEqual([row["candidate_count_within_execution_bucket"] for row in artifact_rows], ["1", "1"])
+        self.assertEqual([row["candidate_count_within_period_bucket"] for row in artifact_rows], ["2", "2"])
+        self.assertNotEqual(artifact_rows[0]["decision_bucket_id"], artifact_rows[1]["decision_bucket_id"])
+        self.assertEqual(artifact_rows[0]["period_bucket_id"], artifact_rows[1]["period_bucket_id"])
+
+    def test_pipeline_candidate_artifact_prefilter_includes_threshold_and_symbol_rejections(self):
+        parser = pipeline.build_parser()
+        args = parser.parse_args([
+            "--candidate-serialization-stage", "pre_score_edge_pre_symbol_filter",
+            "--trade-selection", "topk_score",
+            "--trade-score", "probability",
+            "--top-k-per-minute", "1",
+            "--max-trades-per-period", "0",
+        ])
+        rows = [
+            symbol_row("AAA", 1600000000000, label=1, trade_return=0.02),
+            symbol_row("BBB", 1600000000000, label=0, trade_return=-0.01),
+            symbol_row("CCC", 1600000000000, label=1, trade_return=0.03),
+        ]
+        bundle = pipeline.build_prediction_bundle(
+            probability=[0.90, 0.80, 0.40],
+            calibrated_probability=[0.90, 0.80, 0.40],
+        )
+        symbol_filter_info = {
+            "enabled": True,
+            "mode": "positive_avg_profit",
+            "allowed_symbols": ["AAA", "CCC"],
+            "filtered_symbols": ["BBB"],
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "pipeline_candidates.csv.gz"
+            manifest = pipeline.write_candidate_artifact_for_split(
+                str(path),
+                rows,
+                bundle,
+                0.5,
+                args,
+                "fixed",
+                "fixed",
+                "gbdt_internal",
+                ["ret_1m"],
+                runtime_args=args,
+                trade_score_name="probability",
+                symbol_filter_info=symbol_filter_info,
+            )
+            artifact_rows = list(candidate_artifacts.read_candidate_rows(path))
+
+        by_symbol = {row["symbol"]: row for row in artifact_rows}
+        self.assertEqual(manifest["candidate_serialization_stage"], "pre_score_edge_pre_symbol_filter")
+        self.assertEqual(manifest["row_count"], 3)
+        self.assertEqual(by_symbol["AAA"]["raw_signal"], "1")
+        self.assertEqual(by_symbol["AAA"]["selected_by_topk"], "1")
+        self.assertEqual(by_symbol["AAA"]["executed"], "1")
+        self.assertEqual(by_symbol["BBB"]["selected_by_symbol_filter"], "0")
+        self.assertEqual(by_symbol["BBB"]["raw_signal"], "0")
+        self.assertEqual(by_symbol["BBB"]["rejection_stage"], "symbol_filter")
+        self.assertEqual(by_symbol["CCC"]["selected_by_threshold"], "0")
+        self.assertEqual(by_symbol["CCC"]["raw_signal"], "0")
+        self.assertEqual(by_symbol["CCC"]["rejection_stage"], "threshold")
+
+    def test_pipeline_candidate_artifact_hides_no_valid_threshold_sentinel(self):
+        parser = pipeline.build_parser()
+        args = parser.parse_args([
+            "--candidate-serialization-stage", "pre_score_edge_pre_symbol_filter",
+            "--trade-selection", "topk_score",
+            "--trade-score", "probability",
+            "--top-k-per-minute", "1",
+            "--max-trades-per-period", "0",
+        ])
+        rows = [
+            symbol_row("AAA", 1600000000000, label=1, trade_return=0.02),
+            symbol_row("BBB", 1600000000000, label=0, trade_return=-0.01),
+        ]
+        bundle = pipeline.build_prediction_bundle(
+            probability=[0.90, 0.80],
+            calibrated_probability=[0.90, 0.80],
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "pipeline_candidates.csv.gz"
+            pipeline.write_candidate_artifact_for_split(
+                str(path),
+                rows,
+                bundle,
+                1.01,
+                args,
+                "fixed",
+                "fixed",
+                "gbdt_internal",
+                ["ret_1m"],
+                runtime_args=args,
+                trade_score_name="probability",
+                threshold_selection_status=pipeline.THRESHOLD_STATUS_NO_VALID,
+            )
+            artifact_rows = list(candidate_artifacts.read_candidate_rows(path))
+
+        self.assertEqual([row["selected_threshold"] for row in artifact_rows], ["", ""])
+        self.assertEqual([row["selected_by_threshold"] for row in artifact_rows], ["0", "0"])
+        self.assertEqual({row["rejection_stage"] for row in artifact_rows}, {"threshold"})
+
+    def test_portfolio_ledger_reconciles_overlapping_positions(self):
+        rows = [
+            symbol_row("AAA", 1600000000000, label=1, trade_return=0.10),
+            symbol_row("BBB", 1600000000000, label=0, trade_return=-0.02),
+        ]
+        collector = portfolio_ledger.PortfolioEventCollector()
+        execution = pipeline.portfolio_execution(
+            rows,
+            pipeline.build_prediction_bundle(probability=[1.0, 1.0], calibrated_probability=[1.0, 1.0]),
+            0.5,
+            0.001,
+            0.0005,
+            100.0,
+            0.5,
+            1.0,
+            0,
+            60,
+            5,
+            trade_selection="threshold",
+            portfolio_event_recorder=collector,
+            portfolio_fold_id="fixed",
+        )
+        reconciliation = portfolio_ledger.reconcile_events(
+            collector.events,
+            starting_capital=100.0,
+            reported_total_fees=execution["total_fee_amount"],
+            reported_total_slippage=execution["total_slippage_amount"],
+        )
+        self.assertEqual(reconciliation["portfolio_reconciliation_status"], "passed")
+        self.assertEqual(reconciliation["max_concurrent_positions"], 2)
+        self.assertAlmostEqual(reconciliation["ending_capital"], execution["ending_capital"])
+        self.assertEqual(reconciliation["drawdown_precision"], "exact_realized")
+        self.assertEqual(reconciliation["mark_to_market_drawdown_available"], 0)
+
+    def test_portfolio_ledger_candidate_ids_match_candidate_artifact(self):
+        parser = pipeline.build_parser()
+        args = parser.parse_args([
+            "--portfolio-timeline-mode", "events",
+            "--trade-selection", "topk_score",
+            "--trade-score", "probability",
+            "--top-k-per-minute", "1",
+            "--max-trades-per-period", "0",
+        ])
+        args.test_slippage_multiplier = 1.0
+        rows = [
+            symbol_row("AAA", 1600000000000, label=1, trade_return=0.10),
+            symbol_row("BBB", 1600000000000, label=0, trade_return=-0.02),
+        ]
+        bundle = pipeline.build_prediction_bundle(
+            probability=[1.0, 0.9],
+            calibrated_probability=[1.0, 0.9],
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            candidate_path = root / "candidates.csv.gz"
+            ledger_path = root / "portfolio_events.csv.gz"
+            pipeline.write_candidate_artifact_for_split(
+                str(candidate_path),
+                rows,
+                bundle,
+                0.5,
+                args,
+                "walkforward",
+                "fold_1",
+                "gbdt_internal",
+                ["ret_1m"],
+                runtime_args=args,
+                trade_score_name="probability",
+            )
+            pipeline.write_portfolio_ledger_for_split(
+                str(ledger_path),
+                rows,
+                bundle,
+                0.5,
+                args,
+                "walkforward",
+                "fold_1",
+                runtime_args=args,
+                trade_score_name="probability",
+            )
+            artifact_rows = list(candidate_artifacts.read_candidate_rows(candidate_path))
+            ledger_events = list(portfolio_ledger.read_events(ledger_path))
+
+        artifact_executed_ids = {
+            row["candidate_id"]
+            for row in artifact_rows
+            if row["executed"] == "1"
+        }
+        ledger_open_ids = {
+            row["candidate_id"]
+            for row in ledger_events
+            if row["event_type"] == "position_open"
+        }
+        self.assertEqual(ledger_open_ids, artifact_executed_ids)
+
+    def test_portfolio_ledger_streams_multiple_walk_forward_folds(self):
+        parser = pipeline.build_parser()
+        args = parser.parse_args(["--portfolio-timeline-mode", "events"])
+        args.test_slippage_multiplier = 1.0
+        rows = [
+            symbol_row("AAA", 1600000000000, label=1, trade_return=0.10),
+            symbol_row("BBB", 1600000060000, label=0, trade_return=-0.02),
+        ]
+        bundle = pipeline.build_prediction_bundle(probability=[1.0, 1.0], calibrated_probability=[1.0, 1.0])
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "walk_portfolio_events.csv.gz"
+            with portfolio_ledger.PortfolioLedgerWriter(path, {"source": "walkforward"}) as writer:
+                first = pipeline.write_portfolio_ledger_for_split(
+                    "",
+                    rows,
+                    bundle,
+                    0.5,
+                    args,
+                    "walkforward",
+                    "fold_1",
+                    writer=writer,
+                )
+                second = pipeline.write_portfolio_ledger_for_split(
+                    "",
+                    rows,
+                    bundle,
+                    0.5,
+                    args,
+                    "walkforward",
+                    "fold_2",
+                    writer=writer,
+                )
+            self.assertEqual(first["portfolio_reconciliation_status"], "passed")
+            self.assertEqual(second["portfolio_reconciliation_status"], "passed")
+            events = list(portfolio_ledger.read_events(path))
+            self.assertEqual({row["fold_id"] for row in events}, {"fold_1", "fold_2"})
+            self.assertEqual([int(row["event_sequence"]) for row in events], list(range(len(events))))
+            summary = portfolio_ledger.reconcile_ledger_file_by_fold(path, starting_capital=args.initial_capital)
+            self.assertEqual(summary["portfolio_reconciliation_status"], "passed")
+            self.assertEqual(summary["fold_count"], 2)
+
+    def test_cpp_discovery_reports_path_compiler_candidate(self):
+        with mock.patch.object(verify_cpp_build.shutil, "which", side_effect=lambda name, path=None: r"C:\Tools\g++.exe" if name in ("g++.exe", "g++") else None):
+            with mock.patch.object(verify_cpp_build, "discover_visual_studio_with_vswhere", return_value=[]):
+                with mock.patch.object(verify_cpp_build, "discover_common_windows_compilers", return_value=[]):
+                    candidates = verify_cpp_build.discover_compilers(system="Windows")
+        self.assertTrue(candidates)
+        self.assertEqual(candidates[0].compiler_type, "mingw")
+
+    def test_cpp_verify_no_compiler_is_unavailable_not_passed(self):
+        with mock.patch.object(verify_cpp_build, "discover_compilers", return_value=[]):
+            status = verify_cpp_build.verify(TEST_DIR, build=True)
+        self.assertFalse(status["compiler_found"])
+        self.assertEqual(status["verification_status"], "unavailable_no_compiler")
+        self.assertFalse(status["build_passed"])
+        self.assertTrue(status["installation_guidance"])
+
+    def test_cpp_build_failure_classifies_missing_zlib(self):
+        missing = verify_cpp_build.classify_build_failure("fatal error: zlib.h: No such file or directory")
+        self.assertIn("zlib", missing)
+
+    def test_powershell_cpp_wrapper_exists_and_invokes_python_helper(self):
+        wrapper = Path(TEST_DIR) / "tools" / "verify_cpp_build.ps1"
+        self.assertTrue(wrapper.exists())
+        self.assertIn("verify_cpp_build.py", wrapper.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

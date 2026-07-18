@@ -5,6 +5,7 @@ using namespace std;
 
 void scrapeHistoricalCoinData();
 void scrapeHistoricalCoinData(const vector<string> &symbolOverrides);
+int scrapeHistoricalCoinDataStatus(const vector<string> &symbolOverrides);
 
 int main(int argc, char **argv) {
     //The objective is to make an algorithm that is able to select and buy coins that
@@ -16,7 +17,7 @@ int main(int argc, char **argv) {
         for (int i = 2; i < argc; ++i) {
             symbols.push_back(argv[i]);
         }
-        scrapeHistoricalCoinData(symbols);
+        return scrapeHistoricalCoinDataStatus(symbols);
     } else {
         cout << "Run `coin_predictor train` to train from CSV symbols, or `coin_predictor train BTCUSDT` for a smaller run." << endl;
         cout << "Use `coin_predictor train --help` for labeling, threshold, and logistic options." << endl;

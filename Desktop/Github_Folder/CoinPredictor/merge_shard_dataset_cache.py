@@ -205,9 +205,7 @@ def create_combined_dataset(output_dataset_dir, source_dataset_dirs, replace_out
     merged_manifest = merged_manifest_template(first_manifest)
     merged_manifest["shards"] = merged_entries
     manifest_path = os.path.join(output_dataset_dir, pipeline.SHARDED_DATASET_MANIFEST)
-    with open(manifest_path, "w", encoding="utf-8") as handle:
-        json.dump(merged_manifest, handle, indent=2, sort_keys=True)
-        handle.write("\n")
+    pipeline.atomic_write_json(manifest_path, merged_manifest)
     return {
         "manifest_path": manifest_path,
         "merged_shard_count": len(merged_entries),
@@ -233,10 +231,8 @@ def update_destination_manifest(destination_dataset_dir, source_dataset_dirs):
         }
     updated_manifest = dict(destination_manifest)
     updated_manifest["shards"] = merged_entries
-    backup_path = backup_manifest(destination_dataset_path := destination_manifest_path)
-    with open(destination_dataset_path, "w", encoding="utf-8") as handle:
-        json.dump(updated_manifest, handle, indent=2, sort_keys=True)
-        handle.write("\n")
+    backup_path = backup_manifest(destination_manifest_path)
+    pipeline.atomic_write_json(destination_manifest_path, updated_manifest)
     return {
         "manifest_path": destination_manifest_path,
         "backup_path": backup_path,

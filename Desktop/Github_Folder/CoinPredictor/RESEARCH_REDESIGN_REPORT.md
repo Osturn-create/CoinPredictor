@@ -223,7 +223,7 @@ Result: 172 tests passed, 25 skipped.
 
 No fresh 80M-row retrain was run in this pass. To validate the new diagnostic against real repository artifacts, I ran it on two existing walk-forward prediction files.
 
-Important limitation: these historical files were written in `prediction-output-mode=trades`, so the ranking report evaluates executed rows, not the full candidate universe. Future production comparisons should run with `--prediction-output-mode all` to audit candidate ranking before execution filters.
+Important limitation: these historical files were written in `prediction-output-mode=trades`, so the ranking report evaluates executed rows, not the full candidate universe. Future production comparisons should run with `--prediction-output-mode candidates` to audit candidate ranking before execution filters without writing every scored row.
 
 | Existing run | Rows available | Trade-score top decile net return | Trade-score top 1% net return | Top decile label rate | Decile monotonicity | Top symbol share | Top month share |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
